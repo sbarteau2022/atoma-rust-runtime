@@ -121,7 +121,7 @@ pub struct GlimmerModel {
 impl GlimmerModel {
     pub fn load(model_dir: &Path) -> Result<Self, ForwardError> {
         let config = GlimmerConfig::from_json_file(&model_dir.join("config.json"))?;
-        let mut weights =
+        let weights =
             WeightManager::load(model_dir, &model_dir.join("model.safetensors.index.json"))?;
         let h = config.hidden_size;
         let q_rows_expected_fused = 2 * config.num_attention_heads * config.head_dim;

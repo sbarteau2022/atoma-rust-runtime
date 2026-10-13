@@ -12,7 +12,7 @@ fn test_write_contract_and_audit() {
     };
     let payload = vec![1, 2, 3];
 
-    let id = map
+    let _id = map
         .write(addr, phase, payload)
         .expect("Write should succeed");
 

@@ -58,6 +58,7 @@ struct RawTextConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // config schema: rope params not yet parsed from JSON
 struct RawRopeParams {
     partial_rotary_factor: f32,
     rope_theta: f32,

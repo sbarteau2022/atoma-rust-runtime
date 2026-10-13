@@ -9,7 +9,7 @@ use crate::geometry::bridge::f32_to_lorentz;
 use crate::geometry::fixed::Q32_31;
 use crate::geometry::lorentz::LorentzVector;
 use crate::model_config::{LayerType, ModelConfig};
-use crate::ops::{apply_rope, argmax, matvec, rmsnorm, silu, softmax, top_k_indices};
+use crate::ops::{apply_rope, matvec, rmsnorm, silu, softmax, top_k_indices};
 use crate::qwen_model::{ModelError, WeightManager};
 use std::path::Path;
 

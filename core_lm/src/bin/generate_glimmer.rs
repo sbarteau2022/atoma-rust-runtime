@@ -43,6 +43,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading Glimmer model (this takes a while)...");
     let t0 = Instant::now();
     let mut model = GlimmerModel::load(&model_dir)?;
+    if stop_after_prefill {
+        model.weights.retain_cache = false;
+    }
     println!(
         "Model loaded in {:.1}s (q_fused={}, layers={})",
         t0.elapsed().as_secs_f32(),

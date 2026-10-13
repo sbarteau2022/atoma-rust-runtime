@@ -1,6 +1,7 @@
 //! BPE tokenizer. Parsed from tokenizer.json AT LOAD TIME ONLY.
 //! Runtime uses the compiled BpeTokenizer struct.
 
+use fancy_regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -27,6 +28,8 @@ impl std::error::Error for TokenizerError {}
 #[derive(Debug, Deserialize)]
 struct RawTokenizer {
     model: RawModel,
+    #[serde(default)]
+    pre_tokenizer: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +51,51 @@ pub struct BpeTokenizer {
     merge_ranks: HashMap<(String, String), u32>,
     byte_encoder: HashMap<u8, String>,
     byte_decoder: HashMap<String, u8>,
+    pre_split: Option<Regex>,
+}
+
+fn split_regex(pre: &serde_json::Value) -> Option<String> {
+    let mut found = None;
+    fn walk(v: &serde_json::Value, found: &mut Option<String>) {
+        let Some(obj) = v.as_object() else {
+            return;
+        };
+        if obj.get("type").and_then(|t| t.as_str()) == Some("Split") {
+            if let Some(pattern) = obj
+                .get("pattern")
+                .and_then(|p| p.get("Regex"))
+                .and_then(|r| r.as_str())
+            {
+                *found = Some(pattern.to_string());
+            }
+        }
+        if let Some(parts) = obj.get("pretokenizers").and_then(|p| p.as_array()) {
+            for part in parts {
+                walk(part, found);
+            }
+        }
+    }
+    walk(pre, &mut found);
+    found
+}
+
+fn isolated_pieces<'a>(re: &Regex, text: &'a str) -> Result<Vec<&'a str>, TokenizerError> {
+    let mut pieces = Vec::new();
+    let mut last = 0;
+    for m in re.find_iter(text) {
+        let m = m.map_err(|e| TokenizerError::Encode(e.to_string()))?;
+        if m.start() > last {
+            pieces.push(&text[last..m.start()]);
+        }
+        if !m.as_str().is_empty() {
+            pieces.push(m.as_str());
+        }
+        last = m.end();
+    }
+    if last < text.len() {
+        pieces.push(&text[last..]);
+    }
+    Ok(pieces)
 }
 
 fn bytes_to_unicode() -> (HashMap<u8, String>, HashMap<String, u8>) {
@@ -100,12 +148,19 @@ impl BpeTokenizer {
             }
         }
         let (byte_encoder, byte_decoder) = bytes_to_unicode();
+        let pre_split = match raw.pre_tokenizer.as_ref().and_then(split_regex) {
+            Some(pattern) => {
+                Some(Regex::new(&pattern).map_err(|e| TokenizerError::Parse(e.to_string()))?)
+            }
+            None => None,
+        };
         Ok(Self {
             vocab: raw.model.vocab,
             inv_vocab,
             merge_ranks,
             byte_encoder,
             byte_decoder,
+            pre_split,
         })
     }
     fn bpe(&self, token: &str) -> Vec<String> {
@@ -152,7 +207,16 @@ impl BpeTokenizer {
     }
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, TokenizerError> {
         let mut ids = Vec::new();
-        for word in text.split_inclusive(|c: char| c.is_whitespace()) {
+        let owned;
+        let pieces: Vec<&str> = if let Some(re) = &self.pre_split {
+            isolated_pieces(re, text)?
+        } else {
+            owned = text
+                .split_inclusive(|c: char| c.is_whitespace())
+                .collect::<Vec<_>>();
+            owned
+        };
+        for word in pieces {
             let encoded: String = word
                 .bytes()
                 .map(|b| self.byte_encoder.get(&b).cloned().unwrap_or_default())
@@ -223,5 +287,30 @@ mod tests {
         fs::remove_file(&path).unwrap();
         assert_eq!(tokenizer.encode("ab").unwrap(), vec![2]);
         assert_eq!(tokenizer.decode(&[2]), "ab");
+    }
+    #[test]
+    fn glimmer_prompt_matches_mlx_pretokenizer() {
+        let path = std::path::Path::new(
+            "/Users/stewartbarteau/models/Muse-Glimmer-q4-MLX/tokenizer.json",
+        );
+        let tokenizer = BpeTokenizer::from_json_file(path).expect("glimmer tokenizer");
+        // Ids from the checkpoint tokenizer as shipped. mlx-lm loads that
+        // file. transformers' fix_mistral_regex splits "it's" and "12345"
+        // differently; the baseline run did not apply that flag.
+        let cases = [
+            ("The capital of France is", vec![954, 7963, 323, 11698, 373]),
+            (
+                "The capital of France is ",
+                vec![954, 7963, 323, 11698, 373, 220],
+            ),
+            ("it's a test", vec![90715, 262, 1600]),
+            ("Hello\nworld", vec![19873, 198, 27349]),
+            ("a  b", vec![77, 220, 297]),
+            ("12345", vec![7235, 2127]),
+            ("end.", vec![431, 26]),
+        ];
+        for (text, ids) in cases {
+            assert_eq!(tokenizer.encode(text).unwrap(), ids, "{text:?}");
+        }
     }
 }

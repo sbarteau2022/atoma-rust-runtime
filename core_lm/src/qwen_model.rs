@@ -9,15 +9,14 @@
 //! LorentzVector and stored in GeometricMemoryMap with V as payload.
 //! NO k_cache / v_cache tensors exist anywhere in this file.
 
-use crate::cache::geometric::{GeometricMemoryMap, MemoryError, Phase};
-use crate::geometry::bridge::{BridgeError, f32_to_lorentz};
-use crate::geometry::fixed::Q32_31;
-use crate::model_config::{ConfigError, LayerType, ModelConfig};
-use crate::ops::{OpsError, apply_rope, argmax, matvec, rmsnorm, silu, softmax, top_k_indices};
+use crate::cache::geometric::MemoryError;
+use crate::geometry::bridge::BridgeError;
+use crate::model_config::ConfigError;
+use crate::ops::OpsError;
 use crate::optiq::{DequantError, dequantize, load_f32_tensor};
 use crate::safetensors::{SafeTensorError, SafeTensorFile};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug)]
 pub enum ModelError {

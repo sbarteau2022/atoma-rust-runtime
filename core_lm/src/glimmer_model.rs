@@ -165,6 +165,7 @@ pub struct WeightManager {
     shards: Vec<SafeTensorFile>,
     tensor_to_shard: HashMap<String, usize>,
     cache: HashMap<String, Vec<f32>>,
+    pub retain_cache: bool,
 }
 
 impl WeightManager {
@@ -197,6 +198,7 @@ impl WeightManager {
             shards,
             tensor_to_shard,
             cache: HashMap::new(),
+            retain_cache: true,
         })
     }
     fn shard_for(&self, tensor: &str) -> Result<&SafeTensorFile, GlimmerError> {
@@ -207,8 +209,10 @@ impl WeightManager {
         Ok(&self.shards[*idx])
     }
     pub fn get_weight(&mut self, name: &str) -> Result<Vec<f32>, GlimmerError> {
-        if let Some(v) = self.cache.get(name) {
-            return Ok(v.clone());
+        if self.retain_cache {
+            if let Some(v) = self.cache.get(name) {
+                return Ok(v.clone());
+            }
         }
         let base = name.trim_end_matches(".weight");
         let scales_name = format!("{}.scales", base);
@@ -229,7 +233,9 @@ impl WeightManager {
         } else {
             load_f32_tensor(file, name)?
         };
-        self.cache.insert(name.to_string(), data.clone());
+        if self.retain_cache {
+            self.cache.insert(name.to_string(), data.clone());
+        }
         Ok(data)
     }
     pub fn weight_shape(&self, name: &str) -> Result<(usize, usize), GlimmerError> {

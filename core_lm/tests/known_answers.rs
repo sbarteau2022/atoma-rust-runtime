@@ -30,7 +30,7 @@ fn test_fast_sin() {
     let pi_half = Q32_31::from_f64(std::f64::consts::FRAC_PI_2);
 
     // Tolerance for LUT interpolation
-    let tol = Q32_31::from_f64(0.01);
+    let _tol = Q32_31::from_f64(0.01);
 
     let sin_pi = Q32_31::sin(pi);
     let diff_pi = (sin_pi - Q32_31::ZERO).to_f64().abs();
