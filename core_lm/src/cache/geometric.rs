@@ -1,0 +1,419 @@
+//! Geometric Memory Map (H³/Γ Replacement for KV Cache)
+//! Implements the Atom, Write, Retrieval, and Eviction Contracts.
+
+use crate::geometry::fixed::Q32_31;
+use crate::geometry::lorentz::LorentzVector;
+use crate::geometry::picard::PicardMapper;
+use std::collections::HashMap;
+use std::fmt;
+use std::time::SystemTime;
+
+pub type PayloadRef = Vec<u8>;
+
+#[derive(Debug)]
+pub enum MemoryError {
+    InvalidAddress(String),
+    ReductionFailed,
+    StorageFull,
+}
+
+impl fmt::Display for MemoryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MemoryError::InvalidAddress(e) => write!(f, "Invalid Address: {}", e),
+            MemoryError::ReductionFailed => write!(f, "Picard reduction failed to converge"),
+            MemoryError::StorageFull => write!(f, "Storage capacity reached and eviction refused"),
+        }
+    }
+}
+
+impl std::error::Error for MemoryError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AtomId(pub u64);
+
+impl fmt::Display for AtomId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LogicalClock(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Phase {
+    pub theta_f: Q32_31,
+    pub theta_s: Q32_31,
+}
+
+#[derive(Debug, Clone)]
+pub struct Atom {
+    pub id: AtomId,
+    pub clock: LogicalClock,
+    pub phase: Phase,
+    pub lorentz: LorentzVector,
+    pub payload: PayloadRef,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Op {
+    Write(AtomId),
+    Evict(AtomId),
+}
+
+#[derive(Debug, Clone)]
+pub struct AuditEntry {
+    pub clock: LogicalClock,
+    pub op: Op,
+    pub timestamp: SystemTime,
+}
+
+struct VpNode {
+    vantage: u64,
+    /// Hyperbolic distance threshold. Children inside are at or below it.
+    mu: f64,
+    inside: Option<Box<VpNode>>,
+    outside: Option<Box<VpNode>>,
+}
+
+pub struct GeometricMemoryMap {
+    pub atoms: HashMap<u64, Atom>,
+    pub max_atoms: usize,
+    pub next_id: u64,
+    pub clock: LogicalClock,
+    pub audit_log: Vec<AuditEntry>,
+    pub use_picard: bool,
+    index: Option<Box<VpNode>>,
+}
+
+impl GeometricMemoryMap {
+    pub fn new(max_atoms: usize) -> Self {
+        Self {
+            atoms: HashMap::new(),
+            max_atoms,
+            next_id: 0,
+            clock: LogicalClock(0),
+            audit_log: Vec::new(),
+            use_picard: true,
+            index: None,
+        }
+    }
+
+    /// Store an address that the caller already reduced. Picard is not applied again.
+    pub fn store(
+        &mut self,
+        lorentz: LorentzVector,
+        payload: PayloadRef,
+    ) -> Result<AtomId, MemoryError> {
+        let saved = self.use_picard;
+        self.use_picard = false;
+        let phase = Phase {
+            theta_f: Q32_31::ZERO,
+            theta_s: Q32_31::ZERO,
+        };
+        let result = self.write(lorentz, phase, payload);
+        self.use_picard = saved;
+        result
+    }
+
+    /// Build the vantage-point tree used by [`Self::retrieve`].
+    pub fn rebuild(&mut self) {
+        let ids: Vec<u64> = self.atoms.keys().copied().collect();
+        self.index = build_vp(&ids, &self.atoms);
+    }
+
+    pub fn write(
+        &mut self,
+        lorentz: LorentzVector,
+        phase: Phase,
+        payload: PayloadRef,
+    ) -> Result<AtomId, MemoryError> {
+        if let Err(e) = lorentz.validate() {
+            return Err(MemoryError::InvalidAddress(e));
+        }
+
+        let addr = if self.use_picard {
+            PicardMapper::map_to_fundamental_domain(&lorentz)
+        } else {
+            lorentz
+        };
+
+        if self.atoms.len() >= self.max_atoms {
+            if self.evict().is_none() {
+                return Err(MemoryError::StorageFull);
+            }
+        }
+
+        let id = AtomId(self.next_id);
+        self.next_id += 1;
+        self.clock.0 += 1;
+
+        let atom = Atom {
+            id,
+            clock: self.clock,
+            phase,
+            lorentz: addr,
+            payload,
+            pinned: false,
+        };
+        self.index = None;
+
+        self.atoms.insert(id.0, atom);
+        self.audit_log.push(AuditEntry {
+            clock: self.clock,
+            op: Op::Write(id),
+            timestamp: SystemTime::now(),
+        });
+
+        Ok(id)
+    }
+
+    pub fn pin(&mut self, id: AtomId) {
+        if let Some(atom) = self.atoms.get_mut(&id.0) {
+            atom.pinned = true;
+        }
+    }
+
+    pub fn evict(&mut self) -> Option<AtomId> {
+        self.index = None;
+        let victim = self.atoms.values().filter(|a| !a.pinned).max_by(|a, b| {
+            a.lorentz.x[0]
+                .cmp(&b.lorentz.x[0])
+                .then_with(|| a.id.0.cmp(&b.id.0))
+        })?;
+
+        let id = victim.id;
+        self.audit_log.push(AuditEntry {
+            clock: self.clock,
+            op: Op::Evict(id),
+            timestamp: SystemTime::now(),
+        });
+        self.atoms.remove(&id.0);
+        Some(id)
+    }
+
+    pub fn retrieve(
+        &self,
+        query: &LorentzVector,
+        top_k: usize,
+        exclude_query: bool,
+    ) -> Result<Vec<&Atom>, MemoryError> {
+        if let Err(e) = query.validate() {
+            return Err(MemoryError::InvalidAddress(e));
+        }
+
+        if self.index.is_some() {
+            return Ok(self.retrieve_indexed(query, top_k, exclude_query));
+        }
+
+        let mut results = Vec::new();
+        for atom in self.atoms.values() {
+            let dist = LorentzVector::inner_product(query, &atom.lorentz);
+            results.push((dist, atom));
+        }
+
+        // CORRECTED: Ascending order for distance (smaller inner product = closer in H3)
+        results.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.0.cmp(&b.1.id.0)));
+
+        let mut final_results = Vec::new();
+        for (_, atom) in results {
+            if exclude_query && atom.lorentz == *query {
+                continue;
+            }
+            final_results.push(atom);
+            if final_results.len() >= top_k {
+                break;
+            }
+        }
+
+        Ok(final_results)
+    }
+
+    fn retrieve_indexed(
+        &self,
+        query: &LorentzVector,
+        top_k: usize,
+        exclude_query: bool,
+    ) -> Vec<&Atom> {
+        let Some(root) = &self.index else {
+            return Vec::new();
+        };
+        let extra = if exclude_query {
+            self.atoms
+                .values()
+                .filter(|atom| atom.lorentz == *query)
+                .count()
+        } else {
+            0
+        };
+        let want = top_k.saturating_add(extra);
+        let mut best = Vec::new();
+        search_vp(&self.atoms, root, query, want, &mut best);
+        let mut atoms: Vec<&Atom> = best
+            .iter()
+            .filter_map(|(_, id)| self.atoms.get(id))
+            .filter(|atom| !(exclude_query && atom.lorentz == *query))
+            .collect();
+        atoms.sort_by(|a, b| {
+            let left = LorentzVector::inner_product(query, &a.lorentz);
+            let right = LorentzVector::inner_product(query, &b.lorentz);
+            left.cmp(&right).then(a.id.0.cmp(&b.id.0))
+        });
+        atoms.truncate(top_k);
+        atoms
+    }
+}
+
+fn hyp_distance(a: &LorentzVector, b: &LorentzVector) -> f64 {
+    let ip = LorentzVector::inner_product(a, b).to_f64().max(1.0);
+    (ip + (ip * ip - 1.0).max(0.0).sqrt()).ln()
+}
+
+fn consider(best: &mut Vec<(f64, u64)>, k: usize, distance: f64, id: u64) {
+    if k == 0 {
+        return;
+    }
+    if let Some(&(worst_d, worst_id)) = best.last() {
+        if best.len() == k && (distance, id) >= (worst_d, worst_id) {
+            return;
+        }
+    }
+    best.push((distance, id));
+    best.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    if best.len() > k {
+        best.pop();
+    }
+}
+
+fn tau_of(best: &[(f64, u64)], k: usize) -> f64 {
+    if best.len() < k {
+        f64::INFINITY
+    } else {
+        best.last().map(|(distance, _)| *distance).unwrap_or(f64::INFINITY)
+    }
+}
+
+fn build_vp(ids: &[u64], atoms: &HashMap<u64, Atom>) -> Option<Box<VpNode>> {
+    if ids.is_empty() {
+        return None;
+    }
+    let mut ordered = ids.to_vec();
+    ordered.sort_unstable();
+    let vantage = ordered[0];
+    let rest = &ordered[1..];
+    if rest.is_empty() {
+        return Some(Box::new(VpNode {
+            vantage,
+            mu: 0.0,
+            inside: None,
+            outside: None,
+        }));
+    }
+    let origin = atoms[&vantage].lorentz;
+    let mut scored: Vec<(f64, u64)> = rest
+        .iter()
+        .map(|id| (hyp_distance(&origin, &atoms[id].lorentz), *id))
+        .collect();
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mu = scored[scored.len() / 2].0;
+    let mut inside = Vec::new();
+    let mut outside = Vec::new();
+    for (distance, id) in scored {
+        if distance <= mu {
+            inside.push(id);
+        } else {
+            outside.push(id);
+        }
+    }
+    Some(Box::new(VpNode {
+        vantage,
+        mu,
+        inside: build_vp(&inside, atoms),
+        outside: build_vp(&outside, atoms),
+    }))
+}
+
+fn search_vp(
+    atoms: &HashMap<u64, Atom>,
+    node: &VpNode,
+    query: &LorentzVector,
+    k: usize,
+    best: &mut Vec<(f64, u64)>,
+) {
+    let Some(atom) = atoms.get(&node.vantage) else {
+        return;
+    };
+    let distance = hyp_distance(query, &atom.lorentz);
+    consider(best, k, distance, node.vantage);
+
+    if distance <= node.mu {
+        if let Some(child) = &node.inside {
+            if distance <= node.mu + tau_of(best, k) {
+                search_vp(atoms, child, query, k, best);
+            }
+        }
+        if let Some(child) = &node.outside {
+            if distance + tau_of(best, k) >= node.mu {
+                search_vp(atoms, child, query, k, best);
+            }
+        }
+    } else {
+        if let Some(child) = &node.outside {
+            if distance + tau_of(best, k) >= node.mu {
+                search_vp(atoms, child, query, k, best);
+            }
+        }
+        if let Some(child) = &node.inside {
+            if distance <= node.mu + tau_of(best, k) {
+                search_vp(atoms, child, query, k, best);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::fixed::Q32_31;
+
+    fn address(i: usize) -> LorentzVector {
+        let angle = i as f64 * 0.37;
+        let n = [
+            Q32_31::from_f64(angle.cos()),
+            Q32_31::from_f64(angle.sin()),
+            Q32_31::ZERO,
+        ];
+        LorentzVector::boost(&LorentzVector::origin(), &n, Q32_31::from_f64(0.15 + i as f64 * 0.01))
+    }
+
+    #[test]
+    fn vptree_matches_linear_order() {
+        let mut map = GeometricMemoryMap::new(80);
+        map.use_picard = false;
+        let phase = Phase {
+            theta_f: Q32_31::ZERO,
+            theta_s: Q32_31::ZERO,
+        };
+        for i in 0..40 {
+            map.write(address(i), phase, vec![i as u8])
+                .expect("valid boost address");
+        }
+        let query = address(3);
+        let linear: Vec<u64> = map
+            .retrieve(&query, 7, true)
+            .unwrap()
+            .iter()
+            .map(|atom| atom.id.0)
+            .collect();
+        map.rebuild();
+        let indexed: Vec<u64> = map
+            .retrieve(&query, 7, true)
+            .unwrap()
+            .iter()
+            .map(|atom| atom.id.0)
+            .collect();
+        assert_eq!(linear, indexed);
+    }
+}
