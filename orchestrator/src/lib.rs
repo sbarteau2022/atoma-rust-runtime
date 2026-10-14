@@ -3,7 +3,9 @@
 //! Ties together the complete chain defined in `SPEC.md` §4:
 //! `Distill → Refract → Carve → Silo → Agent → Dissolve & Deposit → Govern → Immune-check`
 //! with a **Model-Agnostic Centralized `(H³ × T²) / Γ` Memory Architecture** that survives
-//! across pluggable model hot-swaps without re-distillation.
+//! across pluggable model hot-swaps without re-distillation, a **Geodesic Native MLIR /
+//! Tokenless Inter-Process Execution Engine**, and an **Open-Weights Knowledge & Reasoning
+//! Distillation Engine** (`OpenWeightsDistillationEngine`).
 
 pub mod bridge;
 pub mod routing;
@@ -15,14 +17,21 @@ use atoma_immune::{
     AtomicIrAlphabet, Atlas13, CarveLossReport, CarvedSwarmMap, CompliancePermit,
     ComplianceViolation, DepositCompilationReceipt, EphemeralMapDeposit,
     FirstPrinciplesComplianceEngine, FirstPrinciplesComplianceReport, FrozenBaseWeights,
-    FrozenShard, HolonomyLoopReceipt, HyperbolicHolonomyEngine, IDENTITY_FRAME_Q32, ImmuneSystem,
-    MetaCognitiveRunbookController, ModelHotSwapReceipt, OpticalLens, OverlapPolicyMatrix,
-    ProjectedTangent, RefractedPoint, RoleId, SurgicalErasureReceipt, SwarmKnowledgeAndHomeostasis,
-    TangentProjector, TeacherTapRecord,
+    FrozenShard, FullModelDistillationReceipt, GeodesicDecodeReceipt, GeodesicMlirDecoder,
+    HolonomyLoopReceipt, HyperbolicHolonomyEngine, IDENTITY_FRAME_Q32, ImmuneSystem,
+    LiveNoveltyDistillationReceipt, MetaCognitiveRunbookController, MlirAtomCatalog, MlirSsaBlock,
+    MlirSsaValidationReceipt, ModelHotSwapReceipt, OpenWeightsDistillationEngine, OpticalLens,
+    OverlapPolicyMatrix, ProjectedTangent, QuantizedDistillationReceipt,
+    QuantizedLayerTapDescriptor, ReasoningChainDistillationReceipt, RefractedPoint, RoleId,
+    SurgicalErasureReceipt, SwarmKnowledgeAndHomeostasis, TangentProjector, TeacherTapRecord,
+    WeightDistillationReceipt,
 };
 use routing::{DeliveredHandoff, HandoffRequest};
 use std::sync::Arc;
-use swarm::{GovernedForwardReceipt, Governor, RestartIntensity, RestartStrategy};
+use swarm::{
+    CrossEpochHydrationReceipt, GovernedForwardReceipt, Governor, RestartIntensity,
+    RestartStrategy,
+};
 
 /// Complete record of a single pass through steps 1–5 (`Distill → Refract → Carve → Silo`).
 #[derive(Debug, Clone)]
@@ -34,6 +43,18 @@ pub struct DistillRefractCarveReceipt {
     pub refracted: RefractedPoint,
     pub carve_loss: CarveLossReport,
     pub loss_permit: CompliancePermit,
+}
+
+/// Receipt emitted when a typed [`MlirSsaBlock`] is validated by Layer 3 (`MlirNativeSsaGate`),
+/// transmitted over the binary ring buffer (zero JSON/UTF-8), and deterministically executed
+/// by the receiving specialist role.
+#[derive(Debug, Clone)]
+pub struct NativeMlirDispatchReceipt {
+    pub handoff: DeliveredHandoff,
+    pub validation: MlirSsaValidationReceipt,
+    pub ssa_permit: CompliancePermit,
+    pub result_q32: Q32_31,
+    pub expanded_model_tokens: Vec<u32>,
 }
 
 /// The central Monster Hybrid Server ("Three Layers, One Server — There is one door", `SPEC.md` §1).
@@ -50,10 +71,18 @@ pub struct MonsterHybridServer {
     pub meta_controller: MetaCognitiveRunbookController,
     /// Pinned Atomic IR lossless alphabet (`SPEC_atomic_ir.md`).
     pub atomic_ir: AtomicIrAlphabet,
+    /// Pinned Geodesic MLIR Opcode Catalog on `(H³ × T²)/Γ₁₂` (`.atoma_ir` / `mlir_atom_catalog.sql`).
+    pub mlir_catalog: MlirAtomCatalog,
     /// 12-Sphere Superpowers ontology (CVE/CWE/ATT&CK) & 8-discipline homeostatic mapping.
     pub knowledge_homeostasis: SwarmKnowledgeAndHomeostasis,
     /// Non-Abelian Levi-Civita Hyperbolic Holonomy & Gauss–Bonnet Berry Phase Engine.
     pub holonomy_engine: HyperbolicHolonomyEngine,
+    /// Autonomous Open-Weights Knowledge (`0-cells`) & Reasoning (`1-cells` / `2-cells`) Distillation Engine.
+    pub distillation_engine: OpenWeightsDistillationEngine,
+    /// Last ingested live inference atom & role for continuous `1-cell` reasoning-arc synthesis.
+    pub last_live_atom: Option<(AtomId, RoleId)>,
+    /// Optional path to the persistent `.atoma_map` binary vault on disk.
+    pub persistent_vault_path: Option<std::path::PathBuf>,
 }
 
 impl MonsterHybridServer {
@@ -84,8 +113,12 @@ impl MonsterHybridServer {
             projector: TangentProjector::default(),
             meta_controller: MetaCognitiveRunbookController::default(),
             atomic_ir: AtomicIrAlphabet::new_canonical(248_320),
+            mlir_catalog: MlirAtomCatalog::new_canonical(248_320),
             knowledge_homeostasis: SwarmKnowledgeAndHomeostasis::new(),
             holonomy_engine: HyperbolicHolonomyEngine::default(),
+            distillation_engine: OpenWeightsDistillationEngine::default(),
+            last_live_atom: None,
+            persistent_vault_path: None,
         })
     }
 
@@ -130,6 +163,206 @@ impl MonsterHybridServer {
             carve_loss,
             loss_permit,
         })
+    }
+
+    /// Distill static **Knowledge (`0-cells`)** directly from an open-source teacher checkpoint's
+    /// frozen weight buffer (`teacher_weights`), auto-routing each principal mode across the 12
+    /// icosahedral specialist wells (`L1..L12`).
+    pub fn distill_open_source_weights(
+        &mut self,
+        teacher_weights: &FrozenBaseWeights,
+        mode_width: usize,
+        max_modes: usize,
+    ) -> Result<WeightDistillationReceipt, String> {
+        self.distillation_engine.distill_static_weight_modes(
+            teacher_weights,
+            mode_width,
+            max_modes,
+            &mut self.swarm_map,
+            &self.immune.policy,
+        )
+    }
+
+    /// Distill **Knowledge (`0-cells`)** directly from a **Quantized Layer Tensor** (`OptiQ` / `MLX`
+    /// `4-bit`, `5-bit`, `6-bit`, `8-bit` packed `U32`/`U8` + `BF16`/`F16`/`F32` scales & biases)
+    /// without ever dequantizing the full matrix (`128×` faster scale/bias spectral sieve +
+    /// top-$K$ single-row `dequantize_row_zero_copy`).
+    pub fn distill_quantized_layer(
+        &mut self,
+        desc: &QuantizedLayerTapDescriptor<'_>,
+        top_k_rows: usize,
+        teacher_fingerprint: atoma_immune::Sha256Digest,
+    ) -> Result<QuantizedDistillationReceipt, String> {
+        self.distillation_engine.distill_quantized_layer_zero_copy(
+            desc,
+            top_k_rows,
+            teacher_fingerprint,
+            &mut self.swarm_map,
+            &self.immune.policy,
+        )
+    }
+
+    /// Automatically discover and distill all `OptiQ` / `MLX` quantized linear layers (`<prefix>.weight`,
+    /// `<prefix>.scales`, `<prefix>.biases`, optional `<prefix>.out_scale`) inside a `.safetensors`
+    /// shard buffer into the centralized `CarvedSwarmMap`.
+    pub fn distill_safetensors_shard(
+        &mut self,
+        file_bytes: &[u8],
+        top_k_rows_per_layer: usize,
+        total_layers_hint: usize,
+    ) -> Result<Vec<QuantizedDistillationReceipt>, String> {
+        self.distillation_engine.distill_safetensors_shard_bytes(
+            file_bytes,
+            top_k_rows_per_layer,
+            total_layers_hint,
+            &mut self.swarm_map,
+            &self.immune.policy,
+        )
+    }
+
+    /// Stream and distill quantized layers (`2D` linear projections and `3D` MoE `switch_mlp` experts)
+    /// directly from a `.safetensors` file on disk using selective `File::seek` (`0` full-file read,
+    /// `0` full-matrix dequantization), resolving exact per-layer bit-widths from `optiq_metadata.json`
+    /// or `config.json`.
+    pub fn distill_safetensors_file(
+        &mut self,
+        safetensors_path: &std::path::Path,
+        top_k_rows_per_layer: usize,
+        max_layers: usize,
+    ) -> Result<Vec<QuantizedDistillationReceipt>, String> {
+        self.distillation_engine.distill_safetensors_file_streaming(
+            safetensors_path,
+            top_k_rows_per_layer,
+            max_layers,
+            &mut self.swarm_map,
+            &self.immune.policy,
+        )
+    }
+
+    /// Full-model or shard distillation with **3-level novelty-only deduplication** (`0` duplicate noise)
+    /// and automatic `.atoma_map` binary vault persistence.
+    pub fn distill_full_checkpoint_novel_only(
+        &mut self,
+        target_path: &std::path::Path,
+        top_k_rows_per_layer: usize,
+        max_layers_per_shard: usize,
+        vault_path: Option<&std::path::Path>,
+    ) -> Result<FullModelDistillationReceipt, String> {
+        if let Some(vp) = vault_path {
+            self.persistent_vault_path = Some(vp.to_path_buf());
+            if vp.exists() && self.swarm_map.ingested_tensor_digests.is_empty() {
+                let _ = self.swarm_map.load_from_binary_vault(vp, &self.immune.policy)?;
+            }
+        }
+
+        let mut shard_paths = Vec::new();
+        if target_path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(target_path) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                        if name.starts_with("model-") && name.ends_with(".safetensors") {
+                            shard_paths.push(p);
+                        }
+                    }
+                }
+            }
+            shard_paths.sort();
+        } else {
+            shard_paths.push(target_path.to_path_buf());
+        }
+
+        let mut total_summary = FullModelDistillationReceipt {
+            model_path: target_path.display().to_string(),
+            shards_processed: shard_paths.len(),
+            tensors_distilled: 0,
+            tensors_skipped_already_ingested: 0,
+            novel_atoms_minted: 0,
+            deduplicated_atoms_coalesced: 0,
+            novel_reasoning_arcs_minted: 0,
+            deduplicated_reasoning_arcs: 0,
+            f32_heap_bytes_saved: 0,
+            role_distribution: [0usize; 12],
+            vault_sha256: None,
+        };
+
+        for sp in &shard_paths {
+            let (_recs, sub) = self.distillation_engine.distill_safetensors_file_novel_only(
+                sp,
+                top_k_rows_per_layer,
+                max_layers_per_shard,
+                &self.mlir_catalog,
+                &mut self.swarm_map,
+                &self.immune.policy,
+            )?;
+            total_summary.tensors_distilled += sub.tensors_distilled;
+            total_summary.tensors_skipped_already_ingested += sub.tensors_skipped_already_ingested;
+            total_summary.novel_atoms_minted += sub.novel_atoms_minted;
+            total_summary.deduplicated_atoms_coalesced += sub.deduplicated_atoms_coalesced;
+            total_summary.novel_reasoning_arcs_minted += sub.novel_reasoning_arcs_minted;
+            total_summary.deduplicated_reasoning_arcs += sub.deduplicated_reasoning_arcs;
+            total_summary.f32_heap_bytes_saved += sub.f32_heap_bytes_saved;
+            for i in 0..12 {
+                total_summary.role_distribution[i] += sub.role_distribution[i];
+            }
+        }
+
+        if let Some(vp) = vault_path {
+            let (_atoms, _arcs, sha) = self.swarm_map.save_to_binary_vault(vp)?;
+            total_summary.vault_sha256 = Some(sha);
+        }
+
+        Ok(total_summary)
+    }
+
+    /// Continuous Live Novelty-Only Distillation Gate when a model is hooked up inside the server:
+    /// - Drops high-entropy guesses (`H(p) > max_entropy_bits_q32`).
+    /// - Deduplicates already-known `0-cell` information and `1-cell` reasoning transitions in `O(1)`.
+    /// - Mints and persists only genuinely new knowledge and reasoning transitions to `persistent_vault_path`.
+    pub fn observe_and_distill_live_step(
+        &mut self,
+        tap: &TeacherTapRecord,
+    ) -> Result<LiveNoveltyDistillationReceipt, String> {
+        let model_fp = self.swarm_map.base_weights.fingerprint;
+        let total_layers = self.swarm_map.base_weights.num_layers.max(1);
+        let receipt = self.distillation_engine.distill_live_step_novel_only(
+            tap,
+            total_layers,
+            model_fp,
+            self.last_live_atom,
+            &self.mlir_catalog,
+            &mut self.swarm_map,
+            &self.immune.policy,
+        )?;
+        if let (Some(aid), Some(r)) = (receipt.atom_id, receipt.role) {
+            self.last_live_atom = Some((aid, r));
+        }
+        if (receipt.atom_was_novel || receipt.arc_was_novel)
+            && let Some(ref vp) = self.persistent_vault_path
+        {
+            let _ = self.swarm_map.save_to_binary_vault(vp);
+        }
+        Ok(receipt)
+    }
+
+    /// Distill a multi-step teacher **Reasoning Trajectory (`1-cells` + `2-cell` Holonomy + Native MLIR)**
+    /// into the centralized `CarvedSwarmMap`.
+    pub fn distill_reasoning_trajectory(
+        &mut self,
+        chain_id: u64,
+        teacher_steps: &[TeacherTapRecord],
+        total_teacher_layers: usize,
+        teacher_fingerprint: atoma_immune::Sha256Digest,
+    ) -> Result<ReasoningChainDistillationReceipt, String> {
+        self.distillation_engine.distill_reasoning_chain(
+            chain_id,
+            teacher_steps,
+            total_teacher_layers,
+            teacher_fingerprint,
+            &self.mlir_catalog,
+            &mut self.swarm_map,
+            &self.immune.policy,
+        )
     }
 
     /// Execute `Agent → Govern → Immune-check` inter-role handoff through the single server door,
@@ -202,6 +435,91 @@ impl MonsterHybridServer {
         Ok((receipt, permit))
     }
 
+    /// Hydrate `role`'s specialist worker at `target_head_dim` from the centralized `CarvedSwarmMap`,
+    /// automatically projecting any KV payloads deposited by older model epochs through
+    /// `ModelAdapterLens` under Layer 3 (`authorize_cross_epoch_adaptation`).
+    pub fn hydrate_role_from_central_vault(
+        &mut self,
+        role: RoleId,
+        target_head_dim: usize,
+    ) -> Result<CrossEpochHydrationReceipt, ComplianceViolation> {
+        self.governor.hydrate_worker_from_silo_with_adapter(
+            role,
+            target_head_dim,
+            &self.swarm_map,
+            &mut self.immune,
+        )
+    }
+
+    /// Synthesize a typed [`MlirSsaBlock`] directly from continuous model `hidden_states` via
+    /// [`GeodesicMlirDecoder`] (bypassing `BpeTokenizer` and `token_id`s completely), verify it
+    /// through Layer 3 (`MlirNativeSsaGate`), and dispatch + execute it across `from_role -> to_role`.
+    pub fn synthesize_and_dispatch_geodesic_mlir(
+        &mut self,
+        from_role: RoleId,
+        to_role: RoleId,
+        shared_atom_id: AtomId,
+        hidden_states: &[Vec<f32>],
+    ) -> Result<(GeodesicDecodeReceipt, NativeMlirDispatchReceipt), ComplianceViolation> {
+        let decode_receipt = GeodesicMlirDecoder::decode_from_hidden_states(
+            &self.mlir_catalog,
+            from_role,
+            hidden_states,
+        )
+        .map_err(|e| ComplianceViolation::InvalidMlirSsaBlock {
+            reason: e.to_string(),
+        })?;
+        let dispatch_receipt = self.dispatch_native_mlir_block(
+            from_role,
+            to_role,
+            shared_atom_id,
+            &decode_receipt.block,
+        )?;
+        Ok((decode_receipt, dispatch_receipt))
+    }
+
+    /// Dispatch and execute a native typed [`MlirSsaBlock`] between `from_role` and `to_role`
+    /// over the binary handoff ring buffer (`0` JSON, `0` UTF-8, `0` Python glue), gated by
+    /// Layer 3 (`ImmuneSystem::authorize_mlir_ssa_block` + `authorize_handoff`).
+    pub fn dispatch_native_mlir_block(
+        &mut self,
+        from_role: RoleId,
+        to_role: RoleId,
+        shared_atom_id: AtomId,
+        block: &MlirSsaBlock,
+    ) -> Result<NativeMlirDispatchReceipt, ComplianceViolation> {
+        let (validation, ssa_permit) = self.immune.authorize_mlir_ssa_block(
+            from_role,
+            to_role,
+            block,
+            &self.mlir_catalog,
+            &self.swarm_map,
+        )?;
+        let wire_bytes = block.to_wire_bytes();
+        let handoff = self.handoff_between_roles(from_role, to_role, shared_atom_id, wire_bytes)?;
+
+        // Receiver decodes the binary MLIR_SSA wire payload directly and executes deterministically
+        let decoded_block = MlirSsaBlock::from_wire_bytes(&handoff.wire_packet.payload).map_err(|e| {
+            ComplianceViolation::InvalidMlirSsaBlock {
+                reason: e.to_string(),
+            }
+        })?;
+        let result_q32 = decoded_block
+            .execute_deterministic(&self.mlir_catalog, from_role)
+            .map_err(|e| ComplianceViolation::InvalidMlirSsaBlock {
+                reason: e.to_string(),
+            })?;
+        let expanded_model_tokens = decoded_block.expand_to_model_tokens(&self.mlir_catalog);
+
+        Ok(NativeMlirDispatchReceipt {
+            handoff,
+            validation,
+            ssa_permit,
+            result_q32,
+            expanded_model_tokens,
+        })
+    }
+
     /// Evaluate the Non-Abelian Levi-Civita Hyperbolic Holonomy and Gauss–Bonnet Berry Phase
     /// around a closed reasoning loop of specialist roles (`roles`).
     pub fn evaluate_reasoning_holonomy(&self, roles: &[RoleId]) -> HolonomyLoopReceipt {
@@ -236,4 +554,336 @@ impl MonsterHybridServer {
             &digests,
         )
     }
+
+    /// Load an existing `.atoma_map` binary vault into `self.swarm_map` (if it exists on disk)
+    /// and bind `self.persistent_vault_path = Some(vault_path.to_path_buf())`.
+    pub fn load_or_init_persistent_vault(
+        &mut self,
+        vault_path: &std::path::Path,
+    ) -> Result<(usize, usize, Option<atoma_immune::Sha256Digest>), String> {
+        self.persistent_vault_path = Some(vault_path.to_path_buf());
+        if vault_path.exists() {
+            let (atoms, arcs, sha) = self
+                .swarm_map
+                .load_from_binary_vault(vault_path, &self.immune.policy)?;
+            Ok((atoms, arcs, Some(sha)))
+        } else {
+            Ok((
+                self.swarm_map.global_atom_count(),
+                self.swarm_map.reasoning_arcs.len(),
+                None,
+            ))
+        }
+    }
+
+    /// Execute a full Geodesic Query against the in-memory `CarvedSwarmMap`:
+    /// 1. Deterministic 6-axis icosahedral routing (`classify_icosahedral_well` or explicit `role_override`)
+    ///    and refraction of `query_text` into `(H³ × T²)/Γ₁₂`.
+    /// 2. Silo-isolated `top_k` `0-cell` retrieval (`SiloView::retrieve_in_silo`) with cross-epoch
+    ///    `ModelAdapterLens` KV energy verification.
+    /// 3. Multi-hop `1-cell` geodesic reasoning chain traversal (`DistilledReasoningArc`s) starting
+    ///    from the nearest reasoning anchor in the query's hyperbolic neighborhood.
+    /// 4. Tokenless `GeodesicMlirDecoder` SSA synthesis & deterministic execution (`result_q32`)
+    ///    plus `2-cell` Gauss–Bonnet holonomy verification.
+    /// 5. Optional live novelty-only ingestion (`learn_novel_query = true`) that persists genuinely
+    ///    new query states back to `persistent_vault_path`.
+    pub fn query_swarm_map(
+        &mut self,
+        query_text: &str,
+        role_override: Option<RoleId>,
+        top_k: usize,
+        max_reasoning_hops: usize,
+        learn_novel_query: bool,
+    ) -> Result<SwarmMapQueryResult, String> {
+        let k = top_k.max(1);
+        // Embed `query_text` into a deterministic 256d continuous query vector
+        let q_bytes = query_text.as_bytes();
+        let q_digest = atoma_immune::Sha256Digest::compute(q_bytes);
+        let mut hidden_state = vec![0.0f32; 256];
+        for i in 0..256 {
+            let b0 = q_bytes.get(i % q_bytes.len().max(1)).copied().unwrap_or(1) as f32;
+            let b1 = q_digest.0[i % 32] as f32 / 255.0 - 0.5;
+            let phase = (i as f32) * 0.137 + (b0 * 0.029);
+            hidden_state[i] = (phase.sin() * 0.65 + b1 * 0.35).clamp(-1.0, 1.0);
+        }
+
+        // Derive low-entropy query distribution from 4 spectral sub-bands
+        let mut band_e = [1e-6f32; 4];
+        for b in 0..4 {
+            for &v in &hidden_state[b * 64..(b + 1) * 64] {
+                band_e[b] += v * v;
+            }
+        }
+        // Sharpen query focus so well classification is high-certainty
+        let max_idx = band_e
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        band_e[max_idx] *= 6.0;
+        let sum_e: f32 = band_e.iter().sum();
+        let next_op_probs: Vec<f32> = band_e.iter().map(|&e| e / sum_e).collect();
+
+        // Infer depth band hint from query keywords (sensory/syntax -> early, logic/math/causal -> mid, executive/audit/action -> late)
+        let lower = query_text.to_ascii_lowercase();
+        let total_layers = self.swarm_map.base_weights.num_layers.max(52);
+        let layer_hint = if lower.contains("exec")
+            || lower.contains("govern")
+            || lower.contains("audit")
+            || lower.contains("motor")
+            || lower.contains("cwe")
+            || lower.contains("security")
+        {
+            (total_layers * 4) / 5
+        } else if lower.contains("sensor")
+            || lower.contains("parse")
+            || lower.contains("token")
+            || lower.contains("spatial")
+        {
+            total_layers / 6
+        } else {
+            total_layers / 2
+        };
+
+        let mut payload = vec![0u8; 256];
+        for (i, &f) in hidden_state.iter().take(64).enumerate() {
+            payload[i * 4..(i + 1) * 4].copy_from_slice(&f.to_le_bytes());
+        }
+
+        let tap = TeacherTapRecord {
+            shard_id: u64::from_le_bytes(q_digest.0[0..8].try_into().unwrap()),
+            layer_index: layer_hint,
+            hidden_state: hidden_state.clone(),
+            next_op_probs,
+            payload,
+        };
+
+        let mut projected = self.projector.project(&tap).map_err(|e| e.to_string())?;
+        let (classified_role, offset, _cert) =
+            OpenWeightsDistillationEngine::classify_icosahedral_well(
+                &self.swarm_map.atlas,
+                &tap.hidden_state,
+                layer_hint,
+                total_layers,
+                projected.loss_report.teacher_entropy_bits_q32,
+            );
+        let target_role = role_override.unwrap_or(classified_role);
+
+        let well = self.swarm_map.atlas.well(target_role);
+        let d_sph = Q32_31::from_f64(0.804_735_5);
+        projected.tangent_h3 = [
+            (well.unit_dir[0] * d_sph) + offset[0],
+            (well.unit_dir[1] * d_sph) + offset[1],
+            (well.unit_dir[2] * d_sph) + offset[2],
+        ];
+        let refracted = OpticalLens::refract(&projected, well.phase).map_err(|e| e.to_string())?;
+        let query_lorentz = refracted.lorentz;
+
+        // 1. Silo-isolated 0-cell retrieval (`SiloView::retrieve_in_silo`)
+        let silo = self
+            .swarm_map
+            .silo(target_role)
+            .ok_or_else(|| "Target role has no carved silo".to_string())?;
+        let silo_atom_count = silo.atom_count();
+        let raw_hits = silo.retrieve_in_silo(&query_lorentz, k);
+        let target_fp = self.swarm_map.base_weights.fingerprint;
+
+        let mut hits = Vec::with_capacity(raw_hits.len());
+        for sa in raw_hits {
+            let cosh_dist =
+                OpticalLens::lorentz_inner_product_wide(&query_lorentz, &sa.global_lorentz);
+            let adapted_energy = if sa.payload.len() >= 16 && sa.payload.len() % 8 == 0 {
+                atoma_immune::ModelAdapterLens::adapt_kv_payload(
+                    sa.id,
+                    &sa.payload,
+                    sa.origin_model_fingerprint,
+                    target_fp,
+                    sa.phase,
+                    64,
+                )
+                .map(|rec| rec.loss_report.retained_k_energy_ratio_q32)
+                .unwrap_or(Q32_31::ONE)
+            } else {
+                Q32_31::ONE
+            };
+            hits.push(RetrievedAtomHit {
+                atom_id: sa.id,
+                cosh_distance_q32: cosh_dist,
+                well_cosh_dist_q32: sa.well_cosh_dist,
+                in_boundary_overlap: sa.in_boundary_overlap,
+                salience_count: sa.salience_count,
+                origin_model_fingerprint: sa.origin_model_fingerprint,
+                adapted_kv_retention_q32: adapted_energy,
+                payload_bytes: sa.payload.len(),
+            });
+        }
+
+        // 2. Find the nearest 1-cell reasoning-chain anchor atom to `query_lorentz` and traverse `max_reasoning_hops`
+        let start_anchor = hits
+            .iter()
+            .find(|h| {
+                self.swarm_map
+                    .reasoning_arcs
+                    .iter()
+                    .any(|a| a.from_atom == h.atom_id)
+            })
+            .map(|h| h.atom_id)
+            .or_else(|| {
+                self.swarm_map
+                    .reasoning_arcs
+                    .iter()
+                    .filter_map(|arc| {
+                        self.swarm_map.global_atom(arc.from_atom).map(|ga| {
+                            let ip = OpticalLens::lorentz_inner_product_wide(
+                                &query_lorentz,
+                                &ga.lorentz,
+                            );
+                            (ip, arc.from_atom)
+                        })
+                    })
+                    .min_by_key(|(ip, _)| ip.0)
+                    .map(|(_, id)| id)
+            });
+
+        let mut reasoning_hops = Vec::new();
+        let mut visited_roles = vec![target_role];
+        let mut hop_states = vec![hidden_state];
+
+        if let Some(anchor_id) = start_anchor {
+            let arcs = self
+                .swarm_map
+                .query_reasoning_trajectory(anchor_id, max_reasoning_hops.max(1));
+            for arc in arcs {
+                let mnemonic = self
+                    .mlir_catalog
+                    .get_op(arc.compiled_mlir_op)
+                    .map(|d| d.mnemonic.clone())
+                    .unwrap_or_else(|| "atoma.unknown".to_string());
+                if visited_roles.last() != Some(&arc.to_role) {
+                    visited_roles.push(arc.to_role);
+                }
+                if let Some(to_ga) = self.swarm_map.global_atom(arc.to_atom) {
+                    if to_ga.payload.len() >= 64 {
+                        let floats: Vec<f32> = to_ga
+                            .payload
+                            .chunks_exact(4)
+                            .take(64)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        hop_states.push(floats);
+                    }
+                }
+                reasoning_hops.push(ReasoningHopHit {
+                    arc_id: arc.arc_id,
+                    from_atom: arc.from_atom,
+                    to_atom: arc.to_atom,
+                    from_role: arc.from_role,
+                    to_role: arc.to_role,
+                    cosh_action_q32: arc.cosh_action_q32,
+                    teacher_certainty_q32: arc.teacher_certainty_q32,
+                    mlir_op_id: arc.compiled_mlir_op.0,
+                    mlir_mnemonic: mnemonic,
+                });
+            }
+        }
+
+        // 3. Synthesize and deterministically execute the native MLIR SSA block for the query + reasoning trajectory
+        let decode_rec = GeodesicMlirDecoder::decode_from_hidden_states(
+            &self.mlir_catalog,
+            target_role,
+            &hop_states,
+        )
+        .map_err(|e| e.to_string())?;
+        let ssa_result_q32 = decode_rec
+            .block
+            .execute_deterministic(&self.mlir_catalog, target_role)
+            .map_err(|e| e.to_string())?;
+        let ssa_mnemonics: Vec<String> = decode_rec
+            .block
+            .instructions
+            .iter()
+            .filter_map(|inst| {
+                self.mlir_catalog
+                    .get_op(inst.op_id)
+                    .map(|d| d.mnemonic.clone())
+            })
+            .collect();
+
+        // 4. Evaluate 2-cell Gauss-Bonnet holonomy across the visited role trajectory
+        let mut closed_roles = visited_roles.clone();
+        if closed_roles.len() >= 2 && closed_roles.first() != closed_roles.last() {
+            closed_roles.push(closed_roles[0]);
+        }
+        let holonomy = self.evaluate_reasoning_holonomy(&closed_roles);
+
+        // 5. Optional live novelty-only learning
+        let live_ingest = if learn_novel_query {
+            Some(self.observe_and_distill_live_step(&tap)?)
+        } else {
+            None
+        };
+
+        Ok(SwarmMapQueryResult {
+            query_text: query_text.to_string(),
+            routed_role: target_role,
+            query_lorentz_x: query_lorentz.x,
+            query_sector: refracted.invariant.n,
+            silo_atom_count,
+            global_atom_count: self.swarm_map.global_atom_count(),
+            global_reasoning_arc_count: self.swarm_map.reasoning_arcs.len(),
+            hits,
+            reasoning_hops,
+            synthesized_mlir_program: ssa_mnemonics,
+            mlir_execution_result_q32: ssa_result_q32,
+            holonomy_flux_rad_q32: holonomy.enclosed_curvature_flux_q32,
+            live_ingest,
+        })
+    }
 }
+
+/// A single `0-cell` atom retrieved from a specialist's carved `SiloView` during a query.
+#[derive(Debug, Clone)]
+pub struct RetrievedAtomHit {
+    pub atom_id: AtomId,
+    pub cosh_distance_q32: Q32_31,
+    pub well_cosh_dist_q32: Q32_31,
+    pub in_boundary_overlap: bool,
+    pub salience_count: u32,
+    pub origin_model_fingerprint: atoma_immune::Sha256Digest,
+    pub adapted_kv_retention_q32: Q32_31,
+    pub payload_bytes: usize,
+}
+
+/// A single `1-cell` geodesic reasoning hop traversed during a query.
+#[derive(Debug, Clone)]
+pub struct ReasoningHopHit {
+    pub arc_id: u64,
+    pub from_atom: AtomId,
+    pub to_atom: AtomId,
+    pub from_role: RoleId,
+    pub to_role: RoleId,
+    pub cosh_action_q32: Q32_31,
+    pub teacher_certainty_q32: Q32_31,
+    pub mlir_op_id: u32,
+    pub mlir_mnemonic: String,
+}
+
+/// Complete response returned by [`MonsterHybridServer::query_swarm_map`].
+#[derive(Debug, Clone)]
+pub struct SwarmMapQueryResult {
+    pub query_text: String,
+    pub routed_role: RoleId,
+    pub query_lorentz_x: [Q32_31; 4],
+    pub query_sector: u8,
+    pub silo_atom_count: usize,
+    pub global_atom_count: usize,
+    pub global_reasoning_arc_count: usize,
+    pub hits: Vec<RetrievedAtomHit>,
+    pub reasoning_hops: Vec<ReasoningHopHit>,
+    pub synthesized_mlir_program: Vec<String>,
+    pub mlir_execution_result_q32: Q32_31,
+    pub holonomy_flux_rad_q32: Q32_31,
+    pub live_ingest: Option<LiveNoveltyDistillationReceipt>,
+}
+

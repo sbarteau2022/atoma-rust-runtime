@@ -1,10 +1,4 @@
-//! Muse Glimmer weight manager and config.
-//!
-//! Pure transformer (52 layers, all standard attention).
-//! Tensor names: `model.layers.{n}.self_attn.{q,k,v,o}_proj.{weight,scales,biases}`
-//! No `language_model.` prefix (unlike Qwen).
-
-use crate::metal::{accelerate_matvec_f32, qmatvec_fused_zero_copy};
+use crate::metal::{accelerate_matvec_f32, dequantize_row_zero_copy, qmatvec_fused_zero_copy};
 use crate::optiq::{DequantError, dequantize, load_f32_tensor};
 use crate::metal_quant::MetalQuantGemm;
 use crate::safetensors::{SafeTensorError, SafeTensorFile};
@@ -259,10 +253,8 @@ impl WeightManager {
         Ok(&self.shards[*idx])
     }
     pub fn get_weight(&mut self, name: &str) -> Result<Vec<f32>, GlimmerError> {
-        if self.retain_cache {
-            if let Some(v) = self.cache.get(name) {
-                return Ok(v.clone());
-            }
+        if let Some(v) = self.cache.get(name) {
+            return Ok(v.clone());
         }
         let base = name.trim_end_matches(".weight");
         let scales_name = format!("{}.scales", base);
@@ -293,11 +285,92 @@ impl WeightManager {
         if has_scales {
             self.apply_out_scale(base, rows, &mut data)?;
         }
-        if self.retain_cache {
+        // Always cache small 1D norm/scale vectors (<= 65,536 floats, < 4 MB total across 52 layers)
+        if self.retain_cache || data.len() <= 65_536 {
             self.cache.insert(name.to_string(), data.clone());
         }
         Ok(data)
     }
+
+    /// Dequantize a single row `row` (`cols` elements) from a 2D weight tensor (e.g. `embed_tokens.weight`).
+    ///
+    /// Eliminates the `5.08 GB/token` full-vocabulary dequantization in `GlimmerModel::embed(token_id)`
+    /// (`248,320×` reduction in embedding lookup work).
+    pub fn get_weight_row(
+        &mut self,
+        name: &str,
+        row: usize,
+        cols: usize,
+    ) -> Result<Vec<f32>, GlimmerError> {
+        if let Some(cached) = self.cache.get(name) {
+            let start = row.saturating_mul(cols);
+            if start + cols > cached.len() {
+                return Err(GlimmerError::Parse(format!(
+                    "row {row} (cols {cols}) out of range for cached {name} (len {})",
+                    cached.len()
+                )));
+            }
+            return Ok(cached[start..start + cols].to_vec());
+        }
+
+        let base = name.trim_end_matches(".weight");
+        let scales_name = format!("{}.scales", base);
+        let biases_name = format!("{}.biases", base);
+        let has_scales = self.tensor_to_shard.contains_key(&scales_name);
+
+        if has_scales && !self.retain_cache {
+            let (bits, group_size) = self.quant_for(base);
+            let out_scale_name = format!("{base}.out_scale");
+            let row_out_scale = if self.tensor_to_shard.contains_key(&out_scale_name) {
+                let os_vec = self.get_weight(&out_scale_name)?;
+                *os_vec.get(row).unwrap_or(&1.0)
+            } else {
+                1.0
+            };
+
+            let w_file = self.shard_for(name)?;
+            let w_info = w_file.tensor_info(name)?;
+            let total_rows = *w_info.shape.first().unwrap_or(&0);
+            if row >= total_rows {
+                return Err(GlimmerError::Parse(format!(
+                    "row {row} >= total_rows {total_rows} for {name}"
+                )));
+            }
+            let w_data = w_file.tensor_data(name)?;
+            let s_file = self.shard_for(&scales_name)?;
+            let s_info = s_file.tensor_info(&scales_name)?;
+            let s_data = s_file.tensor_data(&scales_name)?;
+            let b_file = self.shard_for(&biases_name)?;
+            let b_info = b_file.tensor_info(&biases_name)?;
+            let b_data = b_file.tensor_data(&biases_name)?;
+
+            return dequantize_row_zero_copy(
+                w_data,
+                &w_info.dtype,
+                s_data,
+                &s_info.dtype,
+                b_data,
+                &b_info.dtype,
+                row_out_scale,
+                bits,
+                group_size,
+                row,
+                cols,
+            )
+            .map_err(|e| GlimmerError::Dequant(DequantError::ShapeMismatch(e)));
+        }
+
+        let full = self.get_weight(name)?;
+        let start = row.saturating_mul(cols);
+        if start + cols > full.len() {
+            return Err(GlimmerError::Parse(format!(
+                "row {row} (cols {cols}) out of range for {name} (len {})",
+                full.len()
+            )));
+        }
+        Ok(full[start..start + cols].to_vec())
+    }
+
     fn apply_out_scale(&self, base: &str, rows: usize, data: &mut [f32]) -> Result<(), GlimmerError> {
         let name = format!("{base}.out_scale");
         if !self.tensor_to_shard.contains_key(&name) {
@@ -337,16 +410,8 @@ impl WeightManager {
         Ok((info.shape[0], info.shape[1]))
     }
 
-    /// Zero-copy fused matrix-vector multiply (`y = W * x`) directly over memory-mapped
-    /// `SafeTensorFile` shards (`core_lm::metal::qmatvec_fused_zero_copy`).
-    ///
-    /// Why this eliminates the 87-sec/token CPU bottleneck:
-    /// When `retain_cache == false` (required for 27B/35B models whose full f32 weights exceed RAM),
-    /// calling `get_weight()` allocated ~108 GB of temporary `Vec<f32>` buffers per token.
-    /// `matvec_weight` computes `W * x` in-place directly from the mmap'd `U32`/`BF16` slices with
-    /// zero weight-matrix heap allocations and precomputed group sums `X_group[g]`.
-    /// Try Metal GPU quantized GEMV. Returns None if Metal unavailable or scales not F32.
-    /// Falls back to CPU on any error.
+    /// Dispatch MPS-class SIMD-group Metal GPU quantized GEMV (`q4_gemv`, `q6_gemv`, `q_generic_gemv`)
+    /// with persistent Unified-Memory `MTLBuffer` caching across `BF16`, `F16`, and `F32` scales/biases.
     #[allow(clippy::too_many_arguments)]
     fn try_metal_gemv(
         &self,
@@ -364,40 +429,62 @@ impl WeightManager {
         x: &[f32],
     ) -> Option<Vec<f32>> {
         let gemm = self.metal_gemm.as_ref()?;
-        
-        // Only F32 scales/biases supported in Metal kernel currently
-        if s_dtype != "F32" || b_dtype != "F32" {
+
+        if !matches!(s_dtype, "BF16" | "F16" | "F32") || !matches!(b_dtype, "BF16" | "F16" | "F32") {
             return None;
         }
-        if w_dtype != "U32" {
+        if w_dtype != "U32" || w_data.len() % 4 != 0 || (w_data.as_ptr() as usize) % 4 != 0 {
             return None;
         }
-        
-        // Convert w_data bytes to u32 slice
-        if w_data.len() % 4 != 0 {
-            return None;
-        }
+
         let packed: &[u32] = unsafe {
-            std::slice::from_raw_parts(
-                w_data.as_ptr() as *const u32,
-                w_data.len() / 4,
-            )
+            std::slice::from_raw_parts(w_data.as_ptr() as *const u32, w_data.len() / 4)
         };
-        
+
         let result = if bits == 4 {
             gemm.q4_gemv(
-                packed, s_data, b_data, out_scale, x,
-                rows as u32, cols as u32, group_size as u32,
+                packed,
+                s_data,
+                b_data,
+                out_scale,
+                x,
+                rows as u32,
+                cols as u32,
+                group_size as u32,
+                s_dtype,
+                b_dtype,
             )
         } else if bits == 6 {
             gemm.q6_gemv(
-                packed, s_data, b_data, out_scale, x,
-                rows as u32, cols as u32, group_size as u32,
+                packed,
+                s_data,
+                b_data,
+                out_scale,
+                x,
+                rows as u32,
+                cols as u32,
+                group_size as u32,
+                s_dtype,
+                b_dtype,
+            )
+        } else if bits > 0 && bits <= 16 {
+            gemm.q_generic_gemv(
+                packed,
+                s_data,
+                b_data,
+                out_scale,
+                x,
+                rows as u32,
+                cols as u32,
+                group_size as u32,
+                bits,
+                s_dtype,
+                b_dtype,
             )
         } else {
-            return None; // Unsupported bits for Metal
+            return None;
         };
-        
+
         match result {
             Ok(out) => Some(out),
             Err(e) => {
@@ -439,8 +526,7 @@ impl WeightManager {
             let (bits, group_size) = self.quant_for(base);
             let out_scale_name = format!("{base}.out_scale");
             let out_scale_vec = if self.tensor_to_shard.contains_key(&out_scale_name) {
-                let os_file = self.shard_for(&out_scale_name)?;
-                Some(load_f32_tensor(os_file, &out_scale_name)?)
+                Some(self.get_weight(&out_scale_name)?)
             } else {
                 None
             };
@@ -454,18 +540,23 @@ impl WeightManager {
             let b_info = b_file.tensor_info(&biases_name)?;
             let b_data = b_file.tensor_data(&biases_name)?;
 
-            // Try Metal GPU first (if available and scales are F32)
             if self.use_metal {
                 if let Some(metal_out) = self.try_metal_gemv(
-                    w_data, &w_info.dtype,
-                    s_data, &s_info.dtype,
-                    b_data, &b_info.dtype,
+                    w_data,
+                    &w_info.dtype,
+                    s_data,
+                    &s_info.dtype,
+                    b_data,
+                    &b_info.dtype,
                     out_scale_vec.as_deref(),
-                    bits, group_size, rows, cols, x,
+                    bits,
+                    group_size,
+                    rows,
+                    cols,
+                    x,
                 ) {
                     return Ok(metal_out);
                 }
-                // Fall through to CPU on Metal failure
             }
 
             return Ok(qmatvec_fused_zero_copy(

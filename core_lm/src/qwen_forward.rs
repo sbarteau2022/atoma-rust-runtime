@@ -44,18 +44,12 @@ impl QwenModel {
     }
 
     fn embed(&mut self, token_id: u32) -> Result<Vec<f32>, ModelError> {
-        let w = self
-            .weights
-            .get_weight("language_model.model.embed_tokens.weight")?;
         let h = self.config.hidden_size;
-        let start = (token_id as usize) * h;
-        if start + h > w.len() {
-            return Err(ModelError::MissingWeight(format!(
-                "token {} out of range",
-                token_id
-            )));
-        }
-        Ok(w[start..start + h].to_vec())
+        self.weights.get_weight_row(
+            "language_model.model.embed_tokens.weight",
+            token_id as usize,
+            h,
+        )
     }
 
     fn full_attention(
@@ -82,26 +76,20 @@ impl QwenModel {
             eps,
         )?;
 
-        let q = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.self_attn.q_proj.weight", p))?,
+        let q = self.weights.matvec_weight(
+            &format!("{}.self_attn.q_proj.weight", p),
             nh * hd,
             h,
             &xn,
         )?;
-        let k = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.self_attn.k_proj.weight", p))?,
+        let k = self.weights.matvec_weight(
+            &format!("{}.self_attn.k_proj.weight", p),
             nkv * hd,
             h,
             &xn,
         )?;
-        let v = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.self_attn.v_proj.weight", p))?,
+        let v = self.weights.matvec_weight(
+            &format!("{}.self_attn.v_proj.weight", p),
             nkv * hd,
             h,
             &xn,
@@ -188,10 +176,8 @@ impl QwenModel {
             let _ = repeat;
         }
 
-        let o = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.self_attn.o_proj.weight", p))?,
+        let o = self.weights.matvec_weight(
+            &format!("{}.self_attn.o_proj.weight", p),
             h,
             nh * hd,
             &attn_out,
@@ -217,8 +203,8 @@ impl QwenModel {
             eps,
         )?;
 
-        let gate_logits = matvec(
-            &self.weights.get_weight(&format!("{}.mlp.gate.weight", p))?,
+        let gate_logits = self.weights.matvec_weight(
+            &format!("{}.mlp.gate.weight", p),
             num_experts,
             h,
             &xn,
@@ -265,16 +251,14 @@ impl QwenModel {
         }
 
         let sp = format!("{}.mlp.shared_expert", p);
-        let s_gate = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.gate_proj.weight", sp))?,
+        let s_gate = self.weights.matvec_weight(
+            &format!("{}.gate_proj.weight", sp),
             shared_inter,
             h,
             &xn,
         )?;
-        let s_up = matvec(
-            &self.weights.get_weight(&format!("{}.up_proj.weight", sp))?,
+        let s_up = self.weights.matvec_weight(
+            &format!("{}.up_proj.weight", sp),
             shared_inter,
             h,
             &xn,
@@ -285,10 +269,8 @@ impl QwenModel {
             .zip(s_up.iter())
             .map(|(g, u)| g * u)
             .collect();
-        let s_down = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.down_proj.weight", sp))?,
+        let s_down = self.weights.matvec_weight(
+            &format!("{}.down_proj.weight", sp),
             h,
             shared_inter,
             &s_hidden,
@@ -313,26 +295,20 @@ impl QwenModel {
             eps,
         )?;
 
-        let qkv = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.linear_attn.in_proj_qkv.weight", p))?,
+        let qkv = self.weights.matvec_weight(
+            &format!("{}.linear_attn.in_proj_qkv.weight", p),
             h * 3,
             h,
             &xn,
         )?;
-        let z = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.linear_attn.in_proj_z.weight", p))?,
+        let z = self.weights.matvec_weight(
+            &format!("{}.linear_attn.in_proj_z.weight", p),
             h,
             h,
             &xn,
         )?;
-        let o = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.linear_attn.out_proj.weight", p))?,
+        let o = self.weights.matvec_weight(
+            &format!("{}.linear_attn.out_proj.weight", p),
             h,
             h,
             &qkv[..h],
@@ -368,8 +344,8 @@ impl QwenModel {
 
         let norm_w = self.weights.get_f32("language_model.model.norm.weight")?;
         let xn = rmsnorm(&x, &norm_w, self.config.rms_norm_eps)?;
-        let logits = matvec(
-            &self.weights.get_weight("language_model.lm_head.weight")?,
+        let logits = self.weights.matvec_weight(
+            "language_model.lm_head.weight",
             self.config.vocab_size,
             self.config.hidden_size,
             &xn,

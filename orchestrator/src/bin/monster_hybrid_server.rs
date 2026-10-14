@@ -298,6 +298,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         y_fused[0]
     );
 
+    // Benchmark 6-bit Tight-Packed OptiQ (96-bit / 3xU32 super-word unpacking, crossing word boundaries)
+    let n_words_q6 = (q_rows * q_cols * 6) / 32;
+    let packed_w6: Vec<u8> = (0..(n_words_q6 * 4)).map(|i| (i.wrapping_mul(53) & 0xFF) as u8).collect();
+    let t_q6_start = std::time::Instant::now();
+    let y_q6 = atoma_immune::metal::qmatvec_fused_zero_copy(
+        &packed_w6,
+        "U32",
+        &scales_bf16,
+        "BF16",
+        &biases_bf16,
+        "BF16",
+        Some(&out_scale),
+        6,
+        group_size,
+        q_rows,
+        q_cols,
+        &x_in,
+    )?;
+    let q6_us = t_q6_start.elapsed().as_micros();
+
+    // Benchmark Single-Row Embedding Dequantization (`embed(token_id)`)
+    let t_row_start = std::time::Instant::now();
+    let emb_row = atoma_immune::metal::dequantize_row_zero_copy(
+        &packed_w,
+        "U32",
+        &scales_bf16,
+        "BF16",
+        &biases_bf16,
+        "BF16",
+        out_scale[42],
+        4,
+        group_size,
+        42,
+        q_cols,
+    )?;
+    let row_ns = t_row_start.elapsed().as_nanos();
+    println!(
+        "[verified] Fused 6-Bit Super-Word GEMV ({}x{}, 6-bit/g128): latency={}us y6[0]={:.4} | Single-Row Embed Dequant (1x{}): latency={}ns emb[0]={:.4}",
+        q_rows,
+        q_cols,
+        q6_us,
+        y_q6[0],
+        q_cols,
+        row_ns,
+        emb_row[0]
+    );
+
     // Verify 900-pair ball-hyperboloid isometry bound
     let p_a = [
         Q32_31::from_f64(0.21),
@@ -366,7 +413,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         deposit_receipt.coalesced_existing_atoms,
         deposit_receipt.total_global_atoms_after,
         deposit_permit.sequence(),
-        &deposit.compute_digest().to_hex()[..16]
+        &deposit.origin_model_fingerprint.to_hex()[..16]
     );
 
     // 16. Pluggable Model Hot-Swap without Memory Re-Distillation (Centralized Memory Decoupling)
@@ -383,9 +430,687 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &swap_receipt.new_fingerprint.to_hex()[..16]
     );
 
+    // 17. Cross-Epoch ModelAdapterLens Hydration (128d Epoch-1 Deposit -> 256d Epoch-2 Worker)
+    let hydration = server.hydrate_role_from_central_vault(RoleId::SensoryPerception, 256)?;
+    let first_adapted = &hydration.adapted_records[0];
+    let hd_256 = 256usize;
+    let q_256: Vec<f32> = (0..hd_256).map(|d| ((d as f32) * 0.11).cos()).collect();
+    let k_256: Vec<f32> = (0..hd_256).map(|d| ((d as f32) * 0.11).cos() + 0.01).collect();
+    let v_256: Vec<f32> = (0..hd_256).map(|d| ((d as f32) * 0.07).sin()).collect();
+    let o_256: Vec<f32> = (0..(hd_256 * hd_256)).map(|i| ((i as f32) * 0.002).cos() * 0.03).collect();
+    let fwd_256 = server.execute_governed_forward(
+        RoleId::SensoryPerception,
+        2048,
+        1,
+        &q_256,
+        &k_256,
+        &v_256,
+        &o_256,
+    )?;
+    println!(
+        "[verified] Cross-Epoch ModelAdapterLens (L1 Sensory): hydrated={} {}d->{}d retained_k={:.4} retained_v={:.4} rope_integrity={:.4} next_gen_out_dim={}",
+        hydration.adapted_records.len(),
+        first_adapted.loss_report.source_head_dim,
+        first_adapted.loss_report.target_head_dim,
+        first_adapted.loss_report.retained_k_energy_ratio_q32.to_f64(),
+        first_adapted.loss_report.retained_v_energy_ratio_q32.to_f64(),
+        first_adapted.loss_report.rope_pair_integrity_q32.to_f64(),
+        fwd_256.output_state.len()
+    );
+
+    // 18. Native Tokenless MLIR Inter-Process SSA Execution & Binary .atoma_ir Catalog
+    let catalog_blob = server.mlir_catalog.to_binary_blob();
+    let bin_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("design/mlir_atom_catalog.atoma_ir");
+    std::fs::write(&bin_path, &catalog_blob)?;
+    let reloaded_catalog = atoma_immune::MlirAtomCatalog::from_binary_blob(&catalog_blob)?;
+
+    let op_const = reloaded_catalog.lookup_by_mnemonic("arith.constant_q32").unwrap().op_id;
+    let op_add = reloaded_catalog.lookup_by_mnemonic("arith.add_q32").unwrap().op_id;
+    let op_mul = reloaded_catalog.lookup_by_mnemonic("arith.mul_q32").unwrap().op_id;
+    let op_ret = reloaded_catalog.lookup_by_mnemonic("func.return_q32").unwrap().op_id;
+
+    // SSA Program: %0 = 3.5; %1 = 2.0; %2 = %0 + %1 (5.5); %3 = %2 * %1 (11.0); return %3
+    let ssa_block = atoma_immune::MlirSsaBlock::new(vec![
+        atoma_immune::NativeMlirInstruction {
+            op_id: op_const,
+            dst_reg: 0,
+            src_regs: [0; 4],
+            arity: 0,
+            immediate_q32: Q32_31::from_f64(3.5),
+        },
+        atoma_immune::NativeMlirInstruction {
+            op_id: op_const,
+            dst_reg: 1,
+            src_regs: [0; 4],
+            arity: 0,
+            immediate_q32: Q32_31::from_f64(2.0),
+        },
+        atoma_immune::NativeMlirInstruction {
+            op_id: op_add,
+            dst_reg: 2,
+            src_regs: [0, 1, 0, 0],
+            arity: 2,
+            immediate_q32: Q32_31::ZERO,
+        },
+        atoma_immune::NativeMlirInstruction {
+            op_id: op_mul,
+            dst_reg: 3,
+            src_regs: [2, 1, 0, 0],
+            arity: 2,
+            immediate_q32: Q32_31::ZERO,
+        },
+        atoma_immune::NativeMlirInstruction {
+            op_id: op_ret,
+            dst_reg: 4,
+            src_regs: [3, 0, 0, 0],
+            arity: 1,
+            immediate_q32: Q32_31::ZERO,
+        },
+    ]);
+
+    let mlir_dispatch = server.dispatch_native_mlir_block(
+        RoleId::SensoryPerception,
+        RoleId::SomaticInteroception,
+        rec_boundary.atom_id,
+        &ssa_block,
+    )?;
+    let (_, trans_loss) = reloaded_catalog.tokens_to_mlir_ops(&mlir_dispatch.expanded_model_tokens);
+    println!(
+        "[verified] Native MLIR Inter-Process SSA Dispatch (L1->L3, 0 JSON/Python): ops={} wire_bytes={} result_q32={:.4} tokens={}->{}ops lossless={} catalog_sha256={}..",
+        mlir_dispatch.validation.instruction_count,
+        mlir_dispatch.handoff.wire_packet.payload.len(),
+        mlir_dispatch.result_q32.to_f64(),
+        trans_loss.input_token_count,
+        trans_loss.output_mlir_op_count,
+        trans_loss.roundtrip_lossless,
+        &reloaded_catalog.catalog_sha256.to_hex()[..16]
+    );
+
+    // 19. Geodesic MLIR Direct Hidden-State-to-SSA Pointer Synthesis (0 token_ids, 0 lm_head, 0 BpeTokenizer)
+    let continuous_states_256d: Vec<Vec<f32>> = (0..6)
+        .map(|step| {
+            (0..256)
+                .map(|d| ((d as f32) * 0.11 + (step as f32) * 0.67).sin() * 0.55)
+                .collect()
+        })
+        .collect();
+    let (geo_decode, geo_dispatch) = server.synthesize_and_dispatch_geodesic_mlir(
+        RoleId::SensoryPerception,
+        RoleId::SomaticInteroception,
+        rec_boundary.atom_id,
+        &continuous_states_256d,
+    )?;
+    let synthesized_mnemonics: Vec<&str> = geo_decode
+        .block
+        .instructions
+        .iter()
+        .filter_map(|inst| server.mlir_catalog.get_op(inst.op_id).map(|d| d.mnemonic.as_str()))
+        .collect();
+    println!(
+        "[verified] Geodesic MLIR Hidden-State->SSA Synthesis (256d->(H³xT²)/Γ₁₂, 0 tokens): steps={} masked_illegal_ops={} result_q32={:.4} program={:?}",
+        geo_dispatch.validation.instruction_count,
+        geo_decode.masked_illegal_opcodes_count,
+        geo_dispatch.result_q32.to_f64(),
+        synthesized_mnemonics
+    );
+
+    // 20. Open-Weights Knowledge (0-Cells) & Reasoning (1-Cells + 2-Cell Holonomy) Distillation Engine
+    let oss_weights: Vec<f32> = (0..32_768).map(|i| ((i as f32) * 0.017).cos() * 0.8).collect();
+    let oss_teacher = FrozenBaseWeights::freeze("DeepSeek-Qwen-OpenTeacher-64L", 64, oss_weights);
+    let weight_distill = server.distill_open_source_weights(&oss_teacher, 256, 24)?;
+    let populated_silos = weight_distill.role_distribution.iter().filter(|&&c| c > 0).count();
+    println!(
+        "[verified] Open-Weights Static Mode Distillation ({}): modes={} atoms_minted={} active_silos={}/12 mean_retained={:.4}",
+        weight_distill.teacher_model_name,
+        weight_distill.modes_scanned,
+        weight_distill.knowledge_atoms_minted,
+        populated_silos,
+        weight_distill.mean_retained_energy_q32.to_f64()
+    );
+
+    // Distill a 5-step teacher reasoning chain (4 low-entropy steps + 1 high-entropy guess that gets sieved out)
+    let reasoning_taps = vec![
+        TeacherTapRecord {
+            shard_id: 9001,
+            layer_index: 8, // Early layer -> Sensory/Symbolic/Spatial
+            hidden_state: (0..256).map(|i| ((i as f32) * 0.05).sin()).collect(),
+            next_op_probs: vec![0.88, 0.06, 0.04, 0.02],
+            payload: b"step0:sensory_premise".to_vec(),
+        },
+        TeacherTapRecord {
+            shard_id: 9002,
+            layer_index: 28, // Mid layer -> Logic/Causal/Episodic
+            hidden_state: (0..256).map(|i| ((i as f32) * 0.11 + 1.2).cos()).collect(),
+            next_op_probs: vec![0.04, 0.85, 0.06, 0.05],
+            payload: b"step1:causal_deduction".to_vec(),
+        },
+        TeacherTapRecord {
+            shard_id: 9003,
+            layer_index: 32, // High-entropy uniform guess (H = 3.0 bits > 2.75 ceiling) -> Sieved out!
+            hidden_state: (0..256).map(|i| ((i as f32) * 0.23).sin()).collect(),
+            next_op_probs: vec![0.125; 8],
+            payload: b"step_noise:hallucinated_branch".to_vec(),
+        },
+        TeacherTapRecord {
+            shard_id: 9004,
+            layer_index: 44, // Mid-late layer
+            hidden_state: (0..256).map(|i| ((i as f32) * 0.17 - 0.8).sin()).collect(),
+            next_op_probs: vec![0.03, 0.05, 0.89, 0.03],
+            payload: b"step2:counterfactual_check".to_vec(),
+        },
+        TeacherTapRecord {
+            shard_id: 9005,
+            layer_index: 60, // Late layer -> Semantic/Executive/Motor
+            hidden_state: (0..256).map(|i| ((i as f32) * 0.09 + 2.4).cos()).collect(),
+            next_op_probs: vec![0.02, 0.03, 0.05, 0.90],
+            payload: b"step3:executive_conclusion".to_vec(),
+        },
+    ];
+    let chain_receipt = server.distill_reasoning_trajectory(
+        1,
+        &reasoning_taps,
+        64,
+        oss_teacher.fingerprint,
+    )?;
+    let traversed = server
+        .swarm_map
+        .query_reasoning_trajectory(chain_receipt.atom_sequence[0], 10);
+    println!(
+        "[verified] Open-Weights Reasoning Chain Distillation: ingested={} sieved_out={} arcs={} traversed_hops={} certainty={:.4} holonomy={:?}",
+        chain_receipt.steps_ingested,
+        chain_receipt.steps_rejected_by_entropy_sieve,
+        chain_receipt.arc_ids.len(),
+        traversed.len(),
+        chain_receipt.mean_teacher_certainty_q32.to_f64(),
+        chain_receipt.holonomy_verdict
+    );
+
+    // 21. Zero-Copy Quantized Layer Distillation (4-bit & 6-bit OptiQ U32+BF16 without full F32 dequantization)
+    let q4_tap = atoma_immune::QuantizedLayerTapDescriptor {
+        tensor_name: "model.layers.14.mlp.down_proj.q4",
+        layer_index: 14,
+        total_layers: 64,
+        weight_data: &packed_w,
+        weight_dtype: "U32",
+        scales_data: &scales_bf16,
+        scales_dtype: "BF16",
+        biases_data: &biases_bf16,
+        biases_dtype: "BF16",
+        out_scale: Some(&out_scale),
+        bits: 4,
+        group_size,
+        rows: q_rows,
+        cols: q_cols,
+    };
+    let q4_distill = server.distill_quantized_layer(&q4_tap, 12, oss_teacher.fingerprint)?;
+    let q6_tap = atoma_immune::QuantizedLayerTapDescriptor {
+        tensor_name: "model.layers.46.self_attn.o_proj.q6",
+        bits: 6,
+        layer_index: 46,
+        weight_data: &packed_w6,
+        ..q4_tap
+    };
+    let q6_distill = server.distill_quantized_layer(&q6_tap, 12, oss_teacher.fingerprint)?;
+    println!(
+        "[verified] Zero-Copy Quantized Distillation: Q4(rows={}->dequant={}, saved={}MB, atoms={}) | Q6(rows={}->dequant={}, saved={}MB, atoms={})",
+        q4_distill.total_rows_scanned_via_scales,
+        q4_distill.top_k_rows_dequantized,
+        q4_distill.heap_bytes_saved_vs_full_dequant / (1024 * 1024),
+        q4_distill.minted_atom_ids.len(),
+        q6_distill.total_rows_scanned_via_scales,
+        q6_distill.top_k_rows_dequantized,
+        q6_distill.heap_bytes_saved_vs_full_dequant / (1024 * 1024),
+        q6_distill.minted_atom_ids.len()
+    );
+
+    // Optional CLI flag: `--distill-safetensors <path.safetensors> [--top-k <N>] [--max-layers <M>]`
+    // 22. Live Server Continuous Novelty-Only Distillation Gate & Persistent .atoma_map Vault
+    let live_step_a = TeacherTapRecord {
+        shard_id: 88_001,
+        layer_index: 10,
+        hidden_state: (0..256).map(|i| ((i as f32) * 0.071 + 0.3).sin()).collect(),
+        next_op_probs: vec![0.91, 0.04, 0.03, 0.02],
+        payload: vec![0u8; 256],
+    };
+    let live_step_b = TeacherTapRecord {
+        shard_id: 88_002,
+        layer_index: 36,
+        hidden_state: (0..256).map(|i| ((i as f32) * 0.137 - 1.1).cos()).collect(),
+        next_op_probs: vec![0.03, 0.89, 0.05, 0.03],
+        payload: vec![1u8; 256],
+    };
+    let live_noise = TeacherTapRecord {
+        shard_id: 88_003,
+        layer_index: 20,
+        hidden_state: (0..256).map(|i| ((i as f32) * 0.29).sin()).collect(),
+        next_op_probs: vec![0.125; 8], // 3.0 bits > 2.75 entropy ceiling -> rejected as noise!
+        payload: vec![2u8; 256],
+    };
+    let r_a = server.observe_and_distill_live_step(&live_step_a)?;
+    let r_b = server.observe_and_distill_live_step(&live_step_b)?;
+    // Replay `live_step_b` again: must be deduplicated in O(1) with 0 new atoms/arcs!
+    let r_b_dup = server.observe_and_distill_live_step(&live_step_b)?;
+    let r_noise = server.observe_and_distill_live_step(&live_noise)?;
+    println!(
+        "[verified] Live Server Novelty-Only Distillation: stepA_novel={} stepB(novel_atom={}, novel_arc={}) replayB(novel_atom={}, novel_arc={}) noise_sieved={}",
+        r_a.atom_was_novel,
+        r_b.atom_was_novel,
+        r_b.arc_was_novel,
+        r_b_dup.atom_was_novel,
+        r_b_dup.arc_was_novel,
+        r_noise.rejected_as_high_entropy_noise
+    );
+
+    // Optional CLI flags:
+    //   `--distill-model-dir <dir>` or `--distill-safetensors <file>` or `--distill-full <dir_or_file>`
+    //   `[--top-k <N>]` (default: 6)
+    //   `[--max-layers <M>]` (default: 100000 = ALL quantized tensors across all shards!)
+    //   `[--vault <path.atoma_map>]` (default: design/global_swarm_map.atoma_map)
+    let args: Vec<String> = std::env::args().collect();
+    let default_vault = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("design/global_swarm_map.atoma_map");
+    let vault_path = args
+        .iter()
+        .position(|a| a == "--vault")
+        .and_then(|v_idx| args.get(v_idx + 1))
+        .map(std::path::PathBuf::from)
+        .unwrap_or(default_vault);
+
+    for (idx, arg) in args.iter().enumerate() {
+        if arg == "--distill-safetensors" || arg == "--distill-model-dir" || arg == "--distill-full" {
+            if let Some(target_path_str) = args.get(idx + 1) {
+                let top_k = args
+                    .iter()
+                    .position(|a| a == "--top-k")
+                    .and_then(|k_idx| args.get(k_idx + 1))
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(6);
+                let max_layers = args
+                    .iter()
+                    .position(|a| a == "--max-layers")
+                    .and_then(|m_idx| args.get(m_idx + 1))
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(100_000);
+                let target_path = std::path::Path::new(target_path_str);
+                let t_st = std::time::Instant::now();
+                let summary = server.distill_full_checkpoint_novel_only(
+                    target_path,
+                    top_k,
+                    max_layers,
+                    Some(&vault_path),
+                )?;
+                let elapsed_ms = t_st.elapsed().as_secs_f64() * 1000.0;
+                let active_silos = summary.role_distribution.iter().filter(|&&c| c > 0).count();
+                let vault_hex = summary
+                    .vault_sha256
+                    .map(|d| d.to_hex()[..16].to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                println!(
+                    "[verified] Full Novelty-Only Distillation ({}): shards={} tensors_distilled={} skipped_dup_tensors={} novel_0cells={} dedup_0cells={} novel_1cell_arcs={} dedup_1cell_arcs={} active_silos={}/12 f32_saved={}MB vault_sha256={}.. latency={:.2}ms",
+                    target_path_str,
+                    summary.shards_processed,
+                    summary.tensors_distilled,
+                    summary.tensors_skipped_already_ingested,
+                    summary.novel_atoms_minted,
+                    summary.deduplicated_atoms_coalesced,
+                    summary.novel_reasoning_arcs_minted,
+                    summary.deduplicated_reasoning_arcs,
+                    active_silos,
+                    summary.f32_heap_bytes_saved / (1024 * 1024),
+                    vault_hex,
+                    elapsed_ms
+                );
+            }
+        }
+    }
+
+    // Load persistent vault (`design/global_swarm_map.atoma_map`) automatically when `--query`,
+    // `--serve-stdin`, or `--serve` is requested and the vault was not already loaded above.
+    let wants_query_or_serve = args
+        .iter()
+        .any(|a| a == "--query" || a == "--serve-stdin" || a == "--serve");
+    if wants_query_or_serve && server.persistent_vault_path.is_none() && vault_path.exists() {
+        let t_load = std::time::Instant::now();
+        let (loaded_atoms, loaded_arcs, sha_opt) =
+            server.load_or_init_persistent_vault(&vault_path)?;
+        let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
+        let sha_hex = sha_opt
+            .map(|d| d.to_hex()[..16].to_string())
+            .unwrap_or_else(|| "none".to_string());
+        println!(
+            "[verified] Loaded Persistent Vault ({}): global_0cells={} global_1cell_arcs={} ingested_tensors={} sha256={}.. in {:.2}ms",
+            vault_path.display(),
+            loaded_atoms,
+            loaded_arcs,
+            server.swarm_map.ingested_tensor_digests.len(),
+            sha_hex,
+            load_ms
+        );
+    }
+
+    let role_override = args
+        .iter()
+        .position(|a| a == "--role")
+        .and_then(|r_idx| args.get(r_idx + 1))
+        .and_then(|s| parse_role_arg(s));
+    let top_k_retrieve = args
+        .iter()
+        .position(|a| a == "--top-k-retrieve")
+        .and_then(|k_idx| args.get(k_idx + 1))
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(5);
+    let max_hops = args
+        .iter()
+        .position(|a| a == "--hops")
+        .and_then(|h_idx| args.get(h_idx + 1))
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(6);
+    let learn_query = args.iter().any(|a| a == "--learn-query");
+
+    // 1. One-shot or multi-query CLI flag: `--query "<text>"`
+    for (idx, arg) in args.iter().enumerate() {
+        if arg == "--query" {
+            if let Some(q_text) = args.get(idx + 1) {
+                let t_q = std::time::Instant::now();
+                let res = server.query_swarm_map(
+                    q_text,
+                    role_override,
+                    top_k_retrieve,
+                    max_hops,
+                    learn_query,
+                )?;
+                let q_us = t_q.elapsed().as_micros();
+                print_query_result(&res, q_us);
+            }
+        }
+    }
+
+    // 2. Persistent Interactive REPL / Pipe Daemon Mode: `--serve-stdin`
+    if args.iter().any(|a| a == "--serve-stdin") {
+        use std::io::BufRead;
+        println!(
+            "[verified] Persistent Stdin Retrieval Server Ready (global_0cells={}, global_1cell_arcs={}, commands: `<query>`, `learn <query>`, `status`, `quit`)",
+            server.swarm_map.global_atom_count(),
+            server.swarm_map.reasoning_arcs.len()
+        );
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed == "quit" || trimmed == "exit" {
+                break;
+            }
+            if trimmed == "status" {
+                let silo_counts: Vec<String> = RoleId::CARVED_12
+                    .iter()
+                    .map(|&r| {
+                        format!(
+                            "{}:{}",
+                            r.short_code(),
+                            server.swarm_map.silo(r).map(|s| s.atom_count()).unwrap_or(0)
+                        )
+                    })
+                    .collect();
+                println!(
+                    "[verified] Vault Status: global_0cells={} global_1cell_arcs={} ingested_tensors={} silos=[{}]",
+                    server.swarm_map.global_atom_count(),
+                    server.swarm_map.reasoning_arcs.len(),
+                    server.swarm_map.ingested_tensor_digests.len(),
+                    silo_counts.join(", ")
+                );
+                continue;
+            }
+            let (q_str, learn) = if let Some(rest) = trimmed.strip_prefix("learn ") {
+                (rest.trim(), true)
+            } else if let Some(rest) = trimmed.strip_prefix("query ") {
+                (rest.trim(), learn_query)
+            } else {
+                (trimmed, learn_query)
+            };
+            let t_q = std::time::Instant::now();
+            let res = server.query_swarm_map(q_str, role_override, top_k_retrieve, max_hops, learn)?;
+            let q_us = t_q.elapsed().as_micros();
+            print_query_result(&res, q_us);
+        }
+    }
+
+    // 3. Persistent TCP / HTTP Daemon Mode: `--serve <host:port>` (e.g. `--serve 127.0.0.1:8080`)
+    if let Some(s_idx) = args.iter().position(|a| a == "--serve") {
+        if let Some(bind_addr) = args.get(s_idx + 1) {
+            let max_requests = args
+                .iter()
+                .position(|a| a == "--max-requests")
+                .and_then(|m_idx| args.get(m_idx + 1))
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(usize::MAX);
+            run_persistent_tcp_server(
+                &mut server,
+                bind_addr,
+                role_override,
+                top_k_retrieve,
+                max_hops,
+                learn_query,
+                max_requests,
+            )?;
+        }
+    }
+
     println!(
         "\n=== ALL THREE LAYERS, 10 QUALIFICATIONS & 5 STATUTORY FRAMEWORKS VERIFIED (audit entries = {}) ===",
         server.immune.audit_log().len()
     );
     Ok(())
 }
+
+fn parse_role_arg(s: &str) -> Option<RoleId> {
+    let up = s.trim().to_ascii_uppercase();
+    for r in RoleId::CARVED_12 {
+        if r.short_code() == up || r.name().eq_ignore_ascii_case(s.trim()) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+fn print_query_result(res: &atoma_orchestrator::SwarmMapQueryResult, elapsed_us: u128) {
+    println!(
+        "[verified] QueryResult (\"{}\") -> role={}({}) sector={} silo_atoms={}/{} global_arcs={} mlir_result_q32={:.4} holonomy_flux={:.4}rad latency={}us",
+        res.query_text,
+        res.routed_role.short_code(),
+        res.routed_role.name(),
+        res.query_sector,
+        res.silo_atom_count,
+        res.global_atom_count,
+        res.global_reasoning_arc_count,
+        res.mlir_execution_result_q32.to_f64(),
+        res.holonomy_flux_rad_q32.to_f64(),
+        elapsed_us
+    );
+    for (rank, h) in res.hits.iter().enumerate() {
+        println!(
+            "  [0-cell #{}] atom={} cosh_d={:.6} well_cosh={:.4} salience={} boundary={} kv_retain={:.4} origin={}..",
+            rank + 1,
+            h.atom_id.0,
+            h.cosh_distance_q32.to_f64(),
+            h.well_cosh_dist_q32.to_f64(),
+            h.salience_count,
+            h.in_boundary_overlap,
+            h.adapted_kv_retention_q32.to_f64(),
+            &h.origin_model_fingerprint.to_hex()[..12]
+        );
+    }
+    for (hop_idx, hop) in res.reasoning_hops.iter().enumerate() {
+        println!(
+            "  [1-cell hop #{}] arc={} atom {}({}) -> atom {}({}) cosh_action={:.6} certainty={:.4} mlir_op={}({})",
+            hop_idx + 1,
+            hop.arc_id,
+            hop.from_atom.0,
+            hop.from_role.short_code(),
+            hop.to_atom.0,
+            hop.to_role.short_code(),
+            hop.cosh_action_q32.to_f64(),
+            hop.teacher_certainty_q32.to_f64(),
+            hop.mlir_mnemonic,
+            hop.mlir_op_id
+        );
+    }
+    println!(
+        "  [native-mlir-ssa] ops={:?} -> deterministic_q32={:.4}",
+        res.synthesized_mlir_program,
+        res.mlir_execution_result_q32.to_f64()
+    );
+    if let Some(ref live) = res.live_ingest {
+        println!(
+            "  [live-novelty-gate] ingested={} novel_atom={} novel_arc={} noise_rejected={}",
+            live.step_ingested,
+            live.atom_was_novel,
+            live.arc_was_novel,
+            live.rejected_as_high_entropy_noise
+        );
+    }
+}
+
+fn run_persistent_tcp_server(
+    server: &mut MonsterHybridServer,
+    bind_addr: &str,
+    role_override: Option<RoleId>,
+    top_k: usize,
+    max_hops: usize,
+    learn_default: bool,
+    max_requests: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind(bind_addr)?;
+    println!(
+        "[verified] Persistent TCP/HTTP Retrieval Daemon listening on {} (global_0cells={}, global_1cell_arcs={})",
+        bind_addr,
+        server.swarm_map.global_atom_count(),
+        server.swarm_map.reasoning_arcs.len()
+    );
+
+    let mut handled = 0usize;
+    for stream_res in listener.incoming() {
+        if handled >= max_requests {
+            break;
+        }
+        let Ok(mut stream) = stream_res else { continue };
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        if n == 0 {
+            continue;
+        }
+        let req_str = String::from_utf8_lossy(&buf[..n]);
+        let first_line = req_str.lines().next().unwrap_or("").trim();
+
+        let is_http = first_line.starts_with("GET ") || first_line.starts_with("POST ");
+        let query_str = if is_http {
+            let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+            if let Some(q_pos) = path.find("q=") {
+                let raw_q = &path[q_pos + 2..];
+                let end = raw_q.find('&').unwrap_or(raw_q.len());
+                url_decode(&raw_q[..end])
+            } else if first_line.starts_with("POST ") {
+                req_str
+                    .split("\r\n\r\n")
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            } else {
+                "status".to_string()
+            }
+        } else {
+            first_line.to_string()
+        };
+
+        if query_str == "quit" || query_str == "/quit" {
+            let msg = "{\"status\":\"shutting_down\"}\n";
+            let _ = stream.write_all(msg.as_bytes());
+            break;
+        }
+
+        let t_q = std::time::Instant::now();
+        let res = server.query_swarm_map(
+            &query_str,
+            role_override,
+            top_k,
+            max_hops,
+            learn_default,
+        )?;
+        let q_us = t_q.elapsed().as_micros();
+        print_query_result(&res, q_us);
+
+        let top_hit_id = res.hits.first().map(|h| h.atom_id.0).unwrap_or(0);
+        let top_hit_cosh = res
+            .hits
+            .first()
+            .map(|h| h.cosh_distance_q32.to_f64())
+            .unwrap_or(1.0);
+        let json_body = format!(
+            "{{\"query\":\"{}\",\"routed_role\":\"{}\",\"sector\":{},\"silo_atoms\":{},\"global_0cells\":{},\"global_1cell_arcs\":{},\"top_atom_id\":{},\"top_cosh_dist\":{:.6},\"reasoning_hops\":{},\"mlir_result_q32\":{:.4},\"holonomy_flux_rad\":{:.4},\"latency_us\":{}}}\n",
+            res.query_text.replace('"', "\\\""),
+            res.routed_role.short_code(),
+            res.query_sector,
+            res.silo_atom_count,
+            res.global_atom_count,
+            res.global_reasoning_arc_count,
+            top_hit_id,
+            top_hit_cosh,
+            res.reasoning_hops.len(),
+            res.mlir_execution_result_q32.to_f64(),
+            res.holonomy_flux_rad_q32.to_f64(),
+            q_us
+        );
+
+        if is_http {
+            let http_resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                json_body.len(),
+                json_body
+            );
+            let _ = stream.write_all(http_resp.as_bytes());
+        } else {
+            let _ = stream.write_all(json_body.as_bytes());
+        }
+        handled += 1;
+        if handled >= max_requests {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn url_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(' ');
+            i += 1;
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+                    out.push(val as char);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+

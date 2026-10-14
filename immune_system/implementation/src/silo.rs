@@ -15,6 +15,7 @@
 use crate::atlas13::{Atlas13, R_SPH_Q32, RoleId};
 use crate::cache::geometric::{AtomId, LogicalClock, Phase};
 use crate::compliance::OverlapPolicyMatrix;
+use crate::distill_engine::DistilledReasoningArc;
 use crate::geometry::fixed::Q32_31;
 use crate::geometry::lorentz::LorentzVector;
 use crate::lock::{TopologicalInvariant, extract_invariant};
@@ -249,8 +250,8 @@ impl SiloView {
 
 /// The Centralized Model-Agnostic 1 + 12 Carved Swarm Memory Architecture (`SPEC.md` §1–§4).
 ///
-/// Decouples the persistent `(H³ × T²) / Γ` geometric memory (`global_atoms` + 12 `silos`)
-/// from the currently plugged-in model (`base_weights` at `model_epoch`).
+/// Decouples the persistent `(H³ × T²) / Γ` geometric memory (`global_atoms` 0-cells +
+/// `reasoning_arcs` 1-cells + 12 `silos`) from the currently plugged-in model (`base_weights` at `model_epoch`).
 #[derive(Debug)]
 pub struct CarvedSwarmMap {
     pub atlas: Atlas13,
@@ -262,9 +263,18 @@ pub struct CarvedSwarmMap {
     /// Default single-well attractor basin threshold `τ_r = cosh(d_max)` in Q32.31.
     pub default_basin_cosh: Q32_31,
     next_id: u64,
+    next_arc_id: u64,
     clock: LogicalClock,
-    /// Undivided global map ("The 1" — Coordinator L0).
+    /// Undivided global map ("The 1" — Coordinator L0 `0-cells`).
     global_atoms: BTreeMap<u64, GlobalAtom>,
+    /// O(1) spatial + topological sector novelty hash index (`bucket_key -> Vec<AtomId>`)
+    /// used to reject duplicate `0-cell` noise in microseconds during full-model and live distillation.
+    novelty_buckets: BTreeMap<u64, Vec<AtomId>>,
+    /// Set of `(model_fingerprint, tensor_name, bits, group_size, top_k)` digests already distilled
+    /// into this map so re-running or resuming distillation never duplicates a tensor.
+    pub ingested_tensor_digests: std::collections::BTreeSet<Sha256Digest>,
+    /// Directed geodesic reasoning transitions (`1-cells`) distilled from teacher reasoning chains.
+    pub reasoning_arcs: Vec<DistilledReasoningArc>,
     /// The 12 carved specialist silos (`L1`..`L12`).
     silos: [SiloView; 12],
     /// Most recent Stage 5 loss report.
@@ -297,8 +307,12 @@ impl CarvedSwarmMap {
             model_lineage: lineage,
             default_basin_cosh,
             next_id: 0,
+            next_arc_id: 0,
             clock: LogicalClock(0),
             global_atoms: BTreeMap::new(),
+            novelty_buckets: BTreeMap::new(),
+            ingested_tensor_digests: std::collections::BTreeSet::new(),
+            reasoning_arcs: Vec::new(),
             silos,
             last_carve_loss: CarveLossReport {
                 global_atom_count: 0,
@@ -384,6 +398,89 @@ impl CarvedSwarmMap {
         payload: Vec<u8>,
         policy: &OverlapPolicyMatrix,
     ) -> AtomId {
+        self.keep_and_carve_with_origin(
+            refracted,
+            payload,
+            self.base_weights.fingerprint,
+            policy,
+        )
+    }
+
+    /// Compute a 64-bit spatial + topological sector bucket key for O(1) geodesic novelty lookup.
+    fn spatial_bucket_key(qx1: i64, qx2: i64, qx3: i64, sector_n: u8) -> u64 {
+        let b1 = ((qx1 as u64) & 0x3F_FFFF) << 42;
+        let b2 = ((qx2 as u64) & 0x1F_FFFF) << 21;
+        let b3 = ((qx3 as u64) & 0x1F_FFF) << 8;
+        b1 | b2 | b3 | (sector_n as u64)
+    }
+
+    /// Insert a refracted point with an explicit `origin_model_fingerprint` and return
+    /// `(AtomId, is_novel)`:
+    /// - Uses the O(1) 27-neighborhood spatial bucket index (`novelty_buckets`) to check if an
+    ///   existing `GlobalAtom` lies within `cosh(d) <= 1.0005` in the same topological sector.
+    /// - If a duplicate/near-isometric coordinate exists, increments `salience_count` in place and
+    ///   returns `(existing_id, false)` (`0` duplicate noise added!).
+    /// - If genuinely novel, inserts the atom, carves it incrementally into the 12 silos in O(1),
+    ///   and returns `(new_id, true)`.
+    pub fn keep_and_carve_novel_only(
+        &mut self,
+        refracted: RefractedPoint,
+        payload: Vec<u8>,
+        origin_fingerprint: Sha256Digest,
+        policy: &OverlapPolicyMatrix,
+    ) -> (AtomId, bool) {
+        if !self.is_registered_model_fingerprint(&origin_fingerprint) {
+            let next_epoch = self.model_lineage.len() as u64 + 1;
+            self.model_lineage.push((
+                next_epoch,
+                "DistilledOpenSourceTeacher".to_string(),
+                origin_fingerprint,
+            ));
+        }
+
+        let coalesce_cosh_threshold = Q32_31::from_f64(1.0005);
+        // Quantize spatial Lorentz coordinates at resolution 2^-10 (~0.001)
+        let q1 = refracted.lorentz.x[1].0 >> 21;
+        let q2 = refracted.lorentz.x[2].0 >> 21;
+        let q3 = refracted.lorentz.x[3].0 >> 21;
+        let sec = refracted.invariant.n;
+
+        let mut matched_id: Option<AtomId> = None;
+        'search: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let key = Self::spatial_bucket_key(q1 + dx, q2 + dy, q3 + dz, sec);
+                    if let Some(bucket) = self.novelty_buckets.get(&key) {
+                        for &cand_id in bucket {
+                            if let Some(existing) = self.global_atoms.get(&cand_id.0) {
+                                let ip = OpticalLens::lorentz_inner_product_wide(
+                                    &refracted.lorentz,
+                                    &existing.lorentz,
+                                );
+                                if ip <= coalesce_cosh_threshold && existing.invariant.n == sec {
+                                    matched_id = Some(cand_id);
+                                    break 'search;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(existing_id) = matched_id {
+            if let Some(existing) = self.global_atoms.get_mut(&existing_id.0) {
+                existing.salience_count = existing.salience_count.saturating_add(1);
+                let new_salience = existing.salience_count;
+                for silo in &mut self.silos {
+                    if let Some(sa) = silo.atoms.get_mut(&existing_id.0) {
+                        sa.salience_count = new_salience;
+                    }
+                }
+            }
+            return (existing_id, false);
+        }
+
         let id = AtomId(self.next_id);
         self.next_id += 1;
         self.clock.0 += 1;
@@ -397,13 +494,98 @@ impl CarvedSwarmMap {
             phase: refracted.phase,
             invariant: refracted.invariant,
             payload: shared_payload,
-            origin_model_fingerprint: self.base_weights.fingerprint,
+            origin_model_fingerprint: origin_fingerprint,
             salience_count: 1,
         };
 
+        let home_key = Self::spatial_bucket_key(q1, q2, q3, sec);
+        self.novelty_buckets.entry(home_key).or_default().push(id);
+        self.carve_single_atom_incremental(&atom, policy);
         self.global_atoms.insert(id.0, atom);
-        self.recarve_all_twelve(policy);
-        id
+        self.refresh_loss_ledger_counts();
+        (id, true)
+    }
+
+    /// Insert a refracted point with an explicit `origin_model_fingerprint` (used when distilling
+    /// external open-source teacher checkpoints into the global map) and perform geodesic
+    /// coalescence if an identical coordinate already exists.
+    pub fn keep_and_carve_with_origin(
+        &mut self,
+        refracted: RefractedPoint,
+        payload: Vec<u8>,
+        origin_fingerprint: Sha256Digest,
+        policy: &OverlapPolicyMatrix,
+    ) -> AtomId {
+        self.keep_and_carve_novel_only(refracted, payload, origin_fingerprint, policy)
+            .0
+    }
+
+    /// Record a directed 1-cell [`DistilledReasoningArc`] in the global map, deduplicating if an
+    /// equivalent transition (`(from_atom, to_atom, compiled_mlir_op)` or same role transition +
+    /// MLIR opcode within `|Δcosh| <= 0.001`) already exists.
+    /// Returns `(arc_id, is_novel)`.
+    pub fn record_novel_reasoning_arc(&mut self, mut arc: DistilledReasoningArc) -> (u64, bool) {
+        let cosh_tol = Q32_31::from_f64(0.001).0;
+        for existing in &mut self.reasoning_arcs {
+            let exact_atoms = existing.from_atom == arc.from_atom
+                && existing.to_atom == arc.to_atom
+                && existing.compiled_mlir_op == arc.compiled_mlir_op;
+            let same_role_circuit = existing.from_role == arc.from_role
+                && existing.to_role == arc.to_role
+                && existing.compiled_mlir_op == arc.compiled_mlir_op
+                && (existing.cosh_action_q32.0 - arc.cosh_action_q32.0).abs() <= cosh_tol;
+            if exact_atoms || same_role_circuit {
+                if arc.teacher_certainty_q32.0 > existing.teacher_certainty_q32.0 {
+                    existing.teacher_certainty_q32 = arc.teacher_certainty_q32;
+                }
+                return (existing.arc_id, false);
+            }
+        }
+
+        let id = self.next_arc_id;
+        self.next_arc_id += 1;
+        arc.arc_id = id;
+        self.reasoning_arcs.push(arc);
+        (id, true)
+    }
+
+    /// Record a directed 1-cell [`DistilledReasoningArc`] in the global map.
+    pub fn record_reasoning_arc(&mut self, arc: DistilledReasoningArc) -> u64 {
+        self.record_novel_reasoning_arc(arc).0
+    }
+
+    /// Boost the `salience_count` of an atom when a multi-step reasoning chain passes Gauss–Bonnet
+    /// holonomy verification.
+    pub fn reinforce_atom_salience(&mut self, id: AtomId, delta: u32) {
+        if let Some(atom) = self.global_atoms.get_mut(&id.0) {
+            atom.salience_count = atom.salience_count.saturating_add(delta);
+        }
+    }
+
+    /// Traverse the distilled geodesic reasoning graph starting from `start_atom` up to `max_hops`,
+    /// greedily following the lowest hyperbolic-action (`cosh_action_q32`) outgoing reasoning arc at each hop.
+    pub fn query_reasoning_trajectory(
+        &self,
+        start_atom: AtomId,
+        max_hops: usize,
+    ) -> Vec<&DistilledReasoningArc> {
+        let mut path = Vec::with_capacity(max_hops);
+        let mut curr = start_atom;
+        for _ in 0..max_hops {
+            let next_arc = self
+                .reasoning_arcs
+                .iter()
+                .filter(|a| a.from_atom == curr)
+                .min_by_key(|a| a.cosh_action_q32.0);
+            match next_arc {
+                Some(arc) => {
+                    curr = arc.to_atom;
+                    path.push(arc);
+                }
+                None => break,
+            }
+        }
+        path
     }
 
     /// Compile an [`EphemeralMapDeposit`] surrendered by a dissolved agent into the centralized
@@ -501,103 +683,362 @@ impl CarvedSwarmMap {
         }
     }
 
-    /// Run Stage 5 (`Carve`) twelve times — one refracted view per specialist phase (`SPEC.md` §3),
-    /// governed strictly by the Layer 3 `OverlapPolicyMatrix`, and update `last_carve_loss`.
-    pub fn recarve_all_twelve(&mut self, policy: &OverlapPolicyMatrix) -> CarveLossReport {
-        for silo in &mut self.silos {
-            silo.atoms.clear();
+    /// Incrementally carve a single `GlobalAtom` into whichever of the 12 `SiloView`s are
+    /// permitted by `policy` in `O(1)` (`12` Lorentz inner products), avoiding `O(N^2)` full recarves
+    /// when streaming hundreds of layers from a checkpoint.
+    fn carve_single_atom_incremental(&mut self, atom: &GlobalAtom, policy: &OverlapPolicyMatrix) {
+        let mut well_ips = [Q32_31::ZERO; 12];
+        for r_idx in 0..12 {
+            let role = RoleId::CARVED_12[r_idx];
+            let well = &self.atlas.well(role).lorentz_well;
+            well_ips[r_idx] = OpticalLens::lorentz_inner_product_wide(&atom.lorentz, well);
         }
 
-        for atom in self.global_atoms.values() {
-            let mut well_ips = [Q32_31::ZERO; 12];
-            for r_idx in 0..12 {
-                let role = RoleId::CARVED_12[r_idx];
-                let well = &self.atlas.well(role).lorentz_well;
-                well_ips[r_idx] = OpticalLens::lorentz_inner_product_wide(&atom.lorentz, well);
+        let mut placed_silos = [false; 12];
+        for r_idx in 0..12 {
+            let role_r = RoleId::CARVED_12[r_idx];
+            let in_home_basin = well_ips[r_idx] <= self.default_basin_cosh;
+
+            let mut in_overlap = false;
+            for s_idx in 0..12 {
+                if r_idx == s_idx {
+                    continue;
+                }
+                let role_s = RoleId::CARVED_12[s_idx];
+                let omega = policy.overlap_allowance(role_r, role_s);
+                if omega.0 > 0 {
+                    let limit_r = Q32_31(self.default_basin_cosh.0.saturating_add(omega.0));
+                    let limit_s = Q32_31(self.default_basin_cosh.0.saturating_add(omega.0));
+                    if well_ips[r_idx] <= limit_r && well_ips[s_idx] <= limit_s {
+                        in_overlap = true;
+                        break;
+                    }
+                }
             }
 
-            for r_idx in 0..12 {
-                let role_r = RoleId::CARVED_12[r_idx];
-                let in_home_basin = well_ips[r_idx] <= self.default_basin_cosh;
-
-                let mut in_overlap = false;
-                for s_idx in 0..12 {
-                    if r_idx == s_idx {
-                        continue;
-                    }
-                    let role_s = RoleId::CARVED_12[s_idx];
-                    let omega = policy.overlap_allowance(role_r, role_s);
-                    if omega.0 > 0 {
-                        let limit_r = Q32_31(self.default_basin_cosh.0.saturating_add(omega.0));
-                        let limit_s = Q32_31(self.default_basin_cosh.0.saturating_add(omega.0));
-                        if well_ips[r_idx] <= limit_r && well_ips[s_idx] <= limit_s {
-                            in_overlap = true;
-                            break;
-                        }
-                    }
-                }
-
-                if in_home_basin || in_overlap {
-                    let local_lorentz = self.boost_to_well_frame(role_r, &atom.lorentz);
-                    let silo_atom = SiloAtom {
-                        id: atom.id,
-                        clock: atom.clock,
-                        global_lorentz: atom.lorentz,
-                        local_lorentz,
-                        phase: atom.phase,
-                        well_cosh_dist: well_ips[r_idx],
-                        in_boundary_overlap: in_overlap,
-                        payload: Arc::clone(&atom.payload),
-                        origin_model_fingerprint: atom.origin_model_fingerprint,
-                        salience_count: atom.salience_count,
-                    };
-                    self.silos[r_idx].atoms.insert(atom.id.0, silo_atom);
-                }
+            if in_home_basin || in_overlap {
+                let local_lorentz = self.boost_to_well_frame(role_r, &atom.lorentz);
+                let silo_atom = SiloAtom {
+                    id: atom.id,
+                    clock: atom.clock,
+                    global_lorentz: atom.lorentz,
+                    local_lorentz,
+                    phase: atom.phase,
+                    well_cosh_dist: well_ips[r_idx],
+                    in_boundary_overlap: in_overlap,
+                    payload: Arc::clone(&atom.payload),
+                    origin_model_fingerprint: atom.origin_model_fingerprint,
+                    salience_count: atom.salience_count,
+                };
+                self.silos[r_idx].atoms.insert(atom.id.0, silo_atom);
+                placed_silos[r_idx] = true;
             }
         }
-
-        let total = self.global_atoms.len();
-        let mut silo_atom_counts = [0usize; 12];
-        let mut excluded_atom_counts = [0usize; 12];
-        let mut retention_ratio_q32 = [Q32_31::ZERO; 12];
-        let mut shared_boundary_atoms = [[0usize; 12]; 12];
 
         for r_idx in 0..12 {
+            if placed_silos[r_idx] {
+                for s_idx in 0..12 {
+                    if placed_silos[s_idx] {
+                        self.last_carve_loss.shared_boundary_atoms[r_idx][s_idx] += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn refresh_loss_ledger_counts(&mut self) {
+        let total = self.global_atoms.len();
+        self.last_carve_loss.global_atom_count = total;
+        for r_idx in 0..12 {
             let count = self.silos[r_idx].atoms.len();
-            silo_atom_counts[r_idx] = count;
-            excluded_atom_counts[r_idx] = total.saturating_sub(count);
-            retention_ratio_q32[r_idx] = if total == 0 {
+            self.last_carve_loss.silo_atom_counts[r_idx] = count;
+            self.last_carve_loss.excluded_atom_counts[r_idx] = total.saturating_sub(count);
+            self.last_carve_loss.retention_ratio_q32[r_idx] = if total == 0 {
                 Q32_31::ZERO
             } else {
                 let num = (count as i128) << Q32_31::FRACTIONAL_BITS;
                 Q32_31((num / (total as i128)) as i64)
             };
         }
+    }
 
-        for r_idx in 0..12 {
-            for s_idx in 0..12 {
-                if r_idx == s_idx {
-                    shared_boundary_atoms[r_idx][s_idx] = silo_atom_counts[r_idx];
-                } else {
-                    let shared = self.silos[r_idx]
-                        .atoms
-                        .keys()
-                        .filter(|k| self.silos[s_idx].atoms.contains_key(k))
-                        .count();
-                    shared_boundary_atoms[r_idx][s_idx] = shared;
-                }
-            }
+    /// Run Stage 5 (`Carve`) twelve times — one refracted view per specialist phase (`SPEC.md` §3),
+    /// governed strictly by the Layer 3 `OverlapPolicyMatrix`, and update `last_carve_loss`.
+    pub fn recarve_all_twelve(&mut self, policy: &OverlapPolicyMatrix) -> CarveLossReport {
+        for silo in &mut self.silos {
+            silo.atoms.clear();
+        }
+        self.novelty_buckets.clear();
+        self.last_carve_loss.shared_boundary_atoms = [[0usize; 12]; 12];
+
+        let atoms_snapshot: Vec<GlobalAtom> = self.global_atoms.values().cloned().collect();
+        for atom in &atoms_snapshot {
+            let q1 = atom.lorentz.x[1].0 >> 21;
+            let q2 = atom.lorentz.x[2].0 >> 21;
+            let q3 = atom.lorentz.x[3].0 >> 21;
+            let key = Self::spatial_bucket_key(q1, q2, q3, atom.invariant.n);
+            self.novelty_buckets.entry(key).or_default().push(atom.id);
+            self.carve_single_atom_incremental(atom, policy);
+        }
+        self.refresh_loss_ledger_counts();
+        self.last_carve_loss.clone()
+    }
+
+    /// Save the entire centralized `(H³ × T²)/Γ₁₂` map (`0-cell` `GlobalAtom`s, `1-cell`
+    /// `DistilledReasoningArc`s, `ingested_tensor_digests`, and `model_lineage`) to a
+    /// SHA-256-authenticated `.atoma_map` binary vault on disk.
+    pub fn save_to_binary_vault(&self, path: &std::path::Path) -> Result<(usize, usize, Sha256Digest), String> {
+        let mut buf = Vec::with_capacity(1024 + self.global_atoms.len() * 160 + self.reasoning_arcs.len() * 144);
+        buf.extend_from_slice(b"ATOMA_MAP_V1");
+        buf.extend_from_slice(&self.model_epoch.to_le_bytes());
+        buf.extend_from_slice(&self.next_id.to_le_bytes());
+        buf.extend_from_slice(&self.next_arc_id.to_le_bytes());
+        buf.extend_from_slice(&self.clock.0.to_le_bytes());
+
+        // 1. Model lineage
+        buf.extend_from_slice(&(self.model_lineage.len() as u32).to_le_bytes());
+        for (ep, name, fp) in &self.model_lineage {
+            buf.extend_from_slice(&ep.to_le_bytes());
+            let nb = name.as_bytes();
+            buf.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+            buf.extend_from_slice(nb);
+            buf.extend_from_slice(&fp.0);
         }
 
-        let report = CarveLossReport {
-            global_atom_count: total,
-            silo_atom_counts,
-            excluded_atom_counts,
-            retention_ratio_q32,
-            shared_boundary_atoms,
+        // 2. Ingested tensor digests (for zero-duplicate idempotent re-runs)
+        buf.extend_from_slice(&(self.ingested_tensor_digests.len() as u32).to_le_bytes());
+        for d in &self.ingested_tensor_digests {
+            buf.extend_from_slice(&d.0);
+        }
+
+        // 3. Global 0-cell atoms
+        buf.extend_from_slice(&(self.global_atoms.len() as u32).to_le_bytes());
+        for atom in self.global_atoms.values() {
+            buf.extend_from_slice(&atom.id.0.to_le_bytes());
+            buf.extend_from_slice(&atom.clock.0.to_le_bytes());
+            for c in &atom.poincare_ball {
+                buf.extend_from_slice(&c.0.to_le_bytes());
+            }
+            for c in &atom.lorentz.x {
+                buf.extend_from_slice(&c.0.to_le_bytes());
+            }
+            buf.extend_from_slice(&atom.phase.theta_f.0.to_le_bytes());
+            buf.extend_from_slice(&atom.phase.theta_s.0.to_le_bytes());
+            buf.extend_from_slice(&atom. origin_model_fingerprint.0);
+            buf.extend_from_slice(&atom.salience_count.to_le_bytes());
+            buf.extend_from_slice(&(atom.payload.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&atom.payload);
+        }
+
+        // 4. Directed 1-cell reasoning arcs
+        buf.extend_from_slice(&(self.reasoning_arcs.len() as u32).to_le_bytes());
+        for arc in &self.reasoning_arcs {
+            buf.extend_from_slice(&arc.arc_id.to_le_bytes());
+            buf.extend_from_slice(&arc.chain_id.to_le_bytes());
+            buf.extend_from_slice(&(arc.step_index as u64).to_le_bytes());
+            buf.extend_from_slice(&arc.from_atom.0.to_le_bytes());
+            buf.extend_from_slice(&arc.to_atom.0.to_le_bytes());
+            buf.push(arc.from_role.carved_index().unwrap_or(12) as u8);
+            buf.push(arc.to_role.carved_index().unwrap_or(12) as u8);
+            buf.extend_from_slice(&arc.cosh_action_q32.0.to_le_bytes());
+            for r in 0..3 {
+                for c in 0..3 {
+                    buf.extend_from_slice(&arc.wigner_frame[r][c].0.to_le_bytes());
+                }
+            }
+            buf.extend_from_slice(&arc.compiled_mlir_op.0.to_le_bytes());
+            buf.extend_from_slice(&arc.teacher_certainty_q32.0.to_le_bytes());
+            buf.extend_from_slice(&arc.origin_model_fingerprint.0);
+        }
+
+        let digest = Sha256Digest::compute(&buf);
+        buf.extend_from_slice(&digest.0);
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, &buf).map_err(|e| format!("Failed to write vault {}: {e}", path.display()))?;
+        Ok((self.global_atoms.len(), self.reasoning_arcs.len(), digest))
+    }
+
+    /// Load and authenticate a `.atoma_map` binary vault from disk into `self`, rebuilding
+    /// the O(1) spatial novelty index and 12 carved specialist silos.
+    pub fn load_from_binary_vault(
+        &mut self,
+        path: &std::path::Path,
+        policy: &OverlapPolicyMatrix,
+    ) -> Result<(usize, usize, Sha256Digest), String> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("Failed to read vault {}: {e}", path.display()))?;
+        if bytes.len() < 12 + 32 || &bytes[0..12] != b"ATOMA_MAP_V1" {
+            return Err("Invalid .atoma_map magic header or truncated file".to_string());
+        }
+        let payload_len = bytes.len() - 32;
+        let expected_sha = Sha256Digest::compute(&bytes[..payload_len]);
+        let mut stored_sha = [0u8; 32];
+        stored_sha.copy_from_slice(&bytes[payload_len..]);
+        if expected_sha.0 != stored_sha {
+            return Err("Vault SHA-256 integrity check failed".to_string());
+        }
+
+        let mut pos = 12usize;
+        let read_u64 = |pos: &mut usize| -> Result<u64, String> {
+            if *pos + 8 > payload_len {
+                return Err("Unexpected EOF reading u64".to_string());
+            }
+            let v = u64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
+            *pos += 8;
+            Ok(v)
         };
-        self.last_carve_loss = report.clone();
-        report
+        let read_i64 = |pos: &mut usize| -> Result<i64, String> {
+            Ok(read_u64(pos)? as i64)
+        };
+        let read_u32 = |pos: &mut usize| -> Result<u32, String> {
+            if *pos + 4 > payload_len {
+                return Err("Unexpected EOF reading u32".to_string());
+            }
+            let v = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap());
+            *pos += 4;
+            Ok(v)
+        };
+        let read_sha = |pos: &mut usize| -> Result<Sha256Digest, String> {
+            if *pos + 32 > payload_len {
+                return Err("Unexpected EOF reading Sha256Digest".to_string());
+            }
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&bytes[*pos..*pos + 32]);
+            *pos += 32;
+            Ok(Sha256Digest(s))
+        };
+
+        self.model_epoch = read_u64(&mut pos)?;
+        self.next_id = read_u64(&mut pos)?;
+        self.next_arc_id = read_u64(&mut pos)?;
+        self.clock = LogicalClock(read_u64(&mut pos)?);
+
+        let lineage_count = read_u32(&mut pos)? as usize;
+        self.model_lineage.clear();
+        for _ in 0..lineage_count {
+            let ep = read_u64(&mut pos)?;
+            let nlen = read_u32(&mut pos)? as usize;
+            if pos + nlen > payload_len {
+                return Err("Unexpected EOF reading lineage name".to_string());
+            }
+            let name = String::from_utf8_lossy(&bytes[pos..pos + nlen]).to_string();
+            pos += nlen;
+            let fp = read_sha(&mut pos)?;
+            self.model_lineage.push((ep, name, fp));
+        }
+
+        let digest_count = read_u32(&mut pos)? as usize;
+        self.ingested_tensor_digests.clear();
+        for _ in 0..digest_count {
+            self.ingested_tensor_digests.insert(read_sha(&mut pos)?);
+        }
+
+        let atom_count = read_u32(&mut pos)? as usize;
+        self.global_atoms.clear();
+        for _ in 0..atom_count {
+            let id = AtomId(read_u64(&mut pos)?);
+            let clock = LogicalClock(read_u64(&mut pos)?);
+            let poincare_ball = [
+                Q32_31(read_i64(&mut pos)?),
+                Q32_31(read_i64(&mut pos)?),
+                Q32_31(read_i64(&mut pos)?),
+            ];
+            let lorentz = LorentzVector {
+                x: [
+                    Q32_31(read_i64(&mut pos)?),
+                    Q32_31(read_i64(&mut pos)?),
+                    Q32_31(read_i64(&mut pos)?),
+                    Q32_31(read_i64(&mut pos)?),
+                ],
+            };
+            let phase = Phase {
+                theta_f: Q32_31(read_i64(&mut pos)?),
+                theta_s: Q32_31(read_i64(&mut pos)?),
+            };
+            let tf_pi = rad_q32_to_pi_unit(phase.theta_f);
+            let ts_pi = rad_q32_to_pi_unit(phase.theta_s);
+            let invariant = extract_invariant(tf_pi, ts_pi);
+            let origin_model_fingerprint = read_sha(&mut pos)?;
+            let salience_count = read_u32(&mut pos)?;
+            let plen = read_u32(&mut pos)? as usize;
+            if pos + plen > payload_len {
+                return Err("Unexpected EOF reading atom payload".to_string());
+            }
+            let payload: Arc<[u8]> = Arc::from(bytes[pos..pos + plen].to_vec().into_boxed_slice());
+            pos += plen;
+
+            self.global_atoms.insert(
+                id.0,
+                GlobalAtom {
+                    id,
+                    clock,
+                    poincare_ball,
+                    lorentz,
+                    phase,
+                    invariant,
+                    payload,
+                    origin_model_fingerprint,
+                    salience_count,
+                },
+            );
+        }
+
+        let arc_count = read_u32(&mut pos)? as usize;
+        self.reasoning_arcs.clear();
+        for _ in 0..arc_count {
+            let arc_id = read_u64(&mut pos)?;
+            let chain_id = read_u64(&mut pos)?;
+            let step_index = read_u64(&mut pos)? as usize;
+            let from_atom = AtomId(read_u64(&mut pos)?);
+            let to_atom = AtomId(read_u64(&mut pos)?);
+            if pos + 2 > payload_len {
+                return Err("Unexpected EOF reading arc roles".to_string());
+            }
+            let from_role = RoleId::CARVED_12
+                .get(bytes[pos] as usize)
+                .copied()
+                .unwrap_or(RoleId::Coordinator);
+            let to_role = RoleId::CARVED_12
+                .get(bytes[pos + 1] as usize)
+                .copied()
+                .unwrap_or(RoleId::Coordinator);
+            pos += 2;
+            let cosh_action_q32 = Q32_31(read_i64(&mut pos)?);
+            let mut wigner_frame = [[Q32_31::ZERO; 3]; 3];
+            for r in 0..3 {
+                for c in 0..3 {
+                    wigner_frame[r][c] = Q32_31(read_i64(&mut pos)?);
+                }
+            }
+            let compiled_mlir_op = crate::mlir_native::MlirOpId(read_u32(&mut pos)?);
+            let teacher_certainty_q32 = Q32_31(read_i64(&mut pos)?);
+            let origin_model_fingerprint = read_sha(&mut pos)?;
+
+            self.reasoning_arcs.push(DistilledReasoningArc {
+                arc_id,
+                chain_id,
+                step_index,
+                from_atom,
+                to_atom,
+                from_role,
+                to_role,
+                cosh_action_q32,
+                wigner_frame,
+                compiled_mlir_op,
+                teacher_certainty_q32,
+                origin_model_fingerprint,
+            });
+        }
+
+        self.recarve_all_twelve(policy);
+        Ok((self.global_atoms.len(), self.reasoning_arcs.len(), expected_sha))
+    }
+
+    pub fn is_registered_model_fingerprint(&self, fp: &Sha256Digest) -> bool {
+        self.model_lineage.iter().any(|(_, _, lineage_fp)| lineage_fp == fp)
     }
 
     fn boost_to_well_frame(&self, role: RoleId, global: &LorentzVector) -> LorentzVector {
@@ -614,3 +1055,224 @@ impl CarvedSwarmMap {
         LorentzVector::boost(global, &neg_dir, Q32_31(beta))
     }
 }
+
+/// Mandatory loss report for Cross-Epoch Model Adapter projection (`Qualification #9`: Name the Loss).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterLossReport {
+    pub origin_fingerprint: Sha256Digest,
+    pub target_fingerprint: Sha256Digest,
+    pub source_head_dim: usize,
+    pub target_head_dim: usize,
+    /// Fraction of `K` head L2 energy retained after cross-epoch projection, in Q32.31 (`[0, 1]`).
+    pub retained_k_energy_ratio_q32: Q32_31,
+    /// Fraction of `V` head L2 energy retained after cross-epoch projection, in Q32.31 (`[0, 1]`).
+    pub retained_v_energy_ratio_q32: Q32_31,
+    /// Integrity of 2x2 complex RoPE rotor pairs (`Q32_31::ONE` = 100% pair-preserving).
+    pub rope_pair_integrity_q32: Q32_31,
+    /// True if `origin_fingerprint == target_fingerprint` and `source_head_dim == target_head_dim`.
+    pub is_zero_copy_passthrough: bool,
+}
+
+/// Result of projecting an atom's raw KV payload across model epochs via [`ModelAdapterLens`].
+#[derive(Debug, Clone)]
+pub struct AdaptedKvRecord {
+    pub atom_id: AtomId,
+    pub origin_model_fingerprint: Sha256Digest,
+    pub target_model_fingerprint: Sha256Digest,
+    pub k_head: Vec<f32>,
+    pub v_head: Vec<f32>,
+    pub loss_report: AdapterLossReport,
+}
+
+/// Cross-Epoch Model Adapter Lens (`ModelAdapterLens`).
+///
+/// When a new model backend is hot-swapped into the server (`epoch N -> epoch N+1`, e.g.
+/// `128d` head Glimmer -> `256d` head NextGen MoE), the centralized `(H³ × T²) / Γ` memory
+/// coordinates require zero re-distillation. When a new-epoch worker retrieves an atom whose
+/// raw `(K, V)` payload was deposited by an earlier model epoch (`origin_model_fingerprint`),
+/// `ModelAdapterLens` applies a deterministic, RoPE-pair-preserving `SO(2)^P` gauge rotation
+/// and isometric pair-harmonic embedding/projection into `target_head_dim`.
+#[derive(Debug, Clone, Default)]
+pub struct ModelAdapterLens;
+
+impl ModelAdapterLens {
+    /// Pack `(k_head, v_head)` `f32` slices into a canonical little-endian KV payload buffer.
+    pub fn pack_kv_payload(k_head: &[f32], v_head: &[f32]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity((k_head.len() + v_head.len()) * 4);
+        for &f in k_head {
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+        for &f in v_head {
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Adapt a raw KV payload from `origin_fingerprint` (`source_head_dim` inferred from payload length)
+    /// into `target_fingerprint` at `target_head_dim`, anchored by the atom's canonical `T²` `Phase`.
+    pub fn adapt_kv_payload(
+        atom_id: AtomId,
+        payload: &[u8],
+        origin_fingerprint: Sha256Digest,
+        target_fingerprint: Sha256Digest,
+        phase: Phase,
+        target_head_dim: usize,
+    ) -> Result<AdaptedKvRecord, &'static str> {
+        if payload.len() < 16 || payload.len() % 8 != 0 {
+            return Err("KV payload byte length must be a multiple of 8 (even head_dim f32 K+V)");
+        }
+        if target_head_dim < 2 || target_head_dim % 2 != 0 {
+            return Err("target_head_dim must be a positive even integer (2x2 RoPE pairs)");
+        }
+
+        let source_head_dim = payload.len() / 8;
+        if source_head_dim % 2 != 0 {
+            return Err("source_head_dim must be even (2x2 RoPE pairs)");
+        }
+
+        let k_src: Vec<f32> = payload[0..source_head_dim * 4]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let v_src: Vec<f32> = payload[source_head_dim * 4..2 * source_head_dim * 4]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // Fast path: identical model epoch and identical head dimension -> exact pass-through
+        if origin_fingerprint == target_fingerprint && source_head_dim == target_head_dim {
+            return Ok(AdaptedKvRecord {
+                atom_id,
+                origin_model_fingerprint: origin_fingerprint,
+                target_model_fingerprint: target_fingerprint,
+                k_head: k_src,
+                v_head: v_src,
+                loss_report: AdapterLossReport {
+                    origin_fingerprint,
+                    target_fingerprint,
+                    source_head_dim,
+                    target_head_dim,
+                    retained_k_energy_ratio_q32: Q32_31::ONE,
+                    retained_v_energy_ratio_q32: Q32_31::ONE,
+                    rope_pair_integrity_q32: Q32_31::ONE,
+                    is_zero_copy_passthrough: true,
+                },
+            });
+        }
+
+        let p_src = source_head_dim / 2;
+        let p_dst = target_head_dim / 2;
+        let phase_offset = (phase.theta_f.to_f64() + phase.theta_s.to_f64()) * 0.03125;
+
+        // Step 1: Deterministic SO(2) RoPE-pair gauge alignment between origin_fingerprint and target_fingerprint
+        let mut k_rot = vec![0.0f32; source_head_dim];
+        let mut v_rot = vec![0.0f32; source_head_dim];
+        for p in 0..p_src {
+            let angle = if origin_fingerprint == target_fingerprint {
+                0.0
+            } else {
+                Self::pair_gauge_angle(&origin_fingerprint, &target_fingerprint, p) + phase_offset
+            };
+            let (s, c) = angle.sin_cos();
+            let c32 = c as f32;
+            let s32 = s as f32;
+
+            let k0 = k_src[2 * p];
+            let k1 = k_src[2 * p + 1];
+            k_rot[2 * p] = k0 * c32 - k1 * s32;
+            k_rot[2 * p + 1] = k0 * s32 + k1 * c32;
+
+            let v0 = v_src[2 * p];
+            let v1 = v_src[2 * p + 1];
+            v_rot[2 * p] = v0 * c32 - v1 * s32;
+            v_rot[2 * p + 1] = v0 * s32 + v1 * c32;
+        }
+
+        // Step 2: Isometric Pair-Harmonic Embedding (p_dst >= p_src) or Spectral Pair Truncation (p_dst < p_src)
+        let mut k_dst = vec![0.0f32; target_head_dim];
+        let mut v_dst = vec![0.0f32; target_head_dim];
+
+        if p_dst >= p_src {
+            // Distribute p_dst target pairs across p_src source pairs with exact 1/sqrt(m_p) normalization
+            let base_rep = p_dst / p_src;
+            let rem = p_dst % p_src;
+            let mut dst_pair_idx = 0usize;
+            for p in 0..p_src {
+                let m_p = base_rep + usize::from(p < rem);
+                let scale = 1.0f32 / (m_p as f32).sqrt();
+                for r in 0..m_p {
+                    let sign = if r % 2 == 0 { 1.0f32 } else { -1.0f32 };
+                    k_dst[2 * dst_pair_idx] = k_rot[2 * p] * scale * sign;
+                    k_dst[2 * dst_pair_idx + 1] = k_rot[2 * p + 1] * scale * sign;
+                    v_dst[2 * dst_pair_idx] = v_rot[2 * p] * scale * sign;
+                    v_dst[2 * dst_pair_idx + 1] = v_rot[2 * p + 1] * scale * sign;
+                    dst_pair_idx += 1;
+                }
+            }
+        } else {
+            // Retain top low-frequency RoPE pairs and explicitly log discarded spectral energy (Qual #9)
+            k_dst.copy_from_slice(&k_rot[0..target_head_dim]);
+            v_dst.copy_from_slice(&v_rot[0..target_head_dim]);
+        }
+
+        let k_src_energy: f64 = k_src.iter().map(|&x| (x as f64) * (x as f64)).sum();
+        let k_dst_energy: f64 = k_dst.iter().map(|&x| (x as f64) * (x as f64)).sum();
+        let v_src_energy: f64 = v_src.iter().map(|&x| (x as f64) * (x as f64)).sum();
+        let v_dst_energy: f64 = v_dst.iter().map(|&x| (x as f64) * (x as f64)).sum();
+
+        let retained_k = if k_src_energy <= 1e-18 {
+            Q32_31::ONE
+        } else {
+            Q32_31::from_f64((k_dst_energy / k_src_energy).clamp(0.0, 1.0))
+        };
+        let retained_v = if v_src_energy <= 1e-18 {
+            Q32_31::ONE
+        } else {
+            Q32_31::from_f64((v_dst_energy / v_src_energy).clamp(0.0, 1.0))
+        };
+
+        Ok(AdaptedKvRecord {
+            atom_id,
+            origin_model_fingerprint: origin_fingerprint,
+            target_model_fingerprint: target_fingerprint,
+            k_head: k_dst,
+            v_head: v_dst,
+            loss_report: AdapterLossReport {
+                origin_fingerprint,
+                target_fingerprint,
+                source_head_dim,
+                target_head_dim,
+                retained_k_energy_ratio_q32: retained_k,
+                retained_v_energy_ratio_q32: retained_v,
+                rope_pair_integrity_q32: Q32_31::ONE,
+                is_zero_copy_passthrough: false,
+            },
+        })
+    }
+
+    fn pair_gauge_angle(
+        origin_fp: &Sha256Digest,
+        target_fp: &Sha256Digest,
+        pair_index: usize,
+    ) -> f64 {
+        let mut seed = [0u8; 72];
+        seed[0..32].copy_from_slice(&origin_fp.0);
+        seed[32..64].copy_from_slice(&target_fp.0);
+        seed[64..72].copy_from_slice(&(pair_index as u64).to_le_bytes());
+        let digest = Sha256Digest::compute(&seed);
+        let word = u64::from_le_bytes([
+            digest.0[0],
+            digest.0[1],
+            digest.0[2],
+            digest.0[3],
+            digest.0[4],
+            digest.0[5],
+            digest.0[6],
+            digest.0[7],
+        ]);
+        // Map deterministically into [-π/8, +π/8] rad so cross-epoch phase alignment is smooth
+        let unit = (word as f64) / (u64::MAX as f64) - 0.5;
+        unit * (std::f64::consts::PI * 0.25)
+    }
+}
+

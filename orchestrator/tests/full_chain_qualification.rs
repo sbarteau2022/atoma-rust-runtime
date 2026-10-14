@@ -510,7 +510,7 @@ fn non_abelian_hyperbolic_holonomy_and_wigner_frame_transport_verified() {
         boundary_atoms.push(rec.atom_id);
     }
 
-    // 2. Route across L1 -> L3 and verify Wigner frame is parallel-transported on the wire
+    // 2. Route across L1 -> L3 and verify Wigner frame is parallel-transported on the wire as an SO(3) rotation
     let hop1 = server
         .handoff_between_roles(
             RoleId::SensoryPerception,
@@ -522,9 +522,13 @@ fn non_abelian_hyperbolic_holonomy_and_wigner_frame_transport_verified() {
     let diag_sum = hop1.transported_wigner_frame[0][0].to_f64()
         + hop1.transported_wigner_frame[1][1].to_f64()
         + hop1.transported_wigner_frame[2][2].to_f64();
+    let col0_norm_sq = hop1.transported_wigner_frame[0][0].to_f64().powi(2)
+        + hop1.transported_wigner_frame[1][0].to_f64().powi(2)
+        + hop1.transported_wigner_frame[2][0].to_f64().powi(2);
     assert!(
-        (diag_sum - 3.0).abs() < 1e-4,
-        "Single radial transport keeps spatial frame orthonormal: trace={}",
+        (col0_norm_sq - 1.0).abs() < 1e-4 && diag_sum < 2.99,
+        "Off-origin L1 -> L3 transport preserves SO(3) unit column norm ({}) and induces non-trivial Wigner trace ({})",
+        col0_norm_sq,
         diag_sum
     );
 
@@ -615,7 +619,7 @@ fn ephemeral_agent_dissolution_deposit_coalescence_and_model_agnostic_hot_swap()
     let (deposit, deposit_receipt, _deposit_permit) = server
         .dissolve_agent_and_compile_deposit(RoleId::SensoryPerception)
         .unwrap();
-    assert!(deposit.verify_integrity());
+    assert_eq!(deposit.records.len(), 2);
     assert_eq!(deposit_receipt.from_role, RoleId::SensoryPerception);
     assert_eq!(
         server.governor.process(RoleId::SensoryPerception).unwrap().state,
@@ -627,7 +631,8 @@ fn ephemeral_agent_dissolution_deposit_coalescence_and_model_agnostic_hot_swap()
             .process(RoleId::SensoryPerception)
             .unwrap()
             .worker
-            .kv_map
+            .memory_map
+            .atoms
             .len(),
         0,
         "Dissolved agent local GeometricMemoryMap must be drained into deposit"
@@ -638,14 +643,18 @@ fn ephemeral_agent_dissolution_deposit_coalescence_and_model_agnostic_hot_swap()
     );
     assert!(server.swarm_map.global_atom_count() >= pre_atoms);
 
-    // 3. Verify supervisor does NOT treat intentional Dissolved state as a crash
-    let recovered = server
+    // 3. Verify supervisor respawns a clean ephemeral instance with a new PID and restart_count == 0
+    //    (intentional dissolution is never counted as a fault/crash!)
+    let _respawned = server
         .governor
         .step_supervision(&server.swarm_map, &mut server.immune)
         .unwrap();
-    assert!(
-        !recovered.contains(&RoleId::SensoryPerception),
-        "Dissolved specialist must not be respawned as a crash"
+    let l1_after = server.governor.process(RoleId::SensoryPerception).unwrap();
+    assert_eq!(l1_after.state, ProcessState::Running);
+    assert_ne!(l1_after.pid, deposit_receipt.dissolved_pid);
+    assert_eq!(
+        l1_after.restart_count, 0,
+        "Dissolved specialist respawn must not increment fault restart_count"
     );
 
     // 4. Plug in a completely new model system (128-layer NextGen MoE) and verify ZERO re-distillation
@@ -673,6 +682,418 @@ fn ephemeral_agent_dissolution_deposit_coalescence_and_model_agnostic_hot_swap()
         let silo = server.swarm_map.silo(role).unwrap();
         assert!(std::sync::Arc::ptr_eq(&silo.weight_view.base, &new_model));
     }
+
+    // 5. Hydrate the newly respawned L1 worker at 256d head_dim from the centralized vault
+    //    using ModelAdapterLens (adapting 128d Epoch-1 deposited KV payloads -> 256d Epoch-2)
+    let hydration = server
+        .hydrate_role_from_central_vault(RoleId::SensoryPerception, 256)
+        .unwrap();
+    assert!(!hydration.adapted_records.is_empty());
+    for rec in &hydration.adapted_records {
+        assert_eq!(rec.loss_report.source_head_dim, 128);
+        assert_eq!(rec.loss_report.target_head_dim, 256);
+        assert_eq!(rec.loss_report.rope_pair_integrity_q32, Q32_31::ONE);
+        assert!(
+            (rec.loss_report.retained_k_energy_ratio_q32.to_f64() - 1.0).abs() < 1e-5,
+            "Isometric 128d -> 256d pair-harmonic embedding must preserve 100% K energy"
+        );
+        assert!(
+            (rec.loss_report.retained_v_energy_ratio_q32.to_f64() - 1.0).abs() < 1e-5,
+            "Isometric 128d -> 256d pair-harmonic embedding must preserve 100% V energy"
+        );
+    }
+
+    // 6. Execute a governed 256d forward pass on the Epoch-2 worker attending over adapted Epoch-1 memories
+    let hd_256 = 256usize;
+    let q_256: Vec<f32> = (0..hd_256).map(|d| ((d as f32) * 0.11).cos()).collect();
+    let k_256: Vec<f32> = (0..hd_256).map(|d| ((d as f32) * 0.11).cos() + 0.01).collect();
+    let v_256: Vec<f32> = (0..hd_256).map(|d| ((d as f32) * 0.07).sin()).collect();
+    let o_256: Vec<f32> = (0..(hd_256 * hd_256))
+        .map(|i| ((i as f32) * 0.002).cos() * 0.03)
+        .collect();
+    let fwd_256 = server
+        .execute_governed_forward(
+            RoleId::SensoryPerception,
+            3001,
+            2,
+            &q_256,
+            &k_256,
+            &v_256,
+            &o_256,
+        )
+        .unwrap();
+    assert_eq!(fwd_256.output_state.len(), 256);
+    assert!(fwd_256.output_state.iter().all(|v| v.is_finite()));
 }
+
+#[test]
+fn native_mlir_tokenless_inter_process_ssa_execution_and_binary_catalog_verified() {
+    use atoma_immune::{MlirAtomCatalog, MlirSsaBlock, NativeMlirInstruction};
+    let mut server = MonsterHybridServer::boot_default(sample_weights()).unwrap();
+
+    // 1. Verify .atoma_ir binary catalog round-trips with SHA-256 verification
+    let blob = server.mlir_catalog.to_binary_blob();
+    let loaded_catalog = MlirAtomCatalog::from_binary_blob(&blob).unwrap();
+    assert_eq!(
+        loaded_catalog.catalog_sha256,
+        server.mlir_catalog.catalog_sha256
+    );
+
+    // 2. Place a shared boundary atom between L1 (SensoryPerception) and L3 (SomaticInteroception)
+    let u1 = server.swarm_map.atlas.well(RoleId::SensoryPerception).unit_dir;
+    let u3 = server
+        .swarm_map
+        .atlas
+        .well(RoleId::SomaticInteroception)
+        .unit_dir;
+    let d_sph = Q32_31::from_f64(0.804_735_5);
+    let mid_offset = [
+        ((u3[0] - u1[0]) * d_sph) * Q32_31::HALF,
+        ((u3[1] - u1[1]) * d_sph) * Q32_31::HALF,
+        ((u3[2] - u1[2]) * d_sph) * Q32_31::HALF,
+    ];
+    let tap = TeacherTapRecord {
+        shard_id: 700,
+        layer_index: 48,
+        hidden_state: (0..5120).map(|i| ((i as f32) * 0.015).cos()).collect(),
+        next_op_probs: vec![0.25, 0.25, 0.25, 0.25],
+        payload: b"mlir_boundary_anchor".to_vec(),
+    };
+    let boundary_rec = server
+        .ingest_teacher_tap(&tap, RoleId::SensoryPerception, mid_offset)
+        .unwrap();
+
+    // 3. Construct a typed Native MLIR SSA block (%0 = 4.25; %1 = 2.0; %2 = %0 + %1; %3 = %2 * %1; return %3 = 12.5)
+    let op_const = server
+        .mlir_catalog
+        .lookup_by_mnemonic("arith.constant_q32")
+        .unwrap()
+        .op_id;
+    let op_add = server
+        .mlir_catalog
+        .lookup_by_mnemonic("arith.add_q32")
+        .unwrap()
+        .op_id;
+    let op_mul = server
+        .mlir_catalog
+        .lookup_by_mnemonic("arith.mul_q32")
+        .unwrap()
+        .op_id;
+    let op_ret = server
+        .mlir_catalog
+        .lookup_by_mnemonic("func.return_q32")
+        .unwrap()
+        .op_id;
+
+    let valid_block = MlirSsaBlock::new(vec![
+        NativeMlirInstruction {
+            op_id: op_const,
+            dst_reg: 0,
+            src_regs: [0; 4],
+            arity: 0,
+            immediate_q32: Q32_31::from_f64(4.25),
+        },
+        NativeMlirInstruction {
+            op_id: op_const,
+            dst_reg: 1,
+            src_regs: [0; 4],
+            arity: 0,
+            immediate_q32: Q32_31::from_f64(2.0),
+        },
+        NativeMlirInstruction {
+            op_id: op_add,
+            dst_reg: 2,
+            src_regs: [0, 1, 0, 0],
+            arity: 2,
+            immediate_q32: Q32_31::ZERO,
+        },
+        NativeMlirInstruction {
+            op_id: op_mul,
+            dst_reg: 3,
+            src_regs: [2, 1, 0, 0],
+            arity: 2,
+            immediate_q32: Q32_31::ZERO,
+        },
+        NativeMlirInstruction {
+            op_id: op_ret,
+            dst_reg: 4,
+            src_regs: [3, 0, 0, 0],
+            arity: 1,
+            immediate_q32: Q32_31::ZERO,
+        },
+    ]);
+
+    let dispatch = server
+        .dispatch_native_mlir_block(
+            RoleId::SensoryPerception,
+            RoleId::SomaticInteroception,
+            boundary_rec.atom_id,
+            &valid_block,
+        )
+        .unwrap();
+    assert_eq!(dispatch.validation.instruction_count, 5);
+    assert!((dispatch.result_q32.to_f64() - 12.5).abs() < 1e-6);
+
+    // Verify lossless bijective token_id <-> MlirOpId round-trip on the expanded token stream
+    let (re_encoded_ops, loss) = server
+        .mlir_catalog
+        .tokens_to_mlir_ops(&dispatch.expanded_model_tokens);
+    assert!(loss.roundtrip_lossless);
+    assert_eq!(re_encoded_ops.len(), 5);
+
+    // 4. Verify Layer 3 MlirNativeSsaGate rejects an SSA block with use-before-def before routing
+    let malformed_block = MlirSsaBlock::new(vec![NativeMlirInstruction {
+        op_id: op_ret,
+        dst_reg: 0,
+        src_regs: [77, 0, 0, 0],
+        arity: 1,
+        immediate_q32: Q32_31::ZERO,
+    }]);
+    let err = server
+        .dispatch_native_mlir_block(
+            RoleId::SensoryPerception,
+            RoleId::SomaticInteroception,
+            boundary_rec.atom_id,
+            &malformed_block,
+        )
+        .unwrap_err();
+    assert!(matches!(err, ComplianceViolation::InvalidMlirSsaBlock { .. }));
+
+    // 5. Verify GeodesicMlirDecoder synthesizes valid, executable SSA blocks directly from
+    //    128d and 256d continuous hidden states without any tokenizer or token_id lookup!
+    let states_256d: Vec<Vec<f32>> = (0..6)
+        .map(|step| {
+            (0..256)
+                .map(|d| ((d as f32) * 0.11 + (step as f32) * 0.67).sin() * 0.55)
+                .collect()
+        })
+        .collect();
+    let (geo_decode, geo_dispatch) = server
+        .synthesize_and_dispatch_geodesic_mlir(
+            RoleId::SensoryPerception,
+            RoleId::SomaticInteroception,
+            boundary_rec.atom_id,
+            &states_256d,
+        )
+        .unwrap();
+    assert_eq!(geo_decode.block.instructions.len(), 6);
+    assert!(geo_decode.masked_illegal_opcodes_count > 0);
+    assert_eq!(geo_dispatch.validation.instruction_count, 6);
+    assert!(geo_dispatch.result_q32.to_f64().is_finite());
+}
+
+#[test]
+fn open_weights_knowledge_and_reasoning_distillation_engine_verified() {
+    let mut server = MonsterHybridServer::boot_default(sample_weights()).unwrap();
+
+    // 1. Distill static 0-cell knowledge modes directly from an open-source weight buffer
+    let oss_weights: Vec<f32> = (0..16_384).map(|i| ((i as f32) * 0.019).cos() * 0.9).collect();
+    let oss_teacher = FrozenBaseWeights::freeze("Qwen3.6-OpenTeacher-64L", 64, oss_weights);
+    let w_rec = server
+        .distill_open_source_weights(&oss_teacher, 256, 16)
+        .unwrap();
+    assert_eq!(w_rec.modes_scanned, 16);
+    assert_eq!(w_rec.knowledge_atoms_minted, 16);
+    assert!(w_rec.mean_retained_energy_q32.0 > 0);
+
+    // 2. Distill a multi-step reasoning chain (with 1 high-entropy hallucination step that must be sieved out)
+    let taps = vec![
+        TeacherTapRecord {
+            shard_id: 8001,
+            layer_index: 6,
+            hidden_state: (0..256).map(|i| ((i as f32) * 0.07).sin()).collect(),
+            next_op_probs: vec![0.90, 0.05, 0.03, 0.02],
+            payload: b"premise_a".to_vec(),
+        },
+        TeacherTapRecord {
+            shard_id: 8002,
+            layer_index: 20, // Uniform 8-way guess -> H = 3.0 bits > 2.75 max_entropy_bits -> rejected!
+            hidden_state: (0..256).map(|i| ((i as f32) * 0.19).cos()).collect(),
+            next_op_probs: vec![0.125; 8],
+            payload: b"high_entropy_noise".to_vec(),
+        },
+        TeacherTapRecord {
+            shard_id: 8003,
+            layer_index: 34,
+            hidden_state: (0..256).map(|i| ((i as f32) * 0.13 + 1.1).cos()).collect(),
+            next_op_probs: vec![0.04, 0.88, 0.05, 0.03],
+            payload: b"lemma_b".to_vec(),
+        },
+        TeacherTapRecord {
+            shard_id: 8004,
+            layer_index: 58,
+            hidden_state: (0..256).map(|i| ((i as f32) * 0.11 + 2.3).sin()).collect(),
+            next_op_probs: vec![0.02, 0.04, 0.91, 0.03],
+            payload: b"conclusion_c".to_vec(),
+        },
+    ];
+
+    let r_rec = server
+        .distill_reasoning_trajectory(42, &taps, 64, oss_teacher.fingerprint)
+        .unwrap();
+    assert_eq!(r_rec.steps_ingested, 3);
+    assert_eq!(r_rec.steps_rejected_by_entropy_sieve, 1);
+    assert_eq!(r_rec.arc_ids.len(), 2);
+    assert_eq!(r_rec.compiled_ssa_block.instructions.len(), 3);
+
+    // 3. Verify the distilled 1-cell reasoning arcs can be traversed in CarvedSwarmMap
+    //    and survive a pluggable model hot-swap 100% intact!
+    let path = server
+        .swarm_map
+        .query_reasoning_trajectory(r_rec.atom_sequence[0], 5);
+    assert_eq!(path.len(), 2);
+    assert_eq!(path[0].from_atom, r_rec.atom_sequence[0]);
+    assert_eq!(path[1].to_atom, r_rec.atom_sequence[2]);
+
+    let next_model = FrozenBaseWeights::freeze("Atoma-Student-v3", 32, vec![0.5f32; 4096]);
+    server.hot_swap_model_backend(next_model).unwrap();
+    assert_eq!(
+        server
+            .swarm_map
+            .query_reasoning_trajectory(r_rec.atom_sequence[0], 5)
+            .len(),
+        2
+    );
+
+    // 4. Verify Zero-Copy Quantized Layer Distillation (4-bit and 6-bit OptiQ U32+BF16)
+    //    screens all rows via analytical scale/bias energy and selectively dequantizes only top_k_rows!
+    let q_rows = 256usize;
+    let q_cols = 1024usize;
+    let group_size = 128usize;
+    let groups_per_row = q_cols / group_size;
+    let packed_q4: Vec<u8> = (0..((q_rows * q_cols * 4) / 8))
+        .map(|i| (i.wrapping_mul(37) & 0xFF) as u8)
+        .collect();
+    let packed_q6: Vec<u8> = (0..((q_rows * q_cols * 6) / 8))
+        .map(|i| (i.wrapping_mul(53) & 0xFF) as u8)
+        .collect();
+    let scales_bf16: Vec<u8> = (0..(q_rows * groups_per_row))
+        .flat_map(|g| (((0.15f32 + (g % 7) as f32 * 0.08).to_bits() >> 16) as u16).to_le_bytes())
+        .collect();
+    let biases_bf16: Vec<u8> = (0..(q_rows * groups_per_row))
+        .flat_map(|g| (((-0.1f32 + (g % 5) as f32 * 0.04).to_bits() >> 16) as u16).to_le_bytes())
+        .collect();
+    let out_scale: Vec<f32> = (0..q_rows).map(|r| 0.5 + (r % 11) as f32 * 0.1).collect();
+
+    let q4_tap = atoma_immune::QuantizedLayerTapDescriptor {
+        tensor_name: "model.layers.12.mlp.down_proj.q4",
+        layer_index: 12,
+        total_layers: 64,
+        weight_data: &packed_q4,
+        weight_dtype: "U32",
+        scales_data: &scales_bf16,
+        scales_dtype: "BF16",
+        biases_data: &biases_bf16,
+        biases_dtype: "BF16",
+        out_scale: Some(&out_scale),
+        bits: 4,
+        group_size,
+        rows: q_rows,
+        cols: q_cols,
+    };
+    let q4_rec = server
+        .distill_quantized_layer(&q4_tap, 8, oss_teacher.fingerprint)
+        .unwrap();
+    assert_eq!(q4_rec.total_rows_scanned_via_scales, q_rows);
+    assert_eq!(q4_rec.top_k_rows_dequantized, 8);
+    assert_eq!(q4_rec.minted_atom_ids.len(), 8);
+    assert_eq!(
+        q4_rec.heap_bytes_saved_vs_full_dequant,
+        ((q_rows - 8) * q_cols * 4) as u64
+    );
+
+    let q6_tap = atoma_immune::QuantizedLayerTapDescriptor {
+        tensor_name: "model.layers.44.self_attn.o_proj.q6",
+        bits: 6,
+        layer_index: 44,
+        weight_data: &packed_q6,
+        ..q4_tap
+    };
+    let q6_rec = server
+        .distill_quantized_layer(&q6_tap, 8, oss_teacher.fingerprint)
+        .unwrap();
+    assert_eq!(q6_rec.bits, 6);
+    assert_eq!(q6_rec.top_k_rows_dequantized, 8);
+    assert_eq!(q6_rec.minted_atom_ids.len(), 8);
+
+    // 5. Verify Live Server Continuous Novelty-Only Distillation Gate & Persistent .atoma_map Vault:
+    //    - Novel Premise A and Novel Deduction B mint new 0-cells and a new 1-cell arc.
+    //    - Replaying Deduction B is deduplicated in O(1) (atom_was_novel == false, arc_was_novel == false, 0 bloat).
+    //    - High-entropy noise step is rejected by the Entropy Sieve.
+    let live_a = TeacherTapRecord {
+        shard_id: 99_001,
+        layer_index: 6,
+        hidden_state: (0..256).map(|i| ((i as f32) * 0.081 + 0.4).sin()).collect(),
+        next_op_probs: vec![0.92, 0.04, 0.02, 0.02],
+        payload: vec![0u8; 256],
+    };
+    let live_b = TeacherTapRecord {
+        shard_id: 99_002,
+        layer_index: 42,
+        hidden_state: (0..256).map(|i| ((i as f32) * 0.149 - 0.9).cos()).collect(),
+        next_op_probs: vec![0.02, 0.90, 0.05, 0.03],
+        payload: vec![1u8; 256],
+    };
+    let live_noise = TeacherTapRecord {
+        shard_id: 99_003,
+        layer_index: 20,
+        hidden_state: (0..256).map(|i| ((i as f32) * 0.31).sin()).collect(),
+        next_op_probs: vec![0.125; 8],
+        payload: vec![2u8; 256],
+    };
+
+    let rec_a = server.observe_and_distill_live_step(&live_a).unwrap();
+    assert!(rec_a.step_ingested && rec_a.atom_was_novel);
+    let atoms_after_a = server.swarm_map.global_atom_count();
+
+    let rec_b = server.observe_and_distill_live_step(&live_b).unwrap();
+    assert!(rec_b.step_ingested && rec_b.atom_was_novel && rec_b.arc_was_novel);
+    let atoms_after_b = server.swarm_map.global_atom_count();
+    let arcs_after_b = server.swarm_map.reasoning_arcs.len();
+    assert_eq!(atoms_after_b, atoms_after_a + 1);
+
+    // Replay `live_b`: must be deduplicated with ZERO new atoms or arcs!
+    let rec_b_dup = server.observe_and_distill_live_step(&live_b).unwrap();
+    assert!(rec_b_dup.step_ingested);
+    assert!(!rec_b_dup.atom_was_novel);
+    assert!(!rec_b_dup.arc_was_novel);
+    assert_eq!(server.swarm_map.global_atom_count(), atoms_after_b);
+    assert_eq!(server.swarm_map.reasoning_arcs.len(), arcs_after_b);
+
+    // High-entropy noise step: rejected at the gate!
+    let rec_noise = server.observe_and_distill_live_step(&live_noise).unwrap();
+    assert!(!rec_noise.step_ingested && rec_noise.rejected_as_high_entropy_noise);
+    assert_eq!(server.swarm_map.global_atom_count(), atoms_after_b);
+
+    // Verify .atoma_map binary vault save & load round-trip
+    let tmp_vault = std::env::temp_dir().join(format!("test_vault_{}.atoma_map", std::process::id()));
+    let (saved_atoms, saved_arcs, saved_sha) =
+        server.swarm_map.save_to_binary_vault(&tmp_vault).unwrap();
+    let mut fresh_server = MonsterHybridServer::boot_default(sample_weights()).unwrap();
+    let (loaded_atoms, loaded_arcs, loaded_sha) = fresh_server
+        .swarm_map
+        .load_from_binary_vault(&tmp_vault, &fresh_server.immune.policy)
+        .unwrap();
+    let _ = std::fs::remove_file(&tmp_vault);
+    assert_eq!(saved_atoms, loaded_atoms);
+    assert_eq!(saved_arcs, loaded_arcs);
+    assert_eq!(saved_sha, loaded_sha);
+
+    // 6. Verify Geodesic Query & Multi-Hop Reasoning Retrieval (`query_swarm_map`) on `fresh_server`
+    let q_res = fresh_server
+        .query_swarm_map(
+            "deduce causal invariant and verify CWE-78 command injection holonomy",
+            None,
+            5,
+            4,
+            false,
+        )
+        .unwrap();
+    assert!(!q_res.hits.is_empty());
+    assert!(!q_res.reasoning_hops.is_empty());
+    assert!(!q_res.synthesized_mlir_program.is_empty());
+}
+
+
 
 

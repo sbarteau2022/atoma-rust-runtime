@@ -14,8 +14,11 @@ use crate::atlas13::{Atlas13, EpistemicMark, RoleId};
 use crate::cache::geometric::AtomId;
 use crate::geometry::bridge::BridgeLossReport;
 use crate::geometry::fixed::Q32_31;
+use crate::mlir_native::{MlirAtomCatalog, MlirSsaBlock, MlirSsaValidationReceipt};
 use crate::refraction::{ProjectionLossReport, RefractionLossReport, Sha256Digest};
-use crate::silo::{CarveLossReport, CarvedSwarmMap, EphemeralMapDeposit, FrozenBaseWeights};
+use crate::silo::{
+    AdapterLossReport, CarveLossReport, CarvedSwarmMap, EphemeralMapDeposit, FrozenBaseWeights,
+};
 use std::fmt;
 
 /// Preregistered falsification test fingerprint from `dhng2.html` (`94ce028317e0ecac`).
@@ -121,6 +124,8 @@ pub enum ComplianceViolation {
         required_families: u8,
         co_recall_ci_lower_q32: Q32_31,
     },
+    /// Native MLIR SSA or static type-safety gate failed (`Gate 11: MlirNativeSsaGate`).
+    InvalidMlirSsaBlock { reason: String },
 }
 
 impl fmt::Display for ComplianceViolation {
@@ -178,6 +183,9 @@ impl fmt::Display for ComplianceViolation {
                 required_families,
                 co_recall_ci_lower_q32.to_f64()
             ),
+            Self::InvalidMlirSsaBlock { reason } => {
+                write!(f, "Layer 3 MlirNativeSsaGate rejected block: {}", reason)
+            }
         }
     }
 }
@@ -645,6 +653,145 @@ impl ImmuneSystem {
             ),
             EpistemicMark::Verified,
         ))
+    }
+
+    /// Gate 10 (`Cross-Epoch Model Adapter Gate`):
+    /// Authorize cross-epoch KV payload projection via `ModelAdapterLens` when a newly hot-swapped
+    /// model (`target_fingerprint`, `target_head_dim`) reads raw KV payloads deposited by an earlier
+    /// model epoch (`origin_fingerprint`, `source_head_dim`).
+    ///
+    /// Verifies:
+    /// 1. Base weights are intact (`check_base_weights`).
+    /// 2. Both `origin_fingerprint` and `target_fingerprint` belong to the registered `CarvedSwarmMap::model_lineage`.
+    /// 3. Both `source_head_dim` and `target_head_dim` are positive even dimensions (2x2 RoPE pairs).
+    /// 4. `rope_pair_integrity_q32 == Q32_31::ONE` and `retained_k_energy_ratio_q32 > 0` (`Qualification #9`).
+    pub fn authorize_cross_epoch_adaptation(
+        &mut self,
+        role: RoleId,
+        atom_id: AtomId,
+        loss: &AdapterLossReport,
+        map: &CarvedSwarmMap,
+    ) -> Result<CompliancePermit, ComplianceViolation> {
+        let _weight_permit = self.check_base_weights(map)?;
+
+        if !map.is_registered_model_fingerprint(&loss.origin_fingerprint)
+            || loss.target_fingerprint != map.base_weights.fingerprint
+        {
+            let err = ComplianceViolation::BaseWeightsModified {
+                expected: map.base_weights.fingerprint,
+                found: loss.origin_fingerprint,
+            };
+            self.record_audit(
+                format!(
+                    "REJECT CrossEpochAdapterGate role={} atom={}: unregistered origin/target model lineage",
+                    role.name(),
+                    atom_id
+                ),
+                false,
+                EpistemicMark::Verified,
+            );
+            return Err(err);
+        }
+
+        if loss.source_head_dim == 0
+            || loss.source_head_dim % 2 != 0
+            || loss.target_head_dim == 0
+            || loss.target_head_dim % 2 != 0
+            || loss.rope_pair_integrity_q32 != Q32_31::ONE
+            || loss.retained_k_energy_ratio_q32.0 <= 0
+        {
+            let err = ComplianceViolation::SilentInformationLoss {
+                stage: "ModelAdapterLens::adapt_kv_payload (CrossEpochAdapterGate)",
+            };
+            self.record_audit(
+                format!(
+                    "REJECT CrossEpochAdapterGate role={} atom={}: {}",
+                    role.name(),
+                    atom_id,
+                    err
+                ),
+                false,
+                EpistemicMark::Verified,
+            );
+            return Err(err);
+        }
+
+        Ok(self.mint_permit(
+            format!(
+                "PASS CrossEpochAdapterGate(role={}, atom={}, {}d->{}d, retained_k={:.4}, retained_v={:.4}, passthrough={})",
+                role.name(),
+                atom_id,
+                loss.source_head_dim,
+                loss.target_head_dim,
+                loss.retained_k_energy_ratio_q32.to_f64(),
+                loss.retained_v_energy_ratio_q32.to_f64(),
+                loss.is_zero_copy_passthrough
+            ),
+            EpistemicMark::Verified,
+        ))
+    }
+
+    /// Gate 11 (`MlirNativeSsaGate`):
+    /// Authorize a native inter-process [`MlirSsaBlock`] before it is transmitted or executed
+    /// between roles (`sender -> receiver`).
+    ///
+    /// Verifies:
+    /// 1. Base weights and `MlirAtomCatalog` SHA-256 integrity.
+    /// 2. Static Single Assignment (SSA) dominance (every input register defined before use, no duplicate defs).
+    /// 3. Exact operand arity and static [`MlirTypeSig`] compatibility.
+    /// 4. Specialist role capability ownership (`required_role`).
+    pub fn authorize_mlir_ssa_block(
+        &mut self,
+        sender: RoleId,
+        receiver: RoleId,
+        block: &MlirSsaBlock,
+        catalog: &MlirAtomCatalog,
+        map: &CarvedSwarmMap,
+    ) -> Result<(MlirSsaValidationReceipt, CompliancePermit), ComplianceViolation> {
+        let _weight_permit = self.check_base_weights(map)?;
+        if !catalog.verify_integrity() {
+            let err = ComplianceViolation::InvalidMlirSsaBlock {
+                reason: "MlirAtomCatalog SHA-256 integrity check failed".to_string(),
+            };
+            self.record_audit(
+                format!("REJECT MlirNativeSsaGate: {}", err),
+                false,
+                EpistemicMark::Verified,
+            );
+            return Err(err);
+        }
+
+        let receipt = block
+            .validate_ssa_and_types(catalog, sender)
+            .map_err(|e| {
+                let err = ComplianceViolation::InvalidMlirSsaBlock {
+                    reason: e.to_string(),
+                };
+                self.record_audit(
+                    format!(
+                        "REJECT MlirNativeSsaGate L{} -> L{}: {}",
+                        sender.level(),
+                        receiver.level(),
+                        err
+                    ),
+                    false,
+                    EpistemicMark::Verified,
+                );
+                err
+            })?;
+
+        let permit = self.mint_permit(
+            format!(
+                "PASS MlirNativeSsaGate(L{}->L{}, ops={}, ret={:?}, digest={}..)",
+                sender.level(),
+                receiver.level(),
+                receipt.instruction_count,
+                receipt.final_return_type,
+                &receipt.block_digest.to_hex()[..12]
+            ),
+            EpistemicMark::Verified,
+        );
+        Ok((receipt, permit))
     }
 
     fn mint_permit(&mut self, action_summary: String, mark: EpistemicMark) -> CompliancePermit {

@@ -18,8 +18,9 @@ use atoma_immune::geometry::fixed::Q32_31;
 use atoma_immune::geometry::lorentz::LorentzVector;
 use atoma_immune::ops::{matvec, softmax};
 use atoma_immune::{
-    CarvedSwarmMap, CompliancePermit, ComplianceViolation, DepositCompilationReceipt,
-    DepositedAtomRecord, EphemeralMapDeposit, IDENTITY_FRAME_Q32, ImmuneSystem, RoleId, SiloAtom,
+    AdaptedKvRecord, CarvedSwarmMap, CompliancePermit, ComplianceViolation,
+    DepositCompilationReceipt, DepositedAtomRecord, EphemeralMapDeposit, IDENTITY_FRAME_Q32,
+    ImmuneSystem, ModelAdapterLens, RoleId, SiloAtom,
 };
 use std::time::{Duration, Instant};
 
@@ -59,6 +60,17 @@ pub struct GovernedForwardReceipt {
     pub forward_permit: CompliancePermit,
     pub bridge_loss: BridgeLossReport,
     pub output_state: Vec<f32>,
+}
+
+/// Receipt emitted when hydrating a specialist worker's local `GeometricMemoryMap` from its
+/// carved `SiloView` across model epochs using [`ModelAdapterLens`].
+#[derive(Debug, Clone)]
+pub struct CrossEpochHydrationReceipt {
+    pub role: RoleId,
+    pub worker_pid: u64,
+    pub target_head_dim: usize,
+    pub adapted_records: Vec<AdaptedKvRecord>,
+    pub adapter_permits: Vec<CompliancePermit>,
 }
 
 /// Live `core_lm` inference worker owned and supervised by a `RoleProcess` (`core_lm -> orchestrator`).
@@ -519,5 +531,84 @@ impl Governor {
             target_proc.inbox.push(receipt.clone());
         }
         Ok(receipt)
+    }
+
+    /// Hydrate `role`'s supervised `CoreLmInferenceWorker` at `target_head_dim` from its carved
+    /// `SiloView` in `map`, automatically projecting any cross-epoch KV payloads deposited by
+    /// older model epochs (`origin_model_fingerprint`) into `target_head_dim` via [`ModelAdapterLens`]
+    /// and verifying each projection under Layer 3 (`authorize_cross_epoch_adaptation`).
+    pub fn hydrate_worker_from_silo_with_adapter(
+        &mut self,
+        role: RoleId,
+        target_head_dim: usize,
+        map: &CarvedSwarmMap,
+        immune: &mut ImmuneSystem,
+    ) -> Result<CrossEpochHydrationReceipt, ComplianceViolation> {
+        let needs_recovery = self.processes[role.level() as usize]
+            .as_ref()
+            .map(|p| p.state != ProcessState::Running)
+            .unwrap_or(true);
+        if needs_recovery {
+            self.step_supervision(map, immune)?;
+        }
+
+        let silo = map
+            .silo(role)
+            .ok_or(ComplianceViolation::InvalidSpecialistRole(role))?;
+        let target_fp = map.base_weights.fingerprint;
+
+        let mut adapted_records = Vec::new();
+        let mut adapter_permits = Vec::new();
+        let mut local_entries = Vec::new();
+
+        for silo_atom in silo.atoms() {
+            // Only adapt KV payloads that carry valid even-head-dim f32 K+V pairs (>= 16 bytes, multiple of 8)
+            if silo_atom.payload.len() >= 16 && silo_atom.payload.len() % 8 == 0 {
+                let adapted = ModelAdapterLens::adapt_kv_payload(
+                    silo_atom.id,
+                    &silo_atom.payload,
+                    silo_atom.origin_model_fingerprint,
+                    target_fp,
+                    silo_atom.phase,
+                    target_head_dim,
+                )
+                .map_err(|_| ComplianceViolation::SilentInformationLoss {
+                    stage: "ModelAdapterLens::adapt_kv_payload",
+                })?;
+
+                let permit = immune.authorize_cross_epoch_adaptation(
+                    role,
+                    silo_atom.id,
+                    &adapted.loss_report,
+                    map,
+                )?;
+
+                let packed = ModelAdapterLens::pack_kv_payload(&adapted.k_head, &adapted.v_head);
+                local_entries.push((silo_atom.local_lorentz, silo_atom.phase, packed));
+                adapted_records.push(adapted);
+                adapter_permits.push(permit);
+            }
+        }
+
+        let proc = self.processes[role.level() as usize]
+            .as_mut()
+            .ok_or(ComplianceViolation::InvalidSpecialistRole(role))?;
+        proc.worker.head_dim = target_head_dim;
+        for (lv, phase, packed) in local_entries {
+            proc.worker
+                .memory_map
+                .write(lv, phase, packed)
+                .map_err(|_| ComplianceViolation::SilentInformationLoss {
+                    stage: "GeometricMemoryMap::write (CrossEpochHydration)",
+                })?;
+        }
+
+        Ok(CrossEpochHydrationReceipt {
+            role,
+            worker_pid: proc.pid,
+            target_head_dim,
+            adapted_records,
+            adapter_permits,
+        })
     }
 }

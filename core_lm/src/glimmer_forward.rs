@@ -185,16 +185,10 @@ impl GlimmerModel {
     }
 
     fn embed(&mut self, token_id: u32) -> Result<Vec<f32>, ForwardError> {
-        let w = self.weights.get_weight("model.embed_tokens.weight")?;
         let h = self.config.hidden_size;
-        let start = (token_id as usize) * h;
-        if start + h > w.len() {
-            return Err(ForwardError::Shape(format!(
-                "token {} out of range",
-                token_id
-            )));
-        }
-        let emb = w[start..start + h].to_vec();
+        let emb = self
+            .weights
+            .get_weight_row("model.embed_tokens.weight", token_id as usize, h)?;
         Ok(scaleless_rmsnorm(&emb, self.config.rms_norm_eps))
     }
 

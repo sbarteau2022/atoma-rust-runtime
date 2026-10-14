@@ -1,6 +1,7 @@
 //! `atoma_immune`: Layer 3 Immune System, DHNG II Optical Refraction, DHNG III 12-Around-1 Silos,
 //! Non-Abelian Hyperbolic Holonomy (`holonomy.rs`), Ephemeral Agent Map Deposits, Model-Agnostic
-//! Centralized Memory, and First-Principles Superpowers Integration.
+//! Centralized Memory, Geodesic MLIR Engine (`mlir_native.rs`), Open-Weights Knowledge & Reasoning
+//! Distillation Engine (`distill_engine.rs`), and First-Principles Superpowers Integration.
 
 #[path = "../../../core_lm/src/geometry/mod.rs"]
 pub mod geometry;
@@ -23,8 +24,10 @@ pub mod ops;
 
 pub mod atlas13;
 pub mod compliance;
+pub mod distill_engine;
 pub mod first_principles;
 pub mod holonomy;
+pub mod mlir_native;
 pub mod refraction;
 pub mod silo;
 
@@ -35,6 +38,11 @@ pub use atlas13::{
 pub use compliance::{
     ComplianceAuditEntry, CompliancePermit, ComplianceViolation, ImmuneSystem,
     OverlapPolicyMatrix, PREREGISTERED_KILL_FINGERPRINT, PreregisteredEvaluation,
+};
+pub use distill_engine::{
+    DistilledReasoningArc, FullModelDistillationReceipt, LiveNoveltyDistillationReceipt,
+    OpenWeightsDistillationEngine, QuantizedDistillationReceipt, QuantizedLayerTapDescriptor,
+    ReasoningChainDistillationReceipt, WeightDistillationReceipt,
 };
 pub use first_principles::{
     ATOMIC_IR_MAX_VERIFY_TOKENS, AtomClass, AtomicIrAlphabet, ComplianceMerkleTree,
@@ -49,13 +57,18 @@ pub use first_principles::{
 pub use holonomy::{
     HolonomyLoopReceipt, HolonomyVerdict, HyperbolicHolonomyEngine, IDENTITY_FRAME_Q32,
 };
+pub use mlir_native::{
+    ATOMA_IR_BINARY_MAGIC, GeodesicDecodeReceipt, GeodesicMlirDecoder, MLIR_SSA_WIRE_MAGIC,
+    MlirAtomCatalog, MlirDialect, MlirOpDescriptor, MlirOpId, MlirSsaBlock, MlirSsaError,
+    MlirSsaValidationReceipt, MlirTransductionLossReport, MlirTypeSig, NativeMlirInstruction,
+};
 pub use refraction::{
     FrozenShard, OpticalLens, ProjectedTangent, ProjectionLossReport, RefractedPoint,
     RefractionError, RefractionLossReport, Sha256Digest, TangentProjector, TeacherTapRecord,
     rad_q32_to_pi_unit,
 };
 pub use silo::{
-    CarveLossReport, CarvedSwarmMap, CarvedWeightView, DepositCompilationReceipt,
-    DepositedAtomRecord, EphemeralMapDeposit, FrozenBaseWeights, GlobalAtom, ModelHotSwapReceipt,
-    SiloAtom, SiloView,
+    AdaptedKvRecord, AdapterLossReport, CarveLossReport, CarvedSwarmMap, CarvedWeightView,
+    DepositCompilationReceipt, DepositedAtomRecord, EphemeralMapDeposit, FrozenBaseWeights,
+    GlobalAtom, ModelAdapterLens, ModelHotSwapReceipt, SiloAtom, SiloView,
 };
