@@ -172,7 +172,9 @@ impl WeightManager {
                 scales_file.tensor_data(&scales_name)?,
                 scales_file.tensor_info(&scales_name)?,
                 biases_file.tensor_data(&biases_name)?,
+                biases_file.tensor_info(&biases_name)?,
                 bits,
+                64,
             )?
         } else {
             load_f32_tensor(file, name)?

@@ -1,0 +1,54 @@
+// Tier 4–6 (DESIGN.md): Zero-Copy FlatBuffers Schema for the Carved Swarm & Immune System.
+// Transport: Lock-free mmap SPSC/MPMC Ring Buffers with Acquire/Release atomic fencing.
+
+namespace Atoma.CarvedSwarm;
+
+enum RoleLevel : ubyte {
+  Coordinator = 0,
+  SensoryPerception = 1,
+  MotorPraxis = 2,
+  SomaticInteroception = 3,
+  LanguageSemiotics = 4,
+  EpisodicMemory = 5,
+  PredictiveSimulation = 6,
+  ConvergentLogic = 7,
+  DivergentSynthesis = 8,
+  ValuationSalience = 9,
+  SocialCognition = 10,
+  SpatialTopography = 11,
+  MetacognitiveRegulation = 12
+}
+
+struct LorentzQ32 {
+  x0: long;
+  x1: long;
+  x2: long;
+  x3: long;
+}
+
+struct PhaseQ32 {
+  theta_f: long;
+  theta_s: long;
+  psi_star: long;
+  sector_n: ubyte;
+  sector_m: ubyte;
+}
+
+struct ComplianceStamp {
+  permit_sequence: ulong;
+  chain_digest_hi: ulong;
+  chain_digest_lo: ulong;
+}
+
+table HandoffPacket {
+  envelope_id: ulong;
+  from_role: RoleLevel;
+  to_role: RoleLevel;
+  shared_atom_id: ulong;
+  global_lorentz: LorentzQ32;
+  phase: PhaseQ32;
+  compliance: ComplianceStamp;
+  payload: [ubyte];
+}
+
+root_type HandoffPacket;

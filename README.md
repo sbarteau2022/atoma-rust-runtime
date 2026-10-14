@@ -20,7 +20,7 @@ cd core_lm && cargo build
 cargo run --bin generate_glimmer -- "The capital of France is" 50
 ```
 
-Requires the Muse Glimmer q4 checkpoint at `~/models/Muse-Glimmer-q4-MLX` (path is hardcoded in `src/bin/generate_glimmer.rs`).
+Requires the Muse Glimmer checkpoint at `~/models/Muse-Glimmer-q4km-gs128-MLX` (path is hardcoded in `src/bin/generate_glimmer.rs`).
 
 ## Architecture
 

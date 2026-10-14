@@ -1,0 +1,12 @@
+[package]
+name = "atoma_bridge_harness"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone FLAG-01 empirical energy measurement and replacement bridge qualification harness for Monster Hybrid Server"
+
+[dependencies]
+atoma_immune = { path = "../../immune_system/implementation" }
+
+[[bin]]
+name = "ion_flag01"
+path = "src/bin/ion_flag01.rs"

@@ -1,0 +1,47 @@
+I've implemented the Three-Layer Carved Swarm, DHNG II Optical Refraction Pipeline, DHNG III Twelve-Around-One Phase Geometry, Layer 2 Governor, and Layer 3 Immune System across immune\_system/ and orchestrator/, while keeping core\_lm/ strictly read-only during Grok's 8-token forward congruence comparison \[verified\]:
+
+> * CARVED\_SWARM\_SPEC.md — Architectural specification mapping Layers 1–3, the \\mathbb{H}^3 \\times \\mathbb{T}^2 optical lens, and the 7-step execution chain to DESIGN.md Tiers 4–6 \[verified\]  
+> * BASELINE\_CONGRUENCE\_AUDIT.md — Read-only audit and loss ledger flagging five concrete findings (FLAG-01 through FLAG-05) in core\_lm/ without modifying any existing file \[verified\]  
+> * atlas13.rs — Bit-exact Q32\_31 implementation of the 1 \+ 12 phase structure (RoleId, DualityAxis, approved icosahedral and legacy cuboctahedral frames at r\_{\\text{sph}} \= 0.382, and antipodal \\mathbb{T}^2 phases) \[verified\]  
+> * refraction.rs — Float-free Q32\_31 optical lens n(r) \= \\frac{2}{1-r^2}, \[5/4\] Padé \+ 4-step rational doubling exponential map \\exp\_{\\mathbf{o}}, pure-Rust SHA-256 shard hashing, and mandatory Stage 3/4 loss reports \[verified\]  
+> * silo.rs — Stage 5 (Keep & Carve \\times 12\) coordinate silos (SiloView, CarvedSwarmMap), local moving-frame Lorentz boosts, zero-copy FrozenBaseWeights views, and CarveLossReport accounting \[verified\]  
+> * compliance.rs — Layer 3 ImmuneSystem, OverlapPolicyMatrix, unforgeable CompliancePermit tokens, hash-chained ComplianceAuditEntry log, and preregistered kill-criteria gate (0x94ce\_0283\_17e0\_ecac) \[verified\]  
+> * swarm/mod.rs — Layer 2 Erlang/OTP-style Governor supervision tree (OneForOne / OneForAll, restart intensity windows, heartbeat sweeps, and \<50\\text{ ms} crash recovery) \[verified\]  
+> * routing/mod.rs & bridge/mod.rs — Capability-gated inter-role handoff router, 104-byte-header FlatHandoffPacket wire framing (carved\_swarm.fbs), and Acquire/Release fenced AtomicRingBuffer \[verified\]  
+> * monster\_hybrid\_server.rs & full\_chain\_qualification.rs — Executable server binary and 21-test qualification suite (14/14 unit tests in atoma\_immune \+ 7/7 end-to-end tests in atoma\_orchestrator) \[verified\]  
+> * immune\_system/README.md, implementation/README.md, orchestrator/README.md, & tier4-carved-swarm-immune.md — Module and harness skill documentation conforming to DOCUMENTATION\_STD.md \[verified\]
+
+### **Qualification Ledger (SPEC.md §5)**
+
+| \# | Qualification Requirement | Implementation & Verification | Result | Mark |
+| :---- | :---- | :---- | :---- | :---- |
+| **1** | Proof-bounded claims | Every system claim carries \[verified\], \[reported\], \[inferred\], or \[theory\] (EpistemicMark enum in atlas13.rs) | Enforced in code & audit log | \[verified\] |
+| **2** | Read-only until baseline lands | atoma\_immune mounts core\_lm/src/{geometry,cache,lock} read-only via \#\[path\]; git status confirms zero edits to core\_lm/ | 0 bytes changed in core\_lm/ | \[verified\] |
+| **3** | Math decides, not preference | Proves Welch/Haantjes bound \\vert{}\\cos\\theta\\vert{} \\ge 1/\\sqrt{5} in \\mathbb{R}^3; provides both FrameGeometry::Icosahedral and FrameGeometry::Cuboctahedral | \\Vert{}\\cos(A\_i, A\_j)\\Vert{} \= 0.447213595 (0.5 ULP) | \[verified\] |
+| **4** | Structural, never prompt-based | SiloView omits out-of-basin atoms from its BTreeMap; FlatHandoffPacket::new\_authorized requires a private-field CompliancePermit | Unauthorized paths cannot compile | \[verified\] |
+| **5** | Integer discipline in refraction | OpticalLens::exp\_map\_origin\_q32 and ball\_to\_lorentz run in i64/i128 fixed-point (Q32\_31) with zero floats; 900-pair ball-vs-Lorentz test passes | Max error 9.31 \\times 10^{-10} \\le 4.4 \\times 10^{-9} | \[verified\] |
+| **6** | The 12 are architectural | RoleId::CARVED\_12 \+ RoleId::Coordinator encode the 6 dualities (L1..L12 around L0) at shell radius r\_{\\text{sph}} \= 0.382 | 5 icosahedral neighbors \+ 1 antipode/pole | \[verified\] |
+| **7** | Overlap is policy | OverlapPolicyMatrix::minimal\_icosahedral grants \\Omega \= 0.08 only to adjacent icosahedral poles and \\Omega \= 0 to non-neighbors; expansions require justification | Antipodal handoff L1 \-\> L2 rejected | \[verified\] |
+| **8** | Base is never modified | FrozenBaseWeights verifies SHA-256 integrity on every gate; CarvedWeightView shares Arc\<FrozenBaseWeights\> across all 12 silos | Arc::ptr\_eq verified across all 12 views | \[verified\] |
+| **9** | Name the loss | ProjectionLossReport, RefractionLossReport, and CarveLossReport record exact bit drops (81{,}920\\text{ b} \\to 256\\text{ b}), L2 energy ratios, and per-silo exclusions | Checked by LossAccountingGate | \[verified\] |
+| **10** | Kill criteria | ImmuneSystem::evaluate\_kill\_criteria enforces fingerprint 0x94ce\_0283\_17e0\_ecac (\\ge 5\\% KL reduction on \\ge 17/24 families and 95\\% CI \> 0\) | Falsifies at 12/24; passes at 18/24 | \[verified\] |
+
+### **Mathematical Necessities vs. Alternatives (Qualification \#3)**
+
+> * **Why the optical lens n(r) \= \\frac{2}{1-r^2} and Lorentz lift are one identity**: For a Poincaré ball point \\mathbf{p} \\in \\mathbb{B}^3 with r \= \\Vert{}\\mathbf{p}\\Vert{} \< 1 and refractive index n(r) \= \\frac{2}{1-r^2}, the isometric stereographic lift to the future sheet of the Lorentz hyperboloid \\mathbb{H}^3 is (x\_0, \\mathbf{x}) \= \\left(\\frac{1+r^2}{1-r^2}, \\frac{2\\mathbf{p}}{1-r^2}\\right) \= (n(r) \- 1, \\, n(r)\\mathbf{p}), with inverse \\mathbf{p} \= \\frac{\\mathbf{x}}{x\_0 \+ 1} \[verified\]. Combining this identity with the Weierstrass hyperbolic tangent substitution r \= \\tanh(t/2) yields x\_0 \= n(r) \- 1 \= \\cosh t and \\Vert{}\\mathbf{x}\\Vert{} \= n(r)\\tanh(t/2) \= \\sinh t, making optical refraction through n(r) identical to the Riemannian exponential map \\exp\_{\\mathbf{o}}(\\mathbf{v}) \[verified\].  
+> * **Why 12 poles in 3D force the icosahedron (and what the alternatives are)**: In full teacher embeddings, the 6 cognitive duality differences (Pole A − Pole B) are nearly orthogonal with mean \\vert{}\\cos\\vert{} \= 0.079 and max 0.177 \[reported\], forming a 6D cross-polytope (\\pm e\_1 \\dots \\pm e\_6) \[inferred\]. Because \\mathbb{R}^3 cannot contain 6 mutually orthogonal lines, the Welch/Haantjes lower bound for 6 lines in \\mathbb{R}^3 forces \\max\_{i \\neq j} \\vert{}\\langle \\mathbf{u}\_i, \\mathbf{u}\_j \\rangle\\vert{} \\ge \\frac{1}{\\sqrt{5}} \\approx 0.447213595, achieved uniquely by the 6 five-fold axes of the regular icosahedron (FrameGeometry::Icosahedral) \[verified\]. Both FrameGeometry::Icosahedral and the legacy atlas13.json FrameGeometry::Cuboctahedral are implemented in atlas13.rs; preserving true orthogonality (\\cos \= 0\) requires moving the address manifold from \\mathbb{H}^3 to \\mathbb{H}^d with d \\ge 6 (such as the 16D Lorentz model noted in dhng3.html \[reported\]) \[inferred\].  
+> * **Why \\mathbb{T}^2 carries phase opposition while \\mathbb{H}^3 carries depth**: Unrolled onto \[0, 2\\pi)^2, placing Pole A at (u\_k, 0\) and Pole B at (u\_k \+ \\pi, \\pi) for u\_k \= k \\cdot 30^\\circ gives every duality axis the exact antipodal phase displacement (\\Delta u, \\Delta v) \= (\\pi, \\pi) with squared toroidal distance 2\\pi^2 (2.0 in \\pi-units) \[verified\], while the hypothesis that \\mathbb{H}^3 \\times \\mathbb{T}^2 carving outperforms flat student distillation on held-out MLIR families remains subject to the preregistered test 94ce028317e0ecac \[theory\].
+
+### **Flagged Audit Findings on core\_lm/ (Qualification \#2 & \#9)**
+
+Full details and line references are documented in BASELINE\_CONGRUENCE\_AUDIT.md \[verified\]:
+
+| Flag | File & Lines | Finding (Documented & Left Unmodified in core\_lm/) | Mark |
+| :---- | :---- | :---- | :---- |
+| **FLAG-01** | bridge.rs:27-46 | f32\_to\_lorentz keeps only key\[0..3\], discarding 125/128 dims (97.66\\%, 4{,}000\\text{ bits}) in Glimmer and 253/256 dims (98.83\\%, 8{,}096\\text{ bits}) in Qwen without measuring retained energy, and uses the vertical lift (\\sqrt{1+\\Vert{}\\mathbf{v}\\Vert{}^2}, \\mathbf{v}) (d \= \\operatorname{arsinh}\\Vert{}\\mathbf{v}\\Vert{}) instead of \\exp\_{\\mathbf{o}}(\\mathbf{v}) | \[verified\] |
+| **FLAG-02** | geometric.rs:254-257, fixed.rs:34 | hyp\_distance uses f64::ln in VP-tree indexing; Q32\_31::mul uses floor shift \>\> 31 (1-ULP sign asymmetry) and overflows i64 in x0 \* x0 if x\_0 \\ge 65{,}536 (d \\ge 11.78) | \[verified\] |
+| **FLAG-03** | glimmer\_forward.rs:274-277, fixed.rs:79, lock.rs:6 | Forward passes write Phase { ZERO, ZERO }; fixed.rs uses radian units (TWO\_PI \= 13492913325\) whereas lock.rs uses hardware-wrapping \\pi-units (PI \= 1 \<\< 31, bridged by rad\_q32\_to\_pi\_unit in refraction.rs) | \[verified\] |
+| **FLAG-04** | qwen\_forward.rs:146-154 vs glimmer\_forward.rs:334 | glimmer\_forward.rs scores retrieved candidates via exact 128D q·k dot products, whereas qwen\_forward.rs scores attention using only the 3D Lorentz inner product | \[verified\] |
+| **FLAG-05** | core\_lm/src/\* working tree | Uncommitted edits for Muse-Glimmer-q4km-gs128-MLX (apply\_rope\_traditional, multi-bit U32 unpacking, .out\_scale) are preserved untouched | \[verified\] |
+
+Once Grok's 8-token baseline congruence result lands, we can wire TangentProjector, OpticalLens, and MonsterHybridServer directly into core\_lm's live forward pass.

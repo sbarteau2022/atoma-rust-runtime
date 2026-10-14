@@ -1,0 +1,8 @@
+[package]
+name = "atoma_orchestrator"
+version = "0.1.0"
+edition = "2024"
+description = "Layer 2 Governor, Zero-Copy Bridge, and Full 7-Step Carved Swarm Server"
+
+[dependencies]
+atoma_immune = { path = "../immune_system/implementation" }

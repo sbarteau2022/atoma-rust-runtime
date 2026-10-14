@@ -2,6 +2,13 @@
 //!
 //! Bit-exact Q32.31 fixed-point. No floats in the ODE loop.
 //! (n,m,ψ*) invariants extracted at lock.
+//!
+//! FLAG-03 Resolution:
+//! - Provides explicit bit-exact conversion helpers `rad_q32_to_pi_unit` and
+//!   `pi_unit_to_rad_q32` between `geometry::fixed::Q32_31` (radian units where
+//!   `1 << 31 == 1.0 rad`) and `lock.rs` (`pi`-units where `1 << 31 == π rad`).
+
+use crate::geometry::fixed::Q32_31;
 
 const FRAC_BITS: u32 = 31;
 const PI: i64 = 1 << FRAC_BITS;
@@ -16,6 +23,39 @@ const ATAN_TABLE: [i64; 32] = [
     652, 326, 163, 81, 41,
     20, 10, 5, 3, 1, 1, 0
 ];
+
+/// Converts a radian-unit `Q32_31` angle (`1 << 31 == 1.0 rad`, used in `geometry::fixed`)
+/// to a hardware-wrapping `pi`-unit `i64` angle (`1 << 31 == π rad`, used in `lock.rs`) (`FLAG-03`).
+#[inline]
+pub fn rad_q32_to_pi_unit(rad: Q32_31) -> i64 {
+    // round(2^31 / π) = 683_565_276
+    const INV_PI_Q32: i128 = 683_565_276;
+    const ONE_I128: i128 = 1i128 << FRAC_BITS;
+    let num = (rad.0 as i128) * INV_PI_Q32;
+    let rounded = if num >= 0 {
+        (num + (ONE_I128 >> 1)) / ONE_I128
+    } else {
+        (num - (ONE_I128 >> 1)) / ONE_I128
+    };
+    (rounded as i32) as i64
+}
+
+/// Converts a `pi`-unit `i64` angle (`1 << 31 == π rad`, used in `lock.rs`) back to a
+/// radian-unit `Q32_31` angle (`1 << 31 == 1.0 rad`, used in `geometry::fixed`) (`FLAG-03`).
+#[inline]
+pub fn pi_unit_to_rad_q32(pi_unit: i64) -> Q32_31 {
+    // round(π * 2^31) = 6_746_518_852
+    const PI_RAD_Q32: i128 = 6_746_518_852;
+    const ONE_I128: i128 = 1i128 << FRAC_BITS;
+    let wrapped = (pi_unit as i32) as i128;
+    let num = wrapped * PI_RAD_Q32;
+    let rounded = if num >= 0 {
+        (num + (ONE_I128 >> 1)) / ONE_I128
+    } else {
+        (num - (ONE_I128 >> 1)) / ONE_I128
+    };
+    Q32_31(rounded as i64)
+}
 
 /// Bit-exact Q32.31 CORDIC sine. theta in pi-units (1<<31 = π).
 /// FIXED: pi-unit table, corrected gain, sign bug removed.
@@ -123,5 +163,15 @@ mod tests {
             seen.insert(inv.n);
         }
         assert_eq!(seen.len(), 12);
+    }
+
+    #[test]
+    fn rad_and_pi_unit_roundtrip_matches_cordic() {
+        let angle_rad = Q32_31::from_f64(std::f64::consts::FRAC_PI_4);
+        let pi_u = rad_q32_to_pi_unit(angle_rad);
+        let back_rad = pi_unit_to_rad_q32(pi_u);
+        assert!((back_rad.to_f64() - std::f64::consts::FRAC_PI_4).abs() < 1e-8);
+        let s_cordic = (cordic_sin(pi_u) as f64) / ((1i64 << 31) as f64);
+        assert!((s_cordic - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-6);
     }
 }

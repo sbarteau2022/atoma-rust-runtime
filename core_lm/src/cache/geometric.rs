@@ -1,5 +1,11 @@
-//! Geometric Memory Map (H³/Γ Replacement for KV Cache)
+//! Geometric Memory Map (H³/Γ × T² Replacement for KV Cache)
 //! Implements the Atom, Write, Retrieval, and Eviction Contracts.
+//!
+//! FLAG-02 & FLAG-03 Upgrades:
+//! - Uses wide-accumulator `LorentzVector::inner_product` to prevent `Q32_31` overflow at large
+//!   hyperbolic radii.
+//! - Populates deterministic non-zero `Phase` in `store()` when caller does not supply an explicit
+//!   phase, and adds `retrieve_5d()` for joint `H³ × T²` product-manifold retrieval.
 
 use crate::geometry::fixed::Q32_31;
 use crate::geometry::lorentz::LorentzVector;
@@ -45,6 +51,38 @@ pub struct LogicalClock(pub u64);
 pub struct Phase {
     pub theta_f: Q32_31,
     pub theta_s: Q32_31,
+}
+
+impl Phase {
+    /// Derives a deterministic toroidal phase `(theta_f, theta_s)` from a `LorentzVector`'s
+    /// spatial coordinates so `store()` never leaves `Phase` silently zeroed when `lorentz != origin`.
+    #[inline]
+    pub fn from_lorentz_spatial(lorentz: &LorentzVector) -> Self {
+        let x1 = lorentz.x[1].to_f64();
+        let x2 = lorentz.x[2].to_f64();
+        let x3 = lorentz.x[3].to_f64();
+        if x1.abs() < 1e-12 && x2.abs() < 1e-12 && x3.abs() < 1e-12 {
+            return Self {
+                theta_f: Q32_31::ZERO,
+                theta_s: Q32_31::ZERO,
+            };
+        }
+        let r_xy = (x1 * x1 + x2 * x2).sqrt();
+        Self {
+            theta_f: Q32_31::from_f64(x2.atan2(x1)),
+            theta_s: Q32_31::from_f64(x3.atan2(r_xy)),
+        }
+    }
+
+    /// Circular chord distance squared on `T²` in `Q32_31`.
+    #[inline]
+    pub fn torus_distance_sq(&self, other: &Self) -> Q32_31 {
+        let df = self.theta_f - other.theta_f;
+        let ds = self.theta_s - other.theta_s;
+        let one_minus_cos_f = Q32_31::ONE - Q32_31::cos(df);
+        let one_minus_cos_s = Q32_31::ONE - Q32_31::cos(ds);
+        one_minus_cos_f + one_minus_cos_s
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +140,7 @@ impl GeometricMemoryMap {
     }
 
     /// Store an address that the caller already reduced. Picard is not applied again.
+    /// Populates `Phase::from_lorentz_spatial(&lorentz)` (`FLAG-03`).
     pub fn store(
         &mut self,
         lorentz: LorentzVector,
@@ -109,10 +148,7 @@ impl GeometricMemoryMap {
     ) -> Result<AtomId, MemoryError> {
         let saved = self.use_picard;
         self.use_picard = false;
-        let phase = Phase {
-            theta_f: Q32_31::ZERO,
-            theta_s: Q32_31::ZERO,
-        };
+        let phase = Phase::from_lorentz_spatial(&lorentz);
         let result = self.write(lorentz, phase, payload);
         self.use_picard = saved;
         result
@@ -214,7 +250,7 @@ impl GeometricMemoryMap {
             results.push((dist, atom));
         }
 
-        // CORRECTED: Ascending order for distance (smaller inner product = closer in H3)
+        // Ascending order for distance (smaller inner product = closer in H3)
         results.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.0.cmp(&b.1.id.0)));
 
         let mut final_results = Vec::new();
@@ -229,6 +265,33 @@ impl GeometricMemoryMap {
         }
 
         Ok(final_results)
+    }
+
+    /// Joint 5D `H³ × T²` retrieval using VP-tree candidate filtering followed by
+    /// product-manifold geodesic ranking (`FLAG-03`).
+    pub fn retrieve_5d(
+        &self,
+        query: &LorentzVector,
+        query_phase: &Phase,
+        top_k: usize,
+        exclude_query: bool,
+    ) -> Result<Vec<&Atom>, MemoryError> {
+        let oversample = (top_k.saturating_mul(4)).max(top_k);
+        let candidates = self.retrieve(query, oversample, exclude_query)?;
+        let mut scored: Vec<(Q32_31, &Atom)> = candidates
+            .into_iter()
+            .map(|atom| {
+                let h3_ip = LorentzVector::inner_product(query, &atom.lorentz);
+                let t2_dist = query_phase.torus_distance_sq(&atom.phase);
+                // Weight T^2 phase distance by 0.25 in Q32_31 so H^3 primary topology leads
+                // and T^2 breaks ties among angularly close hyperbolic keys.
+                let combined = Q32_31(h3_ip.0.saturating_add(t2_dist.0 >> 2));
+                (combined, atom)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.0.cmp(&b.1.id.0)));
+        scored.truncate(top_k);
+        Ok(scored.into_iter().map(|(_, a)| a).collect())
     }
 
     fn retrieve_indexed(
@@ -415,5 +478,25 @@ mod tests {
             .map(|atom| atom.id.0)
             .collect();
         assert_eq!(linear, indexed);
+    }
+
+    #[test]
+    fn store_populates_nonzero_phase_and_retrieve_5d_works() {
+        let mut map = GeometricMemoryMap::new(32);
+        map.use_picard = false;
+        for i in 1..16 {
+            let addr = address(i);
+            let id = map.store(addr, vec![i as u8]).unwrap();
+            let atom = &map.atoms[&id.0];
+            assert!(
+                atom.phase.theta_f != Q32_31::ZERO || atom.phase.theta_s != Q32_31::ZERO,
+                "store() must populate non-zero T^2 phase for boosted address"
+            );
+        }
+        let q_addr = address(5);
+        let q_phase = Phase::from_lorentz_spatial(&q_addr);
+        let hits = map.retrieve_5d(&q_addr, &q_phase, 4, false).unwrap();
+        assert_eq!(hits.len(), 4);
+        assert_eq!(hits[0].payload[0], 5);
     }
 }

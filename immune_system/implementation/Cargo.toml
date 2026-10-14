@@ -1,0 +1,7 @@
+[package]
+name = "atoma_immune"
+version = "0.1.0"
+edition = "2024"
+description = "Layer 3 Immune System, DHNG II Optical Refraction, and DHNG III 12-Around-1 Carved Silos"
+
+[dependencies]

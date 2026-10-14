@@ -4,19 +4,20 @@
 //! Keys are projected to LorentzVector; values stored as payload.
 //! There are NO k_cache / v_cache tensors in this module.
 
-use crate::cache::geometric::{GeometricMemoryMap, Phase};
-use crate::geometry::bridge::f32_to_lorentz;
-use crate::geometry::fixed::Q32_31;
+use crate::cache::geometric::GeometricMemoryMap;
+use crate::geometry::bridge::{f32_to_atom_address, f32_to_lorentz};
 use crate::geometry::lorentz::LorentzVector;
 use crate::model_config::{LayerType, ModelConfig};
 use crate::ops::{apply_rope, matvec, rmsnorm, silu, softmax, top_k_indices};
 use crate::qwen_model::{ModelError, WeightManager};
+use crate::{ForwardCompliancePermit, ImmuneForwardGate};
 use std::path::Path;
 
 pub struct QwenModel {
     pub config: ModelConfig,
     pub weights: WeightManager,
     pub geo_maps: Vec<GeometricMemoryMap>,
+    pub immune_gate: ImmuneForwardGate,
 }
 
 impl QwenModel {
@@ -29,10 +30,12 @@ impl QwenModel {
         for _ in 0..num_full {
             geo_maps.push(GeometricMemoryMap::new(1_000_000));
         }
+        let fp = (config.hidden_size as u64) << 32 | (config.num_hidden_layers as u64);
         Ok(Self {
             config,
             weights,
             geo_maps,
+            immune_gate: ImmuneForwardGate::new(fp),
         })
     }
 
@@ -110,23 +113,30 @@ impl QwenModel {
         apply_rope(&mut q, hd, rotary_dim, pos, theta)?;
         apply_rope(&mut k, hd, rotary_dim, pos, theta)?;
 
-        let phase = Phase {
-            theta_f: Q32_31::ZERO,
-            theta_s: Q32_31::ZERO,
-        };
         let geo = &mut self.geo_maps[geo_idx];
 
+        // FLAG-03 & FLAG-04 Resolution:
+        // 1. Project k_head via f32_to_atom_address to populate non-zero T^2 Phase.
+        // 2. Store both k_head and v_head (2 * hd * 4 bytes) in atom.payload so retrieved
+        //    candidates are scored via exact hd-dimensional q·k dot products (matching glimmer_forward.rs).
         for kv_h in 0..nkv {
             let k_head = &k[kv_h * hd..(kv_h + 1) * hd];
             let v_head = &v[kv_h * hd..(kv_h + 1) * hd];
-            let lv = f32_to_lorentz(k_head)?;
-            let v_bytes: Vec<u8> = v_head.iter().flat_map(|f| f.to_le_bytes()).collect();
-            geo.write(lv, phase, v_bytes)?;
+            let (lv, phase, _loss) = f32_to_atom_address(k_head)?;
+            let mut kv_bytes = Vec::with_capacity(2 * hd * 4);
+            for f in k_head.iter() {
+                kv_bytes.extend_from_slice(&f.to_le_bytes());
+            }
+            for f in v_head.iter() {
+                kv_bytes.extend_from_slice(&f.to_le_bytes());
+            }
+            geo.write(lv, phase, kv_bytes)?;
         }
 
         let repeat = nh / nkv;
         let mut attn_out = vec![0.0f32; nh * hd];
         let top_k = 64;
+        let inv_sqrt_hd = 1.0 / (hd as f32).sqrt();
 
         for qh in 0..nh {
             let q_head = &q[qh * hd..(qh + 1) * hd];
@@ -140,15 +150,29 @@ impl QwenModel {
             let mut scores = Vec::new();
             let mut v_list = Vec::new();
             for atom in neighbors {
-                let k_lv = atom.lorentz;
-                let ip = LorentzVector::inner_product(&q_lv, &k_lv).to_f64() as f32;
-                let v_bytes = &atom.payload;
-                let vh: Vec<f32> = v_bytes
-                    .chunks(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                scores.push(-ip / (hd as f32).sqrt());
-                v_list.push(vh);
+                let payload = &atom.payload;
+                if payload.len() >= 2 * hd * 4 {
+                    let kh: Vec<f32> = payload[0..hd * 4]
+                        .chunks(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let vh: Vec<f32> = payload[hd * 4..2 * hd * 4]
+                        .chunks(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let dot: f32 = q_head.iter().zip(kh.iter()).map(|(a, b)| a * b).sum();
+                    scores.push(dot * inv_sqrt_hd);
+                    v_list.push(vh);
+                } else {
+                    let k_lv = atom.lorentz;
+                    let ip = LorentzVector::inner_product(&q_lv, &k_lv).to_f64() as f32;
+                    let vh: Vec<f32> = payload
+                        .chunks(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    scores.push(-ip * inv_sqrt_hd);
+                    v_list.push(vh);
+                }
             }
 
             let probs = softmax(&scores)?;
@@ -318,7 +342,16 @@ impl QwenModel {
         Ok(x.iter().zip(gated.iter()).map(|(a, b)| a + b).collect())
     }
 
-    pub fn forward(&mut self, token_id: u32, pos: usize) -> Result<Vec<f32>, ModelError> {
+    pub fn forward_with_permit(
+        &mut self,
+        token_id: u32,
+        pos: usize,
+        permit: &ForwardCompliancePermit,
+    ) -> Result<Vec<f32>, ModelError> {
+        self.immune_gate
+            .verify_permit_and_loss(permit, None)
+            .map_err(ModelError::MissingWeight)?;
+
         let mut x = self.embed(token_id)?;
         let mut geo_idx = 0;
 
@@ -342,6 +375,15 @@ impl QwenModel {
             &xn,
         )?;
         Ok(logits)
+    }
+
+    pub fn forward(&mut self, token_id: u32, pos: usize) -> Result<Vec<f32>, ModelError> {
+        let fp = (self.config.hidden_size as u64) << 32 | (self.config.num_hidden_layers as u64);
+        let permit = self
+            .immune_gate
+            .authorize_forward_pass(token_id, pos, fp)
+            .map_err(ModelError::MissingWeight)?;
+        self.forward_with_permit(token_id, pos, &permit)
     }
 
     pub fn reset_memory(&mut self) {

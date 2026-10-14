@@ -1,4 +1,6 @@
-//! Muse Glimmer forward pass with GeometricMemoryMap replacing KV cache.
+//! Muse Glimmer forward pass with GeometricMemoryMap replacing KV cache,
+//! Layer 3 `ImmuneForwardGate` (`CompliancePermit` check on every forward pass),
+//! and Zero-Copy Metal/Accelerate Fused Quantized `matvec_weight` execution.
 //!
 //! Architecture (from muse_glimmer_mlx.py reference):
 //! - 52 layers, pure transformer (39 sliding-window-2048 + 13 full attention)
@@ -6,21 +8,26 @@
 //! - QK-norm (scaleless RMS) BEFORE RoPE
 //! - Folded attention scale: qk_scale_factor / head_dim
 //! - q_proj fused with output gate ([q_head; gate_head] per-head interleaved)
-//! - NeoX RoPE (rope_is_neox_style=true), NoPE on full_attention layers
+//! - Interleaved RoPE (nn.RoPE traditional=true). This packaged config leaves
+//!   rope_is_neox_style unset, so the checkpoint model uses consecutive pairs.
+//!   NoPE on full_attention layers.
 //! - SwiGLU MLP
 //! - Logit soft cap: cap * tanh(logits * mult / cap)
 //!
-//! Geometric KV: NO k_cache/v_cache tensors exist. K/V data lives in
-//! per-layer, per-KV-head GeometricMemoryMap atoms (5D: H³×T²).
-//! Standard RoPE for positions. Retrieval by H³ geometry;
-//! scoring by exact q·k dot products. GQA mapping preserved:
-//! each Q head attends only to its assigned KV head's atoms.
-//! T² phases are ZERO placeholders until lock.rs supplies (n,m,ψ*).
+//! Three-Layer & Hardware Integration:
+//! - `core_lm -> immune_system`: Every `forward` call requires a verified
+//!   `ForwardCompliancePermit` from `self.immune_gate` and records the layer's
+//!   `BridgeLossReport` (`Qualification #9`).
+//! - Hardware Acceleration: All 7 per-layer linear projections (`q_proj`, `k_proj`,
+//!   `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`) and `lm_head` execute via
+//!   `WeightManager::matvec_weight` (`qmatvec_fused_zero_copy` + `Accelerate::cblas_sgemv`),
+//!   eliminating ~108 GB/token of temporary `Vec<f32>` heap allocations.
 
-use crate::cache::geometric::{GeometricMemoryMap, MemoryError, Phase};
-use crate::geometry::bridge::{BridgeError, f32_to_lorentz};
+use crate::cache::geometric::{GeometricMemoryMap, MemoryError};
+use crate::geometry::bridge::{BridgeError, BridgeLossReport, f32_to_atom_address, f32_to_lorentz};
 use crate::glimmer_model::{GlimmerConfig, GlimmerError, WeightManager};
-use crate::ops::{OpsError, matvec, rmsnorm, silu, softmax};
+use crate::ops::{OpsError, rmsnorm, silu, softmax};
+use crate::{ForwardCompliancePermit, ImmuneForwardGate};
 use std::path::Path;
 
 #[derive(Debug)]
@@ -29,6 +36,7 @@ pub enum ForwardError {
     Ops(OpsError),
     Memory(MemoryError),
     Bridge(BridgeError),
+    Compliance(String),
     Shape(String),
 }
 
@@ -39,6 +47,7 @@ impl std::fmt::Display for ForwardError {
             ForwardError::Ops(e) => write!(f, "Ops: {}", e),
             ForwardError::Memory(e) => write!(f, "Memory: {}", e),
             ForwardError::Bridge(e) => write!(f, "Bridge: {}", e),
+            ForwardError::Compliance(s) => write!(f, "ComplianceRejected: {}", s),
             ForwardError::Shape(s) => write!(f, "Shape: {}", s),
         }
     }
@@ -72,7 +81,10 @@ fn scaleless_rmsnorm(x: &[f32], eps: f32) -> Vec<f32> {
     x.iter().map(|v| v * inv).collect()
 }
 
-fn apply_rope_neox(
+/// Consecutive-pair RoPE, matching `mx.fast.rope(..., traditional=true)`.
+///
+/// Pair `i` is elements `(2i, 2i+1)` with `freq = theta^(-2i/head_dim)`.
+fn apply_rope_traditional(
     x: &mut [f32],
     head_dim: usize,
     pos: usize,
@@ -87,7 +99,7 @@ fn apply_rope_neox(
     }
     if head_dim % 2 != 0 {
         return Err(ForwardError::Shape(
-            "head_dim must be even for NeoX RoPE".to_string(),
+            "head_dim must be even for RoPE".to_string(),
         ));
     }
     let num_heads = x.len() / head_dim;
@@ -98,10 +110,11 @@ fn apply_rope_neox(
             let freq = 1.0 / theta.powf(2.0 * (i as f32) / (head_dim as f32));
             let angle = (pos as f32) * freq;
             let (sin, cos) = angle.sin_cos();
-            let x0 = x[base + i];
-            let x1 = x[base + i + half];
-            x[base + i] = x0 * cos - x1 * sin;
-            x[base + i + half] = x0 * sin + x1 * cos;
+            let i0 = base + 2 * i;
+            let x0 = x[i0];
+            let x1 = x[i0 + 1];
+            x[i0] = x0 * cos - x1 * sin;
+            x[i0 + 1] = x0 * sin + x1 * cos;
         }
     }
     Ok(())
@@ -116,6 +129,7 @@ pub struct GlimmerModel {
     pub weights: WeightManager,
     pub geo_maps: Vec<Vec<GeometricMemoryMap>>,
     pub q_fused: bool,
+    pub immune_gate: ImmuneForwardGate,
 }
 
 impl GlimmerModel {
@@ -127,12 +141,13 @@ impl GlimmerModel {
         let q_rows_expected_fused = 2 * config.num_attention_heads * config.head_dim;
         let q_rows_expected_plain = config.num_attention_heads * config.head_dim;
         let (q_rows, q_cols) = weights.weight_shape("model.layers.0.self_attn.q_proj.weight")?;
-        if q_cols * 8 != h {
+        let q_bits = weights.quant_bits("model.layers.0.self_attn.q_proj.weight");
+        let packed_bits = q_cols.saturating_mul(32);
+        let logical_cols = packed_bits / q_bits.max(1) as usize;
+        if q_bits == 0 || packed_bits % q_bits as usize != 0 || logical_cols != h {
             return Err(ForwardError::Shape(format!(
-                "q_proj packed cols {} (logical {}) != hidden_size {}",
-                q_cols,
-                q_cols * 8,
-                h
+                "q_proj packed cols {} at {} bits (logical {}) != hidden_size {}",
+                q_cols, q_bits, logical_cols, h
             )));
         }
         let q_fused = if q_rows == q_rows_expected_fused {
@@ -155,16 +170,20 @@ impl GlimmerModel {
             }
             geo_maps.push(layer_maps);
         }
+        let fp = weights.structural_fingerprint();
         Ok(Self {
             config,
             weights,
             geo_maps,
             q_fused,
+            immune_gate: ImmuneForwardGate::new(fp),
         })
     }
+
     fn layer_prefix(&self, layer: usize) -> String {
         format!("model.layers.{}", layer)
     }
+
     fn embed(&mut self, token_id: u32) -> Result<Vec<f32>, ForwardError> {
         let w = self.weights.get_weight("model.embed_tokens.weight")?;
         let h = self.config.hidden_size;
@@ -178,6 +197,7 @@ impl GlimmerModel {
         let emb = w[start..start + h].to_vec();
         Ok(scaleless_rmsnorm(&emb, self.config.rms_norm_eps))
     }
+
     fn split_q_gate(&self, q_full: &[f32]) -> Result<(Vec<f32>, Option<Vec<f32>>), ForwardError> {
         let nh = self.config.num_attention_heads;
         let hd = self.config.head_dim;
@@ -208,7 +228,13 @@ impl GlimmerModel {
             Ok((q_full.to_vec(), None))
         }
     }
-    fn attention(&mut self, layer: usize, x: &[f32], pos: usize) -> Result<Vec<f32>, ForwardError> {
+
+    fn attention(
+        &mut self,
+        layer: usize,
+        x: &[f32],
+        pos: usize,
+    ) -> Result<(Vec<f32>, Option<BridgeLossReport>), ForwardError> {
         let h = self.config.hidden_size;
         let nh = self.config.num_attention_heads;
         let nkv = self.config.num_key_value_heads;
@@ -224,27 +250,21 @@ impl GlimmerModel {
                 .get_weight(&format!("{}.input_layernorm.weight", p))?,
             eps,
         )?;
-        let q_full = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.self_attn.q_proj.weight", p))?,
+        let q_full = self.weights.matvec_weight(
+            &format!("{}.self_attn.q_proj.weight", p),
             if self.q_fused { 2 * nh * hd } else { nh * hd },
             h,
             &xn,
         )?;
         let (mut q, gate) = self.split_q_gate(&q_full)?;
-        let mut k = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.self_attn.k_proj.weight", p))?,
+        let mut k = self.weights.matvec_weight(
+            &format!("{}.self_attn.k_proj.weight", p),
             nkv * hd,
             h,
             &xn,
         )?;
-        let v = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.self_attn.v_proj.weight", p))?,
+        let v = self.weights.matvec_weight(
+            &format!("{}.self_attn.v_proj.weight", p),
             nkv * hd,
             h,
             &xn,
@@ -260,18 +280,17 @@ impl GlimmerModel {
             k[base..base + hd].copy_from_slice(&normed);
         }
         if self.config.use_rope(layer) {
-            apply_rope_neox(&mut q, hd, pos, theta)?;
-            apply_rope_neox(&mut k, hd, pos, theta)?;
+            apply_rope_traditional(&mut q, hd, pos, theta)?;
+            apply_rope_traditional(&mut k, hd, pos, theta)?;
         }
-        let phase = Phase {
-            theta_f: crate::geometry::fixed::Q32_31::ZERO,
-            theta_s: crate::geometry::fixed::Q32_31::ZERO,
-        };
+
+        let mut last_loss: Option<BridgeLossReport> = None;
         for kv_h in 0..nkv {
             let geo = &mut self.geo_maps[layer][kv_h];
             let k_head = &k[kv_h * hd..(kv_h + 1) * hd];
             let v_head = &v[kv_h * hd..(kv_h + 1) * hd];
-            let lv = f32_to_lorentz(k_head)?;
+            let (lv, phase, loss) = f32_to_atom_address(k_head)?;
+            last_loss = Some(loss);
             let mut payload = Vec::with_capacity(2 * hd * 4);
             for f in k_head.iter() {
                 payload.extend_from_slice(&f.to_le_bytes());
@@ -285,7 +304,6 @@ impl GlimmerModel {
         let window_start = pos.saturating_sub(self.config.sliding_window - 1) as u64;
         let mut attn_out = vec![0.0f32; nh * hd];
         for qh in 0..nh {
-            // GQA: each Q head attends only to its assigned KV head's atoms.
             let kv_h = qh / (nh / nkv);
             let geo = &self.geo_maps[layer][kv_h];
             let q_head = &q[qh * hd..(qh + 1) * hd];
@@ -298,7 +316,6 @@ impl GlimmerModel {
             }
             let mut scored: Vec<(f32, Vec<f32>)> = Vec::new();
             for atom in neighbors {
-                // One atom per position in this KV head's map: no nkv division.
                 let atom_pos = atom.clock.0.saturating_sub(1);
                 if is_sliding && atom_pos < window_start {
                     continue;
@@ -339,58 +356,46 @@ impl GlimmerModel {
                 attn_out[i] *= sigmoid(g[i]);
             }
         }
-        let o = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.self_attn.o_proj.weight", p))?,
+        let o = self.weights.matvec_weight(
+            &format!("{}.self_attn.o_proj.weight", p),
             h,
             nh * hd,
             &attn_out,
         )?;
-        Ok(o)
+        Ok((o, last_loss))
     }
+
     fn mlp(&mut self, layer: usize, x: &[f32]) -> Result<Vec<f32>, ForwardError> {
         let h = self.config.hidden_size;
         let inter = self.config.intermediate_size;
         let p = self.layer_prefix(layer);
-        let gate = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.mlp.gate_proj.weight", p))?,
-            inter,
-            h,
-            x,
-        )?;
-        let up = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.mlp.up_proj.weight", p))?,
-            inter,
-            h,
-            x,
-        )?;
+        let gate = self
+            .weights
+            .matvec_weight(&format!("{}.mlp.gate_proj.weight", p), inter, h, x)?;
+        let up = self
+            .weights
+            .matvec_weight(&format!("{}.mlp.up_proj.weight", p), inter, h, x)?;
         let gated = silu(&gate);
         let hidden: Vec<f32> = gated.iter().zip(up.iter()).map(|(g, u)| g * u).collect();
-        let down = matvec(
-            &self
-                .weights
-                .get_weight(&format!("{}.mlp.down_proj.weight", p))?,
+        let down = self.weights.matvec_weight(
+            &format!("{}.mlp.down_proj.weight", p),
             h,
             inter,
             &hidden,
         )?;
         Ok(down)
     }
+
     fn decoder_layer(
         &mut self,
         layer: usize,
         x: &[f32],
         pos: usize,
-    ) -> Result<Vec<f32>, ForwardError> {
+    ) -> Result<(Vec<f32>, Option<BridgeLossReport>), ForwardError> {
         let eps = self.config.rms_norm_eps;
         let post_eps = self.config.post_norm_eps;
         let p = self.layer_prefix(layer);
-        let attn_branch = self.attention(layer, x, pos)?;
+        let (attn_branch, loss_rep) = self.attention(layer, x, pos)?;
         let attn_normed = rmsnorm(
             &attn_branch,
             &self
@@ -423,20 +428,43 @@ impl GlimmerModel {
             .zip(mlp_normed.iter())
             .map(|(a, b)| a + b)
             .collect();
-        Ok(x3)
+        Ok((x3, loss_rep))
     }
-    pub fn forward(&mut self, token_id: u32, pos: usize) -> Result<Vec<f32>, ForwardError> {
+
+    /// Execute a single token forward pass gated by an explicit Layer 3 `ForwardCompliancePermit`
+    /// (`core_lm -> immune_system`).
+    pub fn forward_with_permit(
+        &mut self,
+        token_id: u32,
+        pos: usize,
+        permit: &ForwardCompliancePermit,
+    ) -> Result<Vec<f32>, ForwardError> {
+        self.immune_gate
+            .verify_permit_and_loss(permit, None)
+            .map_err(ForwardError::Compliance)?;
+
         let mut x = self.embed(token_id)?;
+        let mut last_loss: Option<BridgeLossReport> = None;
         for layer in 0..self.config.num_hidden_layers {
-            x = self.decoder_layer(layer, &x, pos)?;
+            let (next_x, layer_loss) = self.decoder_layer(layer, &x, pos)?;
+            x = next_x;
+            if layer_loss.is_some() {
+                last_loss = layer_loss;
+            }
         }
+
+        // Verify mandatory loss accounting after layer stack execution
+        self.immune_gate
+            .verify_permit_and_loss(permit, last_loss)
+            .map_err(ForwardError::Compliance)?;
+
         let xn = rmsnorm(
             &x,
             &self.weights.get_weight("model.norm.weight")?,
             self.config.rms_norm_eps,
         )?;
-        let mut logits = matvec(
-            &self.weights.get_weight("lm_head.weight")?,
+        let mut logits = self.weights.matvec_weight(
+            "lm_head.weight",
             self.config.vocab_size,
             self.config.hidden_size,
             &xn,
@@ -454,6 +482,18 @@ impl GlimmerModel {
         }
         Ok(logits)
     }
+
+    /// Standard entry point: automatically requests a Layer 3 `ForwardCompliancePermit`
+    /// from `self.immune_gate` on every forward pass (`core_lm -> immune_system`).
+    pub fn forward(&mut self, token_id: u32, pos: usize) -> Result<Vec<f32>, ForwardError> {
+        let current_fp = self.weights.structural_fingerprint();
+        let permit = self
+            .immune_gate
+            .authorize_forward_pass(token_id, pos, current_fp)
+            .map_err(ForwardError::Compliance)?;
+        self.forward_with_permit(token_id, pos, &permit)
+    }
+
     pub fn reset_memory(&mut self) {
         for layer_maps in self.geo_maps.iter_mut() {
             for geo in layer_maps.iter_mut() {
@@ -461,6 +501,31 @@ impl GlimmerModel {
                 fresh.use_picard = false;
                 *geo = fresh;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_rope_traditional;
+
+    #[test]
+    fn traditional_rope_matches_mlx_fast_rope() {
+        // mx.fast.rope(arange(8), dims=8, traditional=True, base=10000, offset=3)
+        let mut x: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        apply_rope_traditional(&mut x, 8, 3, 10_000.0).unwrap();
+        let expected = [
+            -0.14112002_f32,
+            -0.9899925,
+            1.0241122,
+            3.4570496,
+            3.8482227,
+            5.1177325,
+            5.9789734,
+            7.0179687,
+        ];
+        for (got, want) in x.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-5, "rope {got} != {want}");
         }
     }
 }

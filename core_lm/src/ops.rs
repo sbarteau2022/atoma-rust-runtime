@@ -1,4 +1,10 @@
 //! Core tensor operations. All return Result, no panics in hot path.
+//!
+//! Hardware Acceleration:
+//! - `matvec` dispatches to Apple Silicon AMX coprocessor via `Accelerate::cblas_sgemv`
+//!   (`crate::metal::accelerate_matvec_f32`) on macOS, with an 8-way unrolled SIMD fallback.
+
+use crate::metal::accelerate_matvec_f32;
 
 #[derive(Debug)]
 pub enum OpsError {
@@ -33,16 +39,7 @@ pub fn matvec(matrix: &[f32], rows: usize, cols: usize, vec: &[f32]) -> Result<V
             cols
         )));
     }
-    let mut out = vec![0.0f32; rows];
-    for r in 0..rows {
-        let mut sum = 0.0f32;
-        let base = r * cols;
-        for c in 0..cols {
-            sum += matrix[base + c] * vec[c];
-        }
-        out[r] = sum;
-    }
-    Ok(out)
+    Ok(accelerate_matvec_f32(matrix, rows, cols, vec))
 }
 
 pub fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Result<Vec<f32>, OpsError> {

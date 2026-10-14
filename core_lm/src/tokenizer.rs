@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn glimmer_prompt_matches_mlx_pretokenizer() {
         let path = std::path::Path::new(
-            "/Users/stewartbarteau/models/Muse-Glimmer-q4-MLX/tokenizer.json",
+            "/Users/stewartbarteau/models/Muse-Glimmer-q4km-gs128-MLX/tokenizer.json",
         );
         let tokenizer = BpeTokenizer::from_json_file(path).expect("glimmer tokenizer");
         // Ids from the checkpoint tokenizer as shipped. mlx-lm loads that

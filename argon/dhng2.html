@@ -1,0 +1,213 @@
+<title>DHNG II · Refraction</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  color-scheme:dark;
+  --void:#08090C; --panel:#12141B; --line:#232633; --gold:#D4AF37; --cyan:#5FE3D4;
+  --ink:#ECE6D6; --muted:#8B90A0; --measured:#8FD18A; --untested:#E8906E; --theory:#D4AF37;
+  --serif:"Cormorant Garamond",Garamond,"Times New Roman",serif;
+  --sans:"IBM Plex Sans",-apple-system,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+}
+html,body{background:var(--void);color:var(--ink)}
+body{font-family:var(--sans);font-size:16px;line-height:1.6;padding-inline:clamp(16px,4vw,48px);padding-block:0 64px}
+.wrap{max-width:1080px;margin:0 auto}
+header.top{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;padding-block:22px 10px;border-bottom:1px solid var(--line)}
+.mark{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.mark b{color:var(--gold);font-weight:500}
+h1{font-family:var(--serif);font-weight:500;font-size:clamp(40px,7vw,76px);line-height:1.02;margin:28px 0 10px;text-wrap:balance}
+h1 em{color:var(--gold);font-style:italic}
+.lede{max-width:62ch;color:#CFC9BA;font-size:18px;margin:0 0 22px}
+h2{font-family:var(--serif);font-weight:600;font-size:clamp(28px,4vw,38px);line-height:1.1;margin:0 0 12px;text-wrap:balance}
+h3{font-family:var(--sans);font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 8px;font-weight:600}
+p{max-width:66ch;margin:0 0 14px}
+section{padding-block:44px;border-bottom:1px solid var(--line)}
+.badge{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;padding:3px 8px;border-radius:999px;border:1px solid currentColor;vertical-align:middle;white-space:nowrap}
+.b-m{color:var(--measured)} .b-t{color:var(--theory)} .b-u{color:var(--untested)}
+.stage{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:28px;align-items:start}
+@media (max-width:820px){.stage{grid-template-columns:1fr}}
+.lens{position:relative;background:radial-gradient(circle at 50% 50%,#0d1016 0%,#08090C 70%);border:1px solid var(--line);border-radius:14px;overflow:hidden;aspect-ratio:1/1;max-width:100%}
+canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}
+.hud{position:absolute;left:12px;bottom:10px;font-family:var(--mono);font-size:11px;color:var(--muted);line-height:1.5;pointer-events:none}
+.controls{display:grid;gap:14px}
+label.ctl{display:grid;gap:6px;font-family:var(--mono);font-size:12px;color:var(--muted)}
+label.ctl span b{color:var(--ink);font-weight:500}
+input[type=range]{width:100%;accent-color:var(--gold)}
+input[type=range]:focus-visible,button:focus-visible{outline:2px solid var(--cyan);outline-offset:3px}
+.note{font-size:14px;color:#BDB7A8;border-left:2px solid var(--gold);padding-left:12px;margin-top:6px}
+.pipe{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-top:18px}
+@media (max-width:820px){.pipe{grid-template-columns:1fr}}
+.step{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+.step .k{font-family:var(--mono);font-size:11px;color:var(--cyan);letter-spacing:.1em;text-transform:uppercase}
+.step h4{font-family:var(--serif);font-size:22px;font-weight:600;margin:4px 0 6px}
+.step p{font-size:14px;color:#C6C0B1;margin:0}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:28px}
+@media (max-width:820px){.two{grid-template-columns:1fr}}
+.ledger{overflow-x:auto;margin-top:10px}
+table{border-collapse:collapse;width:100%;font-size:14px;min-width:560px}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-weight:500}
+td.num{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--ink);white-space:nowrap}
+.ruled{list-style:none;padding:0;margin:0;display:grid;gap:12px;max-width:70ch}
+.ruled li{padding-left:16px;border-left:1px solid var(--line)}
+.ruled li b{color:var(--ink)}
+footer{padding-block:28px;color:var(--muted);font-size:13px;font-family:var(--mono)}
+footer a{color:var(--cyan)}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="wrap">
+<header class="top">
+  <span class="mark"><b>DHNG II</b> · working theories</span>
+  <span class="mark">companion to <a href="https://claude.ai/artifact/HVyxQ2JTcAaXP7LuLtaDe8" style="color:var(--cyan)">DHNG III · Twelve Around One</a></span>
+</header>
+
+<h1>Knowledge distillation through <em>optical refraction</em></h1>
+<p class="lede">The idea in one line: don't take a model apart to learn what it knows. Shine light through it. Read what it computes, then pass that reading through a lens: a curved medium that bends flat, high-dimensional structure into a space where hierarchy has room. Keep the pattern the light makes, not the model.</p>
+
+<section style="padding-top:18px">
+<div class="stage">
+  <div class="lens"><canvas id="c" aria-label="Poincaré disk: rays from a source bend into hyperbolic geodesics as curvature increases"></canvas>
+    <div class="hud" id="hud"></div></div>
+  <div class="controls">
+    <h3>The lens, live</h3>
+    <p>This is a real optical medium, not a metaphor. The disk has refractive index <span style="font-family:var(--mono)">n(r) = 2 / (1 − r²)</span>, rising without bound toward the rim. Under Fermat's principle, light in this medium follows exactly the straight lines of hyperbolic space. <span class="badge b-m">exact maths</span></p>
+    <label class="ctl" for="k"><span>curvature: flat → hyperbolic <b id="kv">1.00</b></span><input id="k" type="range" min="0" max="1" step="0.01" value="1"></label>
+    <label class="ctl" for="nr"><span>rays from the source <b id="nv">18</b></span><input id="nr" type="range" min="4" max="48" step="1" value="18"></label>
+    <p class="note">Drag inside the disk to move the source. At curvature 0 the rays run straight, as in the teacher's flat space. At 1 they bend into circular arcs meeting the rim at right angles. Rays that started nearly parallel spread apart: that spreading is the room hierarchy needs.</p>
+  </div>
+</div>
+</section>
+
+<section>
+<h2>The working theory, in plain language</h2>
+<div class="two">
+<div>
+<p>A large model like Qwen keeps what it knows in <b>internal states</b>: thousands of numbers per word, arranged in a flat space. Flat space is cramped for hierarchy. As a tree branches, the number of branches grows exponentially, but flat space only gives polynomial room, so related ideas get squashed together.</p>
+<p>Hyperbolic space grows exponentially, like a tree. So the theory: <b>read</b> the model's states and predictions, and let them <b>refract</b> into a hyperbolic medium, where the branching structure the model learned can spread out and be kept.</p>
+</div>
+<div>
+<p>The optics make the rule concrete. A <b>lens</b> changes the <i>direction</i> of rays, not what the rays are made of. So we keep the model's relations (what sits near what, what branches from what) and store them as positions and paths in the curved map.</p>
+<p>And the model is never cut open. It is read, frozen, and left whole. What gets stored is the refraction pattern, under a hash, where anyone can reproduce it.</p>
+</div>
+</div>
+</section>
+
+<section>
+<h2>How we plan to use it: distillation without tearing models apart</h2>
+<p>Five stages, each read-only toward the model and each hashed. It mirrors how the carve swarm already works. Specialists are <b>views</b> onto one set of weights: a subset of layers sharing every tensor, healed by small adapters. Nothing is duplicated and the base is never modified.</p>
+<div class="pipe">
+  <div class="step"><div class="k">1 · read</div><h4>Tap</h4><p>Qwen 27B stays frozen. We record layer-48 states and its next-op probabilities over the 390 pinned MLIR ops. No weights change.</p></div>
+  <div class="step"><div class="k">2 · freeze</div><h4>Hash</h4><p>One dump, sharded per kernel variant, every shard hashed. The teacher's floats become fixed bytes.</p></div>
+  <div class="step"><div class="k">3 · focus</div><h4>Project</h4><p>A measured, lossy step from 5,120 numbers down to a small tangent vector. This is where information is lost, so it gets measured.</p></div>
+  <div class="step"><div class="k">4 · refract</div><h4>Exp map</h4><p>The tangent vector enters the curved space (H³ × T²) through the exponential map: the lens itself. Integer maths, same bits on every machine.</p></div>
+  <div class="step"><div class="k">5 · keep</div><h4>Map</h4><p>Positions and relations join the persistent map. Any later model reads the same map, and nothing is lost when the model is swapped.</p></div>
+</div>
+</section>
+
+<section>
+<div class="two">
+<div>
+<h2>What is exactly true</h2>
+<ul class="ruled">
+  <li><b>The disk is an optical medium.</b> Hyperbolic geodesics are light paths for n = 2/(1 − r²). <span class="badge b-m">exact maths</span></li>
+  <li><b>Ball and hyperboloid are one space.</b> The same distances, reproduced in integer code to 4.4 × 10⁻⁹ across 900 pairs. <span class="badge b-m">measured</span></li>
+  <li><b>The corpus is pinned.</b> 1,394 unique MLIR variants, all inside the 390-op base, rebuilt byte for byte. <span class="badge b-m">measured</span></li>
+  <li><b>Carving works on the real model.</b> 12 middle layers removed with no loss; healing took a 48-layer view from 1/10 to 4/10. <span class="badge b-m">measured</span></li>
+</ul>
+</div>
+<div>
+<h2>What the lens cannot do</h2>
+<ul class="ruled">
+  <li><b>It can't be lossless.</b> One token's state is about 82,000 bits; an H³ × T² point holds 256. Refraction keeps <i>relations</i>, not everything. <span class="badge b-m">arithmetic</span></li>
+  <li><b>A mirror doesn't reduce dimension.</b> A reflection is an isometry, the same size in and out. The reduction happens in stage 3, and it costs information. <span class="badge b-m">exact maths</span></li>
+  <li><b>Hosted APIs can't be the teacher.</b> They hide internal states and full probabilities. The teacher must be open weights we run. <span class="badge b-m">checked</span></li>
+  <li><b>Beauty isn't evidence.</b> A figure that looks stable is not a measured result. <span class="badge b-u">see the audit</span></li>
+</ul>
+</div>
+</div>
+</section>
+
+<section>
+<h2>What would prove it, or kill it</h2>
+<p>The theory is <span class="badge b-t">working theory</span> until it passes a test written before the data. That test is frozen under fingerprint <span style="font-family:var(--mono);color:var(--gold)">94ce028317e0ecac</span>.</p>
+<div class="ledger"><table>
+<thead><tr><th>Test</th><th>Pass bar (fixed in advance)</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Curved student vs flat and RoPE students, same capacity</td><td class="num">≥ 5 % lower KL on ≥ 17 of 24 held-out algorithm families</td><td><span class="badge b-u">not run</span></td></tr>
+<tr><td>Geometry bake-off on the memory graph</td><td class="num">beats Euclidean on held-out co-recall, 95 % CI &gt; 0</td><td><span class="badge b-u">not run</span></td></tr>
+<tr><td>Does the teacher's geometry look like a tree at all?</td><td class="num">Gromov δ of teacher distances vs a random baseline</td><td><span class="badge b-u">not run</span></td></tr>
+<tr><td>Integer determinism across machines</td><td class="num">one golden hash on every target</td><td><span class="badge b-m">pinned on arm64</span></td></tr>
+</tbody></table></div>
+<p class="note" style="margin-top:14px">If the curved student does not beat the flat one, the lens is the wrong shape for this data, and that result gets published just as loudly.</p>
+</section>
+
+<footer>DHNG II · 2026-09-24 · deterministic sources in TorPhPoEnc (<span>pami/</span>, <span>audit/ELLE_PORT_AUDIT.md</span>)</footer>
+</div>
+
+<script>
+(() => {
+  const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  const kIn = document.getElementById('k'), nIn = document.getElementById('nr');
+  const kv = document.getElementById('kv'), nv = document.getElementById('nv'), hud = document.getElementById('hud');
+  let src = { x: -0.35, y: 0.18 }, W = 0, dpr = 1;
+  const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  function size() { dpr = Math.min(2, window.devicePixelRatio || 1); const r = cv.getBoundingClientRect(); W = r.width; cv.width = W * dpr; cv.height = W * dpr; draw(); }
+  // complex helpers
+  const mul = (a, b) => ({ x: a.x * b.x - a.y * b.y, y: a.x * b.y + a.y * b.x });
+  const div = (a, b) => { const d = b.x * b.x + b.y * b.y; return { x: (a.x * b.x + a.y * b.y) / d, y: (a.y * b.x - a.x * b.y) / d }; };
+  // Möbius map sending 0 -> p with direction preserved at 0: T(z) = (z + p) / (1 + conj(p) z)
+  const T = (z, p) => div({ x: z.x + p.x, y: z.y + p.y }, { x: 1 + (p.x * z.x + p.y * z.y), y: p.x * z.y - p.y * z.x });
+  function draw() {
+    const R = W * dpr * 0.46, cx = W * dpr / 2, cy = W * dpr / 2, k = +kIn.value, n = +nIn.value;
+    const P = (z) => [cx + z.x * R, cy - z.y * R];
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    // refractive index field n(r) = 2/(1-r^2), shown as rising brightness toward the rim
+    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R);
+    g.addColorStop(0, 'rgba(95,227,212,0.03)'); g.addColorStop(0.7, 'rgba(95,227,212,0.07)'); g.addColorStop(0.97, 'rgba(212,175,55,0.22)'); g.addColorStop(1, 'rgba(212,175,55,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.fill();
+    // depth shells (hyperbolic distance 1, 2, 3 -> r = tanh(d/2))
+    ctx.lineWidth = 1 * dpr; ctx.setLineDash([3 * dpr, 5 * dpr]); ctx.strokeStyle = 'rgba(139,144,160,0.35)';
+    for (const d of [1, 2, 3]) { ctx.beginPath(); ctx.arc(cx, cy, R * Math.tanh(d / 2), 0, Math.PI * 2); ctx.stroke(); }
+    ctx.setLineDash([]);
+    ctx.strokeStyle = css('--gold'); ctx.lineWidth = 1.5 * dpr; ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.stroke();
+    // rays: geodesic through src with direction θ = image of the diameter e^{iθ}·t under T_src
+    for (let i = 0; i < n; i++) {
+      const th = (i / n) * Math.PI * 2;
+      const dir = { x: Math.cos(th), y: Math.sin(th) };
+      ctx.beginPath();
+      let first = true;
+      for (let s = 0; s <= 1.0001; s += 0.01) {
+        const t = s * 0.999;
+        const hyp = T(mul(dir, { x: t, y: 0 }), src);
+        // flat ray: straight line from src clipped at the rim
+        const lam = rayToRim(src, dir) * s;
+        const flat = { x: src.x + dir.x * lam, y: src.y + dir.y * lam };
+        const z = { x: (1 - k) * flat.x + k * hyp.x, y: (1 - k) * flat.y + k * hyp.y };
+        const [X, Y] = P(z); if (first) { ctx.moveTo(X, Y); first = false; } else ctx.lineTo(X, Y);
+      }
+      const warm = i % 3 === 0;
+      ctx.strokeStyle = warm ? 'rgba(212,175,55,0.85)' : 'rgba(95,227,212,0.75)'; ctx.lineWidth = (warm ? 1.4 : 1.1) * dpr; ctx.stroke();
+    }
+    const [sx, sy] = P(src);
+    ctx.fillStyle = '#ECE6D6'; ctx.beginPath(); ctx.arc(sx, sy, 5 * dpr, 0, Math.PI * 2); ctx.fill();
+    const r = Math.hypot(src.x, src.y), nIdx = 2 / (1 - r * r), depth = 2 * Math.atanh(Math.min(r, 0.999999));
+    hud.textContent = `source r = ${r.toFixed(3)} · n(r) = ${nIdx.toFixed(2)} · depth = ${depth.toFixed(2)}`;
+    kv.textContent = k.toFixed(2); nv.textContent = n;
+  }
+  function rayToRim(p, d) { const b = p.x * d.x + p.y * d.y, c = p.x * p.x + p.y * p.y - 1; return -b + Math.sqrt(b * b - c); }
+  function setFrom(ev) {
+    const r = cv.getBoundingClientRect(), R = r.width * 0.46;
+    let x = (ev.clientX - r.left - r.width / 2) / R, y = -(ev.clientY - r.top - r.height / 2) / R;
+    const m = Math.hypot(x, y); if (m > 0.94) { x *= 0.94 / m; y *= 0.94 / m; }
+    src = { x, y }; draw();
+  }
+  let down = false;
+  cv.addEventListener('pointerdown', (e) => { down = true; cv.setPointerCapture(e.pointerId); setFrom(e); });
+  cv.addEventListener('pointermove', (e) => { if (down) setFrom(e); });
+  cv.addEventListener('pointerup', () => { down = false; });
+  kIn.addEventListener('input', draw); nIn.addEventListener('input', draw);
+  new ResizeObserver(size).observe(cv); size();
+})();
+</script>

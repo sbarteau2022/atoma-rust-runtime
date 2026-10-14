@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| s.as_str())
         .unwrap_or("The capital of France is");
     let max_tokens: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(50);
-    let model_dir = PathBuf::from("/Users/stewartbarteau/models/Muse-Glimmer-q4-MLX");
+    let model_dir = PathBuf::from("/Users/stewartbarteau/models/Muse-Glimmer-q4km-gs128-MLX");
     let tokens_only = std::env::var("GLIMMER_TOKENS_ONLY").is_ok();
     let stop_after_prefill = std::env::var("GLIMMER_STOP_AFTER_PREFILL").is_ok();
     println!("Loading tokenizer...");
@@ -43,14 +43,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading Glimmer model (this takes a while)...");
     let t0 = Instant::now();
     let mut model = GlimmerModel::load(&model_dir)?;
-    if stop_after_prefill {
-        model.weights.retain_cache = false;
-    }
+    // Full f32 cache of this checkpoint does not fit next to the mapped q4 file.
+    model.weights.retain_cache = false;
+    let (quant_bits, quant_group) = model.weights.quant_defaults();
     println!(
-        "Model loaded in {:.1}s (q_fused={}, layers={})",
+        "Model loaded in {:.1}s (q_fused={}, layers={}, quant={}bit/g{} overrides={})",
         t0.elapsed().as_secs_f32(),
         model.q_fused,
-        model.config.num_hidden_layers
+        model.config.num_hidden_layers,
+        quant_bits,
+        quant_group,
+        model.weights.quant_override_count()
     );
     let eos = model.config.eos_token_ids.clone();
     let t0 = Instant::now();
@@ -88,23 +91,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if stop_after_prefill {
         return Ok(());
     }
+    // First output is the prefill argmax. Each later forward takes the id just emitted,
+    // at the next position, which is the same step MLX generate_step uses.
     let mut generated: Vec<u32> = Vec::new();
+    let mut next = boundary as u32;
+    let mut next_logit = last_logits[boundary];
     for i in 0..max_tokens {
-        let pos = tokens.len() + i;
-        let last = *tokens.last().unwrap();
-        let t1 = Instant::now();
-        let logits = model.forward(last, pos)?;
-        let next = argmax(&logits).map_err(|e| format!("argmax: {}", e))? as u32;
-        let dt = t1.elapsed().as_secs_f32();
         let piece = tok.decode(&[next]);
-        println!("  token {} ({}): {:.2}s", next, piece.trim(), dt);
+        println!(
+            "GEN {} token={} piece={} logit={:.4}",
+            i,
+            next,
+            piece.trim(),
+            next_logit
+        );
+        generated.push(next);
         if eos.contains(&next) {
             println!("EOS reached.");
             break;
         }
+        if i + 1 == max_tokens {
+            break;
+        }
+        let pos = tokens.len();
+        let t1 = Instant::now();
+        let logits = model.forward(next, pos)?;
+        println!("  forward pos={} {:.2}s", pos, t1.elapsed().as_secs_f32());
         tokens.push(next);
-        generated.push(next);
+        next = argmax(&logits).map_err(|e| format!("argmax: {}", e))? as u32;
+        next_logit = logits[next as usize];
     }
+    println!("GEN_IDS {:?}", generated);
     let output = tok.decode(&generated);
     println!("\n=== OUTPUT ===\n{}{}", prompt, output);
     println!("=== END ===");

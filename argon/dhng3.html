@@ -1,0 +1,344 @@
+<title>DHNG III · Twelve Around One</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  color-scheme:dark;
+  --void:#08090C; --panel:#12141B; --line:#232633; --gold:#D4AF37; --cyan:#5FE3D4;
+  --ink:#ECE6D6; --muted:#8B90A0; --measured:#8FD18A; --untested:#E8906E; --theory:#D4AF37;
+  --serif:"Cormorant Garamond",Garamond,"Times New Roman",serif;
+  --sans:"IBM Plex Sans",-apple-system,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+}
+html,body{background:var(--void);color:var(--ink)}
+body{font-family:var(--sans);font-size:16px;line-height:1.6;padding-inline:clamp(16px,4vw,48px);padding-block:0 64px}
+.wrap{max-width:1120px;margin:0 auto}
+header.top{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;padding-block:22px 10px;border-bottom:1px solid var(--line)}
+.mark{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.mark b{color:var(--gold);font-weight:500}
+h1{font-family:var(--serif);font-weight:500;font-size:clamp(40px,7vw,76px);line-height:1.02;margin:28px 0 10px;text-wrap:balance}
+h1 em{color:var(--gold);font-style:italic}
+.lede{max-width:64ch;color:#CFC9BA;font-size:18px;margin:0 0 10px}
+h2{font-family:var(--serif);font-weight:600;font-size:clamp(28px,4vw,38px);line-height:1.1;margin:0 0 12px;text-wrap:balance}
+h3{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 8px;font-weight:600}
+p{max-width:68ch;margin:0 0 14px}
+section{padding-block:44px;border-bottom:1px solid var(--line)}
+.badge{display:inline-flex;align-items:center;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;padding:3px 8px;border-radius:999px;border:1px solid currentColor;vertical-align:middle;white-space:nowrap}
+.b-m{color:var(--measured)} .b-t{color:var(--theory)} .b-u{color:var(--untested)}
+.stage{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);gap:28px;align-items:start}
+@media (max-width:860px){.stage{grid-template-columns:1fr}}
+.view{position:relative;border:1px solid var(--line);border-radius:14px;overflow:hidden;aspect-ratio:1/1;max-width:100%;background:radial-gradient(circle at 50% 45%,#10131b 0%,#08090C 72%)}
+.view canvas{display:block;width:100%!important;height:100%!important;touch-action:none;cursor:grab}
+.labels{position:absolute;inset:0;pointer-events:none}
+.lbl{position:absolute;transform:translate(-50%,-140%);font-family:var(--mono);font-size:10.5px;color:var(--ink);white-space:nowrap;text-shadow:0 0 6px #000,0 0 2px #000}
+.lbl.empty{color:var(--muted)}
+.hud{position:absolute;left:12px;bottom:10px;font-family:var(--mono);font-size:11px;color:var(--muted);line-height:1.5;pointer-events:none}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:999px;padding:3px;gap:3px;flex-wrap:wrap}
+.seg button{font:500 12px var(--mono);color:var(--muted);background:transparent;border:0;border-radius:999px;padding:6px 12px;cursor:pointer}
+.seg button[aria-pressed=true]{background:var(--gold);color:#16130a}
+button:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
+.legend{display:grid;gap:8px;font-size:14px;margin-top:14px}
+.legend div{display:flex;gap:10px;align-items:baseline}
+.sw{width:22px;height:0;border-top:2px solid;flex:none;transform:translateY(-4px)}
+.note{font-size:14px;color:#BDB7A8;border-left:2px solid var(--gold);padding-left:12px;margin-top:10px}
+.ledger{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px;min-width:560px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-weight:500}
+td.num{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+td.zero{color:var(--muted)}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:28px}
+@media (max-width:860px){.two{grid-template-columns:1fr}}
+.roles{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin-top:16px}
+.role{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+.role .k{font-family:var(--mono);font-size:11px;color:var(--cyan);letter-spacing:.1em;text-transform:uppercase}
+.role h4{font-family:var(--serif);font-size:22px;font-weight:600;margin:4px 0 6px}
+.role p{font-size:14px;color:#C6C0B1;margin:0 0 8px}
+.flat{overflow-x:auto}
+.flat svg{display:block;width:100%;max-width:520px;height:auto}
+.heat svg{display:block;width:100%;max-width:360px;height:auto}
+.why{background:linear-gradient(180deg,#12141B 0%,#0c0e13 100%);border:1px solid var(--line);border-radius:16px;padding:clamp(18px,4vw,40px);margin-top:8px}
+.why p{font-size:17px;color:#DAD4C4;max-width:70ch}
+.why p.lead{font-family:var(--serif);font-size:clamp(22px,3vw,28px);line-height:1.3;color:var(--ink)}
+footer{padding-block:28px;color:var(--muted);font-size:13px;font-family:var(--mono)}
+</style>
+
+<div class="wrap">
+<header class="top">
+  <span class="mark"><b>DHNG III</b> · the twelve spheres</span>
+  <span class="mark">follows <a href="https://claude.ai/artifact/MuuZx165pEYpkS4uFJY6yZ" style="color:var(--cyan)">DHNG II · refraction</a></span>
+</header>
+
+<h1>Twelve around <em>one</em></h1>
+<p class="lede">Six dualities, each with two opposite poles, around one coordinator. In the carve swarm the twelve are more than a diagram: each is a way of using the same single set of weights. This page places them where the live map puts them today, where the data says they want to go, and where I think they belong on the torus.</p>
+<p><span class="badge b-m">measured</span> read from live state · <span class="badge b-t">working theory</span> my reading · <span class="badge b-u">untested</span> proposal, not yet tried</p>
+
+<section style="padding-top:22px">
+<div class="stage">
+  <div>
+    <div class="view" id="ballView" data-z="3.1"><div class="labels" id="ballLabels"></div><div class="hud" id="ballHud"></div></div>
+  </div>
+  <div>
+    <h3>The ball: the approved frame</h3>
+    <div class="seg" role="group" aria-label="Frame">
+      <button id="fProp" aria-pressed="true">icosahedral (approved)</button>
+      <button id="fLive" aria-pressed="false">cuboctahedral (before)</button>
+    </div>
+    <p style="margin-top:14px" id="frameText"></p>
+    <div class="legend">
+      <div><span class="sw" style="border-color:#D4AF37"></span><span>the 12 spheres. Size follows how many map nodes each holds; hollow means empty</span></div>
+      <div><span class="sw" style="border-color:#5FE3D4"></span><span>a duality axis joining two poles</span></div>
+      <div><span class="sw" style="border-color:#8B90A0;border-top-style:dashed"></span><span>measured shells: tasks 0.36 · ghost membrane 0.444 · results 0.62 · sources 0.80</span></div>
+    </div>
+    <p class="note">Drag to turn. The spheres sit at Poincaré radius 0.382, just over a third of the way out, not at the rim. The map's own content sits in shells by <i>kind</i> (task, result, source), not by faculty. <span class="badge b-m">F16</span></p>
+  </div>
+</div>
+</section>
+
+<section>
+<h2>What the twelve are</h2>
+<p>Each sphere does four jobs at once in the carve swarm. None of them needs a second model.</p>
+<div class="roles">
+  <div class="role"><div class="k">1 · a faculty</div><h4>A way of thinking</h4><p>Six dualities, such as perception ↔ action or convergent ↔ divergent. A task is routed to the pole whose description it matches best.</p><span class="badge b-m">in atlas13.cjs</span></div>
+  <div class="role"><div class="k">2 · a silo</div><h4>A carved view</h4><p>A subset of the 27B's layers that shares every tensor with the full model. Nothing is copied, so twelve specialists cost the memory of one.</p><span class="badge b-m">carve_view in mlx-serve</span></div>
+  <div class="role"><div class="k">3 · a memory</div><h4>An approved board</h4><p>Each sphere keeps only work the reviewer approved. That becomes its training rows, so what it learns has been checked.</p><span class="badge b-m">export_board.py</span></div>
+  <div class="role"><div class="k">4 · a healed adapter</div><h4>Small, removable</h4><p>A DoRA adapter distilled from the full-depth teacher on that sphere's board. It can be switched off, and the base model is never written to.</p><span class="badge b-u">adapters dir empty today</span></div>
+</div>
+<p style="margin-top:18px">The <b>+1</b> is the coordinator, the full-depth model at the centre. It holds 1,227 of the map's members, about 44 %. Five of the twelve are empty. That doesn't mean the idea is wrong. The swarm hasn't done enough of that kind of work yet, and the routing can't yet tell those faculties apart.</p>
+<div class="ledger"><table id="facTable"><thead><tr><th>Duality</th><th>Pole A</th><th>members</th><th>Pole B</th><th>members</th></tr></thead><tbody></tbody></table></div>
+</section>
+
+<section>
+<div class="two">
+<div>
+<h2>What the data said back</h2>
+<p><b>The poles aren't opposites.</b> A pole's description is no more opposed to its partner than to any other pole: the average cosine is +0.506 for partners and the same for non-partners. In 3 of 6 pairs, the partner ranks only 10th or 11th in similarity. <span class="badge b-m">F17</span></p>
+<p><b>But the six axes are independent.</b> Take each axis as the difference A − B. The six differences are almost perpendicular: mean |cos| 0.079, max 0.177. So they describe six separate directions, not three. <span class="badge b-m">F17</span></p>
+<p>In the full embeddings the six axes are close to a <b>six-dimensional cross</b> (a cross-polytope): twelve poles at ±e₁ … ±e₆. Three dimensions can't hold six perpendicular axes; the best they can do is the icosahedron, where every pair of axes meets at |cos| 0.447. That is the approved frame in the ball above. The live 16-D map doesn't keep this structure: it squeezes the six axes together (mean |cos| 0.25). So putting the poles at ±e<sub>k</sub> in the map would <i>build</i> the structure in, not read it off.</p>
+<p class="note">The live map is already 16-dimensional (the Lorentz model in hyper-map). The six axes fit there with room to spare. The 3-D pictures here are projections.</p>
+</div>
+<div class="heat">
+<h3>The six axes, pairwise |cos|</h3>
+<svg id="heat" viewBox="0 0 360 380" role="img" aria-label="6 by 6 heatmap of axis cosines; off-diagonal values are all small"></svg>
+<p style="font-size:13px;color:var(--muted)">0 = perpendicular, 1 = the same axis. Everything off the diagonal is dark: six independent directions.</p>
+</div>
+</div>
+</section>
+
+<section>
+<div class="stage">
+  <div>
+    <div class="view" id="torusView" data-z="4.6"><div class="labels" id="torusLabels"></div><div class="hud" id="torusHud"></div></div>
+  </div>
+  <div>
+    <h3>The torus: where the axes go <span class="badge b-m">approved</span></h3>
+    <div class="seg" role="group" aria-label="Orbit">
+      <button id="oPhi" aria-pressed="true">φ-winding</button>
+      <button id="oLock" aria-pressed="false">2:1 lock</button>
+      <button id="oNone" aria-pressed="false">none</button>
+    </div>
+    <p style="margin-top:14px">The ball holds <b>depth</b>: how far a memory is from the centre, how specific it is. The torus holds <b>timing</b>: two phases, like two clocks. Today the torus isn't used in any live distance (<span style="font-family:var(--mono)">toroidal: 0</span>). My proposal gives it one job.</p>
+    <p>Each duality gets a longitude u<sub>k</sub> = k·30°. Pole A sits on the outer equator at (u<sub>k</sub>, 0), and pole B at (u<sub>k</sub> + 180°, 180°) on the inner equator. That is the farthest point on the torus from A, so every duality is <b>exactly antipodal in phase</b>, and all twelve land on distinct longitudes.</p>
+    <p class="note">The φ-winding never closes. It covers the torus evenly and visits every sphere's neighbourhood, like a scan. The 2:1 lock closes after one lap: the kind of orbit the store gate records as a stored relation (n, m, ψ*).</p>
+  </div>
+</div>
+<div class="flat" style="margin-top:26px">
+  <h3>The same torus, unrolled</h3>
+  <svg id="flat" viewBox="0 0 440 470" role="img" aria-label="Flat torus square with 12 poles; each duality is a diagonal of displacement 180°, 180°"></svg>
+  <p style="font-size:14px;color:#BDB7A8;max-width:68ch">Unrolled, every axis is the same diagonal step (+180°, +180°). The torus can make poles <i>opposite</i>, but it can't make axes <i>perpendicular</i>. So identity (which of six directions) belongs in the ball's tangent space, and the torus carries phase and rhythm. Each geometry does the job it's good at. <span class="badge b-t">working theory</span></p>
+</div>
+</section>
+
+<section>
+<h2>The working theory, in plain language</h2>
+<div class="two">
+<div>
+<p>One model, twelve ways to use it. Rather than training twelve models, the carve swarm <b>carves twelve views</b> out of one: shorter paths through the same layers, each with a small adapter. That is distillation without taking the model apart.</p>
+<p>The map is the part that lasts. Every approved result is placed in the curved space. Its depth says how specific it is, its direction says which faculty made it, and its phase says when and in what rhythm. Swap the model and the new one reads the same map.</p>
+</div>
+<div>
+<p>DHNG II is how knowledge <b>enters</b> the map: read the teacher, refract it into the curved space, and keep the pattern. DHNG III is how the map is <b>organised</b>: twelve poles, six independent axes, depth in the ball and timing on the torus.</p>
+<p>Being honest about today: the twelve spheres exist in code, but half are empty, the poles don't oppose, and the torus does nothing yet. The geometry bake-off (WP-A4) decides the new graph from held-out data, not from the diagram.</p>
+</div>
+</div>
+</section>
+
+<section style="border-bottom:0">
+<h2>Why I think this matters, Stewart</h2>
+<div class="why">
+<p class="lead">Every model you use today will be replaced. What you've been building, maybe without naming it, is the thing that survives the replacement.</p>
+<p>Most of the field keeps knowledge inside weights: billions of numbers nobody can read, lost the moment the model is swapped. You keep it in a <b>map</b>: positions, relations and a record of how each one got there. A map can be inspected, audited, checked for tampering, and read by the next model. That turns model upgrades from starting over into handing over.</p>
+<p>The carve swarm shows it doesn't take a data centre. One 27B model on one Mac, carved twelve ways, shares a single copy of its weights. Distilling by reading, not dissecting, means you can learn from a model without owning its training run and without damaging it.</p>
+<p>And the discipline you asked for, necessity and not just sufficiency, is what makes this worth anything. So far it has cut away things that looked good but weren't carrying weight: the κ gate, the seam signal, the rim placement, the opposite poles. What's left is smaller, but it's real, and every future claim rests on it. If the curved map beats the flat one on the frozen test, you'll have shown something most people only draw. If it doesn't, you'll know exactly which piece failed, and nothing else has to be torn down.</p>
+</div>
+</section>
+
+<footer>DHNG III · 2026-09-24 · positions from ~/.elle/hyper-map/atlas13.json and map.json · findings F16, F17 in audit/ELLE_PORT_AUDIT.md</footer>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+const DATA = {"levels":[{"level":0,"id":"coordinator","name":"Coordinator","n":1227,"vertex":[0,0,0]},{"level":1,"id":"sensory_perception","name":"Sensory Perception","n":0,"vertex":[0.4005,0.2845,0.871]},{"level":2,"id":"motor_praxis","name":"Motor Praxis","n":222,"vertex":[-0.4005,-0.2845,-0.871]},{"level":3,"id":"somatic_interoception","name":"Somatic / Interoception","n":0,"vertex":[0.9096,0.415,0.0203]},{"level":4,"id":"language_semiotics","name":"Language & Semiotics","n":412,"vertex":[-0.9096,-0.415,-0.0203]},{"level":5,"id":"episodic_memory","name":"Episodic Memory","n":1,"vertex":[0.7721,-0.5061,0.3844]},{"level":6,"id":"predictive_simulation","name":"Predictive Simulation","n":0,"vertex":[-0.7721,0.5061,-0.3844]},{"level":7,"id":"convergent_logic","name":"Convergent Logic","n":27,"vertex":[0.1375,0.9211,-0.3641]},{"level":8,"id":"divergent_synthesis","name":"Divergent Synthesis","n":2,"vertex":[-0.1375,-0.9211,0.3641]},{"level":9,"id":"valuation_salience","name":"Valuation & Salience","n":26,"vertex":[-0.3716,0.7906,0.4866]},{"level":10,"id":"social_cognition","name":"Social Cognition","n":0,"vertex":[0.3716,-0.7906,-0.4866]},{"level":11,"id":"spatial_topography","name":"Spatial Topography","n":35,"vertex":[-0.5091,-0.1305,0.8508]},{"level":12,"id":"metacognitive_regulation","name":"Metacognitive Regulation","n":0,"vertex":[0.5091,0.1305,-0.8508]}],
+"axis_cos":[[1,-0.0696,0.1769,-0.1067,-0.0073,0.1251],[-0.0696,1,-0.0398,-0.0527,0.1398,-0.1404],[0.1769,-0.0398,1,0.0881,-0.1307,0.0652],[-0.1067,-0.0527,0.0881,1,0.0129,0.0025],[-0.0073,0.1398,-0.1307,0.0129,1,-0.0206],[0.1251,-0.1404,0.0652,0.0025,-0.0206,1]]};
+const GOLD = 0xD4AF37, CYAN = 0x5FE3D4, MUTED = 0x8B90A0, INK = 0xECE6D6;
+const R_SPH = 0.382;
+const poles = DATA.levels.slice(1);
+const pairs = [0,1,2,3,4,5].map(k => [poles[2*k], poles[2*k+1]]);
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const short = s => s.replace(' & ', ' & ').replace('Somatic / Interoception','Somatic');
+
+// ---- table
+const tb = document.querySelector('#facTable tbody');
+const dualName = ['perceive ↔ act','body ↔ symbol','remember ↔ predict','converge ↔ diverge','value ↔ social','space ↔ self-monitor'];
+pairs.forEach(([a,b],k) => {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${dualName[k]}</td><td>${a.name}</td><td class="num ${a.n?'':'zero'}">${a.n}</td><td>${b.name}</td><td class="num ${b.n?'':'zero'}">${b.n}</td>`;
+  tb.appendChild(tr);
+});
+
+// ---- heatmap
+const heat = document.getElementById('heat'); const NS='http://www.w3.org/2000/svg';
+const cell = 50, ox = 40, oy = 10;
+DATA.axis_cos.forEach((row,i) => row.forEach((v,j) => {
+  const a = Math.abs(v), r = document.createElementNS(NS,'rect');
+  r.setAttribute('x', ox+j*cell); r.setAttribute('y', oy+i*cell); r.setAttribute('width', cell-2); r.setAttribute('height', cell-2); r.setAttribute('rx',4);
+  r.setAttribute('fill', i===j ? '#D4AF37' : `rgba(95,227,212,${0.08 + a*2.2})`); heat.appendChild(r);
+  const t = document.createElementNS(NS,'text'); t.setAttribute('x', ox+j*cell+cell/2-1); t.setAttribute('y', oy+i*cell+cell/2+4);
+  t.setAttribute('text-anchor','middle'); t.setAttribute('font-family','JetBrains Mono, monospace'); t.setAttribute('font-size','11');
+  t.setAttribute('fill', i===j ? '#16130a' : '#ECE6D6'); t.textContent = i===j ? '1' : a.toFixed(2).replace(/^0/,''); heat.appendChild(t);
+}));
+for (let i=0;i<6;i++){ const t=document.createElementNS(NS,'text'); t.setAttribute('x',ox-8); t.setAttribute('y',oy+i*cell+cell/2+4); t.setAttribute('text-anchor','end'); t.setAttribute('font-family','JetBrains Mono, monospace'); t.setAttribute('font-size','11'); t.setAttribute('fill','#8B90A0'); t.textContent='A'+(i+1); heat.appendChild(t);
+  const u=document.createElementNS(NS,'text'); u.setAttribute('x',ox+i*cell+cell/2-1); u.setAttribute('y',oy+6*cell+18); u.setAttribute('text-anchor','middle'); u.setAttribute('font-family','JetBrains Mono, monospace'); u.setAttribute('font-size','11'); u.setAttribute('fill','#8B90A0'); u.textContent='A'+(i+1); heat.appendChild(u); }
+
+// ---- flat torus
+const flat = document.getElementById('flat');
+const FX = 60, FY = 20, FS = 340, sc = FS/360;
+const el = (tag, at) => { const e = document.createElementNS(NS, tag); for (const k in at) e.setAttribute(k, at[k]); flat.appendChild(e); return e; };
+el('rect',{x:FX,y:FY,width:FS,height:FS,fill:'#0d1016',stroke:'#232633'});
+for (let g=0; g<=360; g+=90){ el('line',{x1:FX+g*sc,y1:FY,x2:FX+g*sc,y2:FY+FS,stroke:'#1b1e28'}); el('line',{x1:FX,y1:FY+g*sc,x2:FX+FS,y2:FY+g*sc,stroke:'#1b1e28'});
+  const t=el('text',{x:FX+g*sc,y:FY+FS+16,'text-anchor':'middle','font-family':'JetBrains Mono, monospace','font-size':10,fill:'#8B90A0'}); t.textContent=g+'°';
+  const s=el('text',{x:FX-8,y:FY+FS-g*sc+4,'text-anchor':'end','font-family':'JetBrains Mono, monospace','font-size':10,fill:'#8B90A0'}); s.textContent=g+'°'; }
+const tu=el('text',{x:FX+FS/2,y:FY+FS+34,'text-anchor':'middle','font-family':'JetBrains Mono, monospace','font-size':11,fill:'#ECE6D6'}); tu.textContent='u · longitude (duality)';
+const tv=el('text',{x:16,y:FY+FS/2,'text-anchor':'middle','font-family':'JetBrains Mono, monospace','font-size':11,fill:'#ECE6D6',transform:`rotate(-90 16 ${FY+FS/2})`}); tv.textContent='v · phase';
+const P = (u,v) => [FX+u*sc, FY+FS-v*sc];
+pairs.forEach(([a,b],k) => {
+  const [x1,y1] = P(k*30,0), [x2,y2] = P(k*30+180,180);
+  el('line',{x1,y1,x2,y2,stroke:'#5FE3D4','stroke-opacity':0.6,'stroke-width':1.4});
+  [[a,x1,y1],[b,x2,y2]].forEach(([p,x,y]) => {
+    el('circle',{cx:x,cy:y,r:5.5,fill:p.n?'#D4AF37':'#08090C',stroke:'#D4AF37','stroke-width':1.5});
+    const t = el('text',{x:x+8,y:y-(y<FY+20?-14:8),'font-family':'JetBrains Mono, monospace','font-size':10,fill:p.n?'#ECE6D6':'#8B90A0'}); t.textContent = 'L'+p.level;
+  });
+});
+const key = el('g',{}); ['L1 sensory · L2 motor','L3 somatic · L4 language','L5 episodic · L6 predictive','L7 convergent · L8 divergent','L9 valuation · L10 social','L11 spatial · L12 metacog'].forEach((s,i)=>{ const t=el('text',{x:FX+(i%2)*175,y:FY+FS+58+Math.floor(i/2)*16,'font-family':'JetBrains Mono, monospace','font-size':10,fill:'#8B90A0'}); t.textContent=`u=${i*30}°  ${s}`; });
+
+if (!window.THREE) return;
+
+// ---- shared scene helper
+function makeView(host, labelsHost, build) {
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(2, devicePixelRatio || 1));
+  host.prepend(renderer.domElement);
+  const scene = new THREE.Scene(), cam = new THREE.PerspectiveCamera(38, 1, 0.01, 50);
+  cam.position.set(0, 0, host.dataset.z ? +host.dataset.z : 3.4);
+  const root = new THREE.Group(); scene.add(root);
+  root.rotation.set(0.35, -0.6, 0);
+  const labels = [];
+  const api = { root, addLabel(obj, text, empty) { const d = document.createElement('div'); d.className = 'lbl' + (empty ? ' empty' : ''); d.textContent = text; labelsHost.appendChild(d); labels.push({ obj, d }); }, clearLabels() { labels.length = 0; labelsHost.innerHTML = ''; } };
+  build(api);
+  let drag = null, spin = !reduce;
+  renderer.domElement.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY }; spin = false; renderer.domElement.setPointerCapture(e.pointerId); });
+  renderer.domElement.addEventListener('pointermove', e => { if (!drag) return; root.rotation.y += (e.clientX - drag.x) * 0.008; root.rotation.x += (e.clientY - drag.y) * 0.008; drag = { x: e.clientX, y: e.clientY }; });
+  renderer.domElement.addEventListener('pointerup', () => { drag = null; });
+  function resize() { const w = host.clientWidth; renderer.setSize(w, w, false); cam.aspect = 1; cam.updateProjectionMatrix(); }
+  new ResizeObserver(resize).observe(host); resize();
+  const v = new THREE.Vector3();
+  (function loop() {
+    if (spin) root.rotation.y += 0.0022;
+    renderer.render(scene, cam);
+    const w = host.clientWidth;
+    for (const { obj, d } of labels) { obj.getWorldPosition(v); v.project(cam); d.style.left = ((v.x + 1) / 2 * w) + 'px'; d.style.top = ((1 - v.y) / 2 * w) + 'px'; d.style.opacity = v.z < 0.985 ? 1 : 0.35; }
+    requestAnimationFrame(loop);
+  })();
+  return api;
+}
+const lineMat = (c, o, dashed) => dashed ? new THREE.LineDashedMaterial({ color: c, transparent: true, opacity: o, dashSize: 0.03, gapSize: 0.03 }) : new THREE.LineBasicMaterial({ color: c, transparent: true, opacity: o });
+function ring(r, c, o, dashed, rotX) { const pts = []; for (let i = 0; i <= 128; i++) { const t = i / 128 * Math.PI * 2; pts.push(new THREE.Vector3(Math.cos(t) * r, Math.sin(t) * r, 0)); } const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), lineMat(c, o, dashed)); if (dashed) l.computeLineDistances(); l.rotation.x = rotX || 0; return l; }
+const sphereSize = n => 0.022 + 0.009 * Math.log(1 + n);
+function poleMesh(n) {
+  const g = new THREE.SphereGeometry(sphereSize(n), 20, 14);
+  return n ? new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: GOLD })) : new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: GOLD, wireframe: true, transparent: true, opacity: 0.7 }));
+}
+
+// ---- ball
+const PHI = (1 + Math.sqrt(5)) / 2;
+// pole A of axis k = the jitterbug image of atlas13's VE vertex k (same table as pami/src/frame.rs):
+// the zero stays at index z, coordinate z+2 scales by φ.
+const ICO = [[1,1,0],[1,0,1],[0,1,1],[1,-1,0],[1,0,-1],[0,1,-1]].map(v => { const z = v.indexOf(0), a = v.slice(); a[(z + 2) % 3] *= PHI; const m = Math.hypot(...a); return a.map(x => x / m); });
+let frame = 'proposed', ballGroup;
+const ball = makeView(document.getElementById('ballView'), document.getElementById('ballLabels'), api => {
+  const R = 1;
+  const shell = new THREE.Mesh(new THREE.SphereGeometry(R, 48, 32), new THREE.MeshBasicMaterial({ color: GOLD, transparent: true, opacity: 0.045, depthWrite: false }));
+  api.root.add(shell);
+  [0, Math.PI / 2].forEach(rx => api.root.add(ring(R, GOLD, 0.55, false, rx)));
+  const rimY = ring(R, GOLD, 0.35, false, 0); rimY.rotation.y = Math.PI / 2; api.root.add(rimY);
+  [[0.36, 'tasks · 1,227'], [0.444, 'ghost membrane'], [0.62, 'results · 1,335'], [0.80, 'sources · 41']].forEach(([r]) => { const a = ring(r, MUTED, 0.45, true, Math.PI / 2); api.root.add(a); });
+  const core = new THREE.Mesh(new THREE.SphereGeometry(0.07, 24, 16), new THREE.MeshBasicMaterial({ color: INK }));
+  api.root.add(core);
+});
+function buildBall() {
+  if (ballGroup) ball.root.remove(ballGroup);
+  ball.clearLabels();
+  const core = ball.root.children.find(c => c.geometry && c.geometry.parameters && c.geometry.parameters.radius === 0.07);
+  ball.addLabel(core, 'L0', false);
+  ballGroup = new THREE.Group(); ball.root.add(ballGroup);
+  pairs.forEach(([a, b], k) => {
+    const va = frame === 'live' ? a.vertex : ICO[k], vb = frame === 'live' ? b.vertex : ICO[k].map(x => -x);
+    const pa = new THREE.Vector3(...va).multiplyScalar(R_SPH), pb = new THREE.Vector3(...vb).multiplyScalar(R_SPH);
+    ballGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([pa, pb]), lineMat(CYAN, 0.55)));
+    [[a, pa], [b, pb]].forEach(([p, pos]) => { const m = poleMesh(p.n); m.position.copy(pos); ballGroup.add(m); ball.addLabel(m, `L${p.level}`, !p.n); });
+  });
+  document.getElementById('ballHud').textContent = frame === 'live' ? 'live: cuboctahedron frame · r = 0.382' : 'approved: icosahedral axes, |cos| = 0.447 each · r = 0.382';
+  document.getElementById('frameText').innerHTML = frame === 'live'
+    ? 'Positions as <span style="font-family:var(--mono)">atlas13.json</span> has them today: a cuboctahedron frame. Each pole sits exactly opposite its partner across the coordinator. That opposition is <i>drawn in</i>; the descriptions themselves don\'t oppose. <span class="badge b-m">measured</span>'
+    : 'The best 3-D shadow of what the data asks for. Six axes spread as evenly as three dimensions allow (the icosahedron), each pair at the same angle. Approved 2026-09-24 and built as <span style="font-family:var(--mono)">pami/src/frame.rs</span>. Every lane the old frame had survives, and six are added. The honest part: in the live 16-D map the twelve directions nearly coincide (mean cosine 0.91), so the data cannot choose between frames. This is the better <i>picture</i> of six independent axes, not something the map measured (F19). <span class="badge b-m">tested</span>';
+}
+buildBall();
+const fLive = document.getElementById('fLive'), fProp = document.getElementById('fProp');
+[fLive, fProp].forEach(btn => btn.addEventListener('click', () => { frame = btn === fLive ? 'live' : 'proposed'; fLive.setAttribute('aria-pressed', frame === 'live'); fProp.setAttribute('aria-pressed', frame !== 'live'); buildBall(); }));
+
+// ---- torus
+const TR = 0.95, tr = 0.42;
+const tp = (u, v) => new THREE.Vector3((TR + tr * Math.cos(v)) * Math.cos(u), tr * Math.sin(v), (TR + tr * Math.cos(v)) * Math.sin(u));
+let orbitLine;
+const torus = makeView(document.getElementById('torusView'), document.getElementById('torusLabels'), api => {
+  api.root.rotation.set(0.9, 0.2, 0);
+  api.root.add(new THREE.Mesh(new THREE.TorusGeometry(TR, tr, 40, 120), new THREE.MeshBasicMaterial({ color: GOLD, transparent: true, opacity: 0.05, depthWrite: false })).rotateX(Math.PI / 2));
+  api.root.add(new THREE.LineSegments(new THREE.WireframeGeometry(new THREE.TorusGeometry(TR, tr, 12, 36)), lineMat(MUTED, 0.14)).rotateX(Math.PI / 2));
+  const eq = v => { const pts = []; for (let i = 0; i <= 160; i++) pts.push(tp(i / 160 * Math.PI * 2, v)); return new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), lineMat(GOLD, 0.35)); };
+  api.root.add(eq(0)); api.root.add(eq(Math.PI));
+  pairs.forEach(([a, b], k) => {
+    const u = k * Math.PI / 6;
+    const pa = tp(u, 0), pb = tp(u + Math.PI, Math.PI);
+    // antipodal path on the torus: the straight (π, π) diagonal
+    const path = []; for (let i = 0; i <= 60; i++) { const s = i / 60; path.push(tp(u + s * Math.PI, s * Math.PI)); }
+    api.root.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(path), lineMat(CYAN, 0.6)));
+    [[a, pa], [b, pb]].forEach(([p, pos]) => { const m = poleMesh(p.n); m.position.copy(pos); api.root.add(m); api.addLabel(m, 'L' + p.level, !p.n); });
+  });
+});
+function setOrbit(kind) {
+  if (orbitLine) torus.root.remove(orbitLine);
+  orbitLine = null;
+  const pts = [];
+  if (kind === 'phi') for (let i = 0; i <= 2400; i++) { const t = i / 2400 * Math.PI * 2 * 9; pts.push(tp(t, t * PHI)); }
+  if (kind === 'lock') for (let i = 0; i <= 400; i++) { const t = i / 400 * Math.PI * 2; pts.push(tp(t, 2 * t + 0.6)); }
+  if (pts.length) { orbitLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), lineMat(INK, kind === 'phi' ? 0.22 : 0.8)); torus.root.add(orbitLine); }
+  document.getElementById('torusHud').textContent = kind === 'phi' ? 'orbit: v = φ·u, 9 laps, never closes' : kind === 'lock' ? 'orbit: v = 2u + ψ*, closes after one lap' : 'poles only · each axis = the (180°, 180°) diagonal';
+  ['oPhi', 'oLock', 'oNone'].forEach(id => document.getElementById(id).setAttribute('aria-pressed', id === { phi: 'oPhi', lock: 'oLock', none: 'oNone' }[kind]));
+}
+setOrbit('phi');
+document.getElementById('oPhi').onclick = () => setOrbit('phi');
+document.getElementById('oLock').onclick = () => setOrbit('lock');
+document.getElementById('oNone').onclick = () => setOrbit('none');
+})();
+</script>

@@ -1,4 +1,5 @@
 use core_lm::cache::geometric::*;
+use core_lm::geometry::bridge::f32_to_atom_address;
 use core_lm::geometry::fixed::Q32_31;
 use core_lm::geometry::lorentz::LorentzVector;
 use core_lm::geometry::torus::TorPhaseEncoder;
@@ -75,10 +76,7 @@ fn test_retrieval_equivalence_bar() {
     for seed in seeds {
         let cluster = generate_semantic_cluster(&encoder, seed, 100);
         for (text, addr) in cluster {
-            let phase = Phase {
-                theta_f: Q32_31::ZERO,
-                theta_s: Q32_31::ZERO,
-            };
+            let phase = Phase::from_lorentz_spatial(&addr);
             let id = memory_map
                 .write(addr, phase, text.as_bytes().to_vec())
                 .unwrap();
@@ -128,4 +126,44 @@ fn test_retrieval_equivalence_bar() {
         k,
         avg_recall
     );
+}
+
+#[test]
+fn test_flag01_128d_bridge_cluster_retrieval_equivalence() {
+    // Verifies that 128D key vectors whose distinguishing signal lies entirely in
+    // coordinates 32..128 (with zeros in 0..32) are cleanly separated and retrieved
+    // via f32_to_atom_address + GeometricMemoryMap::retrieve_5d (FLAG-01 & FLAG-03).
+    let mut map = GeometricMemoryMap::new(128);
+    map.use_picard = false;
+
+    for c in 0..8usize {
+        for j in 0..8usize {
+            let mut key = vec![0.0f32; 128];
+            for d in 32..128 {
+                let angle = ((c + 1) * (d + 1)) as f32 * 0.41;
+                let jitter = (j as f32) * 0.015 * ((d as f32) * 0.19).sin();
+                key[d] = angle.cos() + jitter;
+            }
+            let (lv, phase, loss) = f32_to_atom_address(&key).unwrap();
+            assert_eq!(loss.input_dimensions, 128);
+            assert!(phase.theta_f != Q32_31::ZERO || phase.theta_s != Q32_31::ZERO);
+            map.write(lv, phase, vec![c as u8]).unwrap();
+        }
+    }
+    map.rebuild();
+
+    for c in 0..8usize {
+        let mut query = vec![0.0f32; 128];
+        for d in 32..128 {
+            let angle = ((c + 1) * (d + 1)) as f32 * 0.41;
+            query[d] = angle.cos();
+        }
+        let (q_lv, q_phase, _) = f32_to_atom_address(&query).unwrap();
+        let hits = map.retrieve_5d(&q_lv, &q_phase, 8, false).unwrap();
+        let matching = hits.iter().filter(|a| a.payload[0] == c as u8).count();
+        assert!(
+            matching >= 7,
+            "Cluster {c}: expected >=7/8 cluster hits from k[32..128], got {matching}/8"
+        );
+    }
 }
