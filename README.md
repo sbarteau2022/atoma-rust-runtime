@@ -35,7 +35,7 @@ Requires the Muse Glimmer checkpoint at `~/models/Muse-Glimmer-q4km-gs128-MLX` (
 - `design/` — architecture docs and qualification gates
 - `docs/` — session notes and handoff docs
 - `harness/` — qualification tooling
-- `orchestrator/` — reserved for the control plane
+- `orchestrator/` — Rust control plane, authenticated HTTP/TLS edge, metrics, health checks, snapshots, and worker-cache generation gates
 - `immune_system/` — reserved for audit and adversarial tooling
 - `scripts/` — operator scripts
 

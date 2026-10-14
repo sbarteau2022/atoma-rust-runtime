@@ -249,6 +249,25 @@ impl RoleId {
         }
     }
 
+    /// Stable compact identifier for wire protocols and operator-facing metrics.
+    pub const fn short_code(self) -> &'static str {
+        match self {
+            Self::Coordinator => "L0",
+            Self::SensoryPerception => "L1",
+            Self::MotorPraxis => "L2",
+            Self::SomaticInteroception => "L3",
+            Self::LanguageSemiotics => "L4",
+            Self::EpisodicMemory => "L5",
+            Self::PredictiveSimulation => "L6",
+            Self::ConvergentLogic => "L7",
+            Self::DivergentSynthesis => "L8",
+            Self::ValuationSalience => "L9",
+            Self::SocialCognition => "L10",
+            Self::SpatialTopography => "L11",
+            Self::MetacognitiveRegulation => "L12",
+        }
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::Coordinator => "Coordinator",

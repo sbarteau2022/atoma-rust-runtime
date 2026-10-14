@@ -80,6 +80,8 @@ pub struct CoreLmInferenceWorker {
     pub forward_steps: u64,
     pub last_permit_sequence: u64,
     pub last_bridge_loss: Option<BridgeLossReport>,
+    /// Central map generation from which this local atom cache was hydrated.
+    pub map_generation: u64,
 }
 
 impl Clone for CoreLmInferenceWorker {
@@ -98,6 +100,7 @@ impl Clone for CoreLmInferenceWorker {
             forward_steps: self.forward_steps,
             last_permit_sequence: self.last_permit_sequence,
             last_bridge_loss: self.last_bridge_loss,
+            map_generation: self.map_generation,
         }
     }
 }
@@ -123,6 +126,7 @@ impl CoreLmInferenceWorker {
             forward_steps: 0,
             last_permit_sequence: 0,
             last_bridge_loss: None,
+            map_generation: 0,
         }
     }
 }
@@ -186,6 +190,32 @@ pub struct Governor {
 }
 
 impl Governor {
+    /// Refresh an inference worker before it consumes atoms from the central map. A generation
+    /// mismatch discards its derived cache and rehydrates it through the existing Layer 3 gate.
+    pub fn synchronize_worker_memory(
+        &mut self,
+        role: RoleId,
+        map_generation: u64,
+        map: &CarvedSwarmMap,
+        immune: &mut ImmuneSystem,
+    ) -> Result<(), ComplianceViolation> {
+        let stale = self
+            .process(role)
+            .map(|p| p.worker.map_generation != map_generation)
+            .unwrap_or(true);
+        if !stale {
+            return Ok(());
+        }
+        if let Some(proc) = self.processes[role.level() as usize].as_mut() {
+            proc.worker.memory_map = GeometricMemoryMap::new(proc.worker.memory_map.max_atoms);
+            proc.worker.memory_map.use_picard = false;
+        }
+        self.hydrate_worker_from_silo_with_adapter(role, 128, map, immune)?;
+        if let Some(proc) = self.processes[role.level() as usize].as_mut() {
+            proc.worker.map_generation = map_generation;
+        }
+        Ok(())
+    }
     pub fn new(
         strategy: RestartStrategy,
         intensity: RestartIntensity,
@@ -261,7 +291,14 @@ impl Governor {
         role: RoleId,
         map: &mut CarvedSwarmMap,
         immune: &mut ImmuneSystem,
-    ) -> Result<(EphemeralMapDeposit, DepositCompilationReceipt, CompliancePermit), ComplianceViolation> {
+    ) -> Result<
+        (
+            EphemeralMapDeposit,
+            DepositCompilationReceipt,
+            CompliancePermit,
+        ),
+        ComplianceViolation,
+    > {
         let proc = self.processes[role.level() as usize]
             .as_mut()
             .ok_or(ComplianceViolation::InvalidSpecialistRole(role))?;
@@ -312,7 +349,9 @@ impl Governor {
         immune: &mut ImmuneSystem,
     ) -> Result<Vec<RoleId>, ComplianceViolation> {
         self.current_tick += 1;
-        let cutoff = self.current_tick.saturating_sub(self.intensity.within_ticks);
+        let cutoff = self
+            .current_tick
+            .saturating_sub(self.intensity.within_ticks);
         self.restart_history_ticks.retain(|&t| t >= cutoff);
 
         let _sup_permit = immune.authorize_governor_supervision(
@@ -359,7 +398,9 @@ impl Governor {
                 .unwrap_or(false);
 
             if !was_dissolved {
-                let cutoff = self.current_tick.saturating_sub(self.intensity.within_ticks);
+                let cutoff = self
+                    .current_tick
+                    .saturating_sub(self.intensity.within_ticks);
                 self.restart_history_ticks.retain(|&t| t >= cutoff);
 
                 if self.restart_history_ticks.len() as u32 >= self.intensity.max_restarts {
@@ -416,14 +457,16 @@ impl Governor {
             self.step_supervision(map, immune)?;
         }
 
-        let (k_lv, k_phase, bridge_loss) =
-            f32_to_atom_address(k_head).map_err(|_| ComplianceViolation::SilentInformationLoss {
+        let (k_lv, k_phase, bridge_loss) = f32_to_atom_address(k_head).map_err(|_| {
+            ComplianceViolation::SilentInformationLoss {
                 stage: "core_lm::geometry::bridge::f32_to_atom_address(k_head)",
-            })?;
-        let (q_lv, q_phase, _) =
-            f32_to_atom_address(q_head).map_err(|_| ComplianceViolation::SilentInformationLoss {
+            }
+        })?;
+        let (q_lv, q_phase, _) = f32_to_atom_address(q_head).map_err(|_| {
+            ComplianceViolation::SilentInformationLoss {
                 stage: "core_lm::geometry::bridge::f32_to_atom_address(q_head)",
-            })?;
+            }
+        })?;
 
         let forward_permit =
             immune.authorize_forward_pass(role, token_id, pos, map, &bridge_loss)?;
@@ -480,8 +523,8 @@ impl Governor {
             }
         }
 
-        let probs =
-            softmax(&scores).unwrap_or_else(|_| vec![1.0 / scores.len().max(1) as f32; scores.len()]);
+        let probs = softmax(&scores)
+            .unwrap_or_else(|_| vec![1.0 / scores.len().max(1) as f32; scores.len()]);
         let mut attn_vec = vec![0.0f32; hd];
         for (p, vh) in probs.iter().zip(v_list.iter()) {
             for d in 0..hd.min(vh.len()) {

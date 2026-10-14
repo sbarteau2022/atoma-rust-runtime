@@ -8,13 +8,14 @@
 //! Distillation Engine** (`OpenWeightsDistillationEngine`).
 
 pub mod bridge;
+pub mod http_api;
 pub mod routing;
 pub mod swarm;
 
 use atoma_immune::cache::geometric::AtomId;
 use atoma_immune::geometry::fixed::Q32_31;
 use atoma_immune::{
-    AtomicIrAlphabet, Atlas13, CarveLossReport, CarvedSwarmMap, CompliancePermit,
+    Atlas13, AtomicIrAlphabet, CarveLossReport, CarvedSwarmMap, CompliancePermit,
     ComplianceViolation, DepositCompilationReceipt, EphemeralMapDeposit,
     FirstPrinciplesComplianceEngine, FirstPrinciplesComplianceReport, FrozenBaseWeights,
     FrozenShard, FullModelDistillationReceipt, GeodesicDecodeReceipt, GeodesicMlirDecoder,
@@ -29,8 +30,7 @@ use atoma_immune::{
 use routing::{DeliveredHandoff, HandoffRequest};
 use std::sync::Arc;
 use swarm::{
-    CrossEpochHydrationReceipt, GovernedForwardReceipt, Governor, RestartIntensity,
-    RestartStrategy,
+    CrossEpochHydrationReceipt, GovernedForwardReceipt, Governor, RestartIntensity, RestartStrategy,
 };
 
 /// Complete record of a single pass through steps 1–5 (`Distill → Refract → Carve → Silo`).
@@ -83,6 +83,8 @@ pub struct MonsterHybridServer {
     pub last_live_atom: Option<(AtomId, RoleId)>,
     /// Optional path to the persistent `.atoma_map` binary vault on disk.
     pub persistent_vault_path: Option<std::path::PathBuf>,
+    /// Monotonic centralized-map generation used to invalidate worker-local atom caches.
+    pub map_generation: u64,
 }
 
 impl MonsterHybridServer {
@@ -119,6 +121,7 @@ impl MonsterHybridServer {
             distillation_engine: OpenWeightsDistillationEngine::default(),
             last_live_atom: None,
             persistent_vault_path: None,
+            map_generation: 0,
         })
     }
 
@@ -142,16 +145,19 @@ impl MonsterHybridServer {
         ];
 
         let refracted = OpticalLens::refract(&projected, well.phase).map_err(|e| e.to_string())?;
-        let atom_id = self.swarm_map.keep_and_carve(
-            refracted,
-            tap.payload.clone(),
-            &self.immune.policy,
-        );
+        let atom_id =
+            self.swarm_map
+                .keep_and_carve(refracted, tap.payload.clone(), &self.immune.policy);
         let carve_loss = self.swarm_map.last_carve_loss.clone();
+        self.map_generation = self.map_generation.wrapping_add(1);
 
         let loss_permit = self
             .immune
-            .verify_loss_accounting(&projected.loss_report, &refracted.refraction_loss, &carve_loss)
+            .verify_loss_accounting(
+                &projected.loss_report,
+                &refracted.refraction_loss,
+                &carve_loss,
+            )
             .map_err(|e| e.to_string())?;
 
         Ok(DistillRefractCarveReceipt {
@@ -174,13 +180,15 @@ impl MonsterHybridServer {
         mode_width: usize,
         max_modes: usize,
     ) -> Result<WeightDistillationReceipt, String> {
-        self.distillation_engine.distill_static_weight_modes(
+        let receipt = self.distillation_engine.distill_static_weight_modes(
             teacher_weights,
             mode_width,
             max_modes,
             &mut self.swarm_map,
             &self.immune.policy,
-        )
+        )?;
+        self.mark_map_updated();
+        Ok(receipt)
     }
 
     /// Distill **Knowledge (`0-cells`)** directly from a **Quantized Layer Tensor** (`OptiQ` / `MLX`
@@ -193,13 +201,15 @@ impl MonsterHybridServer {
         top_k_rows: usize,
         teacher_fingerprint: atoma_immune::Sha256Digest,
     ) -> Result<QuantizedDistillationReceipt, String> {
-        self.distillation_engine.distill_quantized_layer_zero_copy(
+        let receipt = self.distillation_engine.distill_quantized_layer_zero_copy(
             desc,
             top_k_rows,
             teacher_fingerprint,
             &mut self.swarm_map,
             &self.immune.policy,
-        )
+        )?;
+        self.mark_map_updated();
+        Ok(receipt)
     }
 
     /// Automatically discover and distill all `OptiQ` / `MLX` quantized linear layers (`<prefix>.weight`,
@@ -211,13 +221,15 @@ impl MonsterHybridServer {
         top_k_rows_per_layer: usize,
         total_layers_hint: usize,
     ) -> Result<Vec<QuantizedDistillationReceipt>, String> {
-        self.distillation_engine.distill_safetensors_shard_bytes(
+        let receipts = self.distillation_engine.distill_safetensors_shard_bytes(
             file_bytes,
             top_k_rows_per_layer,
             total_layers_hint,
             &mut self.swarm_map,
             &self.immune.policy,
-        )
+        )?;
+        self.mark_map_updated();
+        Ok(receipts)
     }
 
     /// Stream and distill quantized layers (`2D` linear projections and `3D` MoE `switch_mlp` experts)
@@ -230,13 +242,17 @@ impl MonsterHybridServer {
         top_k_rows_per_layer: usize,
         max_layers: usize,
     ) -> Result<Vec<QuantizedDistillationReceipt>, String> {
-        self.distillation_engine.distill_safetensors_file_streaming(
-            safetensors_path,
-            top_k_rows_per_layer,
-            max_layers,
-            &mut self.swarm_map,
-            &self.immune.policy,
-        )
+        let receipts = self
+            .distillation_engine
+            .distill_safetensors_file_streaming(
+                safetensors_path,
+                top_k_rows_per_layer,
+                max_layers,
+                &mut self.swarm_map,
+                &self.immune.policy,
+            )?;
+        self.mark_map_updated();
+        Ok(receipts)
     }
 
     /// Full-model or shard distillation with **3-level novelty-only deduplication** (`0` duplicate noise)
@@ -251,7 +267,9 @@ impl MonsterHybridServer {
         if let Some(vp) = vault_path {
             self.persistent_vault_path = Some(vp.to_path_buf());
             if vp.exists() && self.swarm_map.ingested_tensor_digests.is_empty() {
-                let _ = self.swarm_map.load_from_binary_vault(vp, &self.immune.policy)?;
+                let _ = self
+                    .swarm_map
+                    .load_from_binary_vault(vp, &self.immune.policy)?;
             }
         }
 
@@ -287,14 +305,16 @@ impl MonsterHybridServer {
         };
 
         for sp in &shard_paths {
-            let (_recs, sub) = self.distillation_engine.distill_safetensors_file_novel_only(
-                sp,
-                top_k_rows_per_layer,
-                max_layers_per_shard,
-                &self.mlir_catalog,
-                &mut self.swarm_map,
-                &self.immune.policy,
-            )?;
+            let (_recs, sub) = self
+                .distillation_engine
+                .distill_safetensors_file_novel_only(
+                    sp,
+                    top_k_rows_per_layer,
+                    max_layers_per_shard,
+                    &self.mlir_catalog,
+                    &mut self.swarm_map,
+                    &self.immune.policy,
+                )?;
             total_summary.tensors_distilled += sub.tensors_distilled;
             total_summary.tensors_skipped_already_ingested += sub.tensors_skipped_already_ingested;
             total_summary.novel_atoms_minted += sub.novel_atoms_minted;
@@ -312,6 +332,7 @@ impl MonsterHybridServer {
             total_summary.vault_sha256 = Some(sha);
         }
 
+        self.mark_map_updated();
         Ok(total_summary)
     }
 
@@ -342,6 +363,9 @@ impl MonsterHybridServer {
         {
             let _ = self.swarm_map.save_to_binary_vault(vp);
         }
+        if receipt.atom_was_novel || receipt.arc_was_novel {
+            self.mark_map_updated();
+        }
         Ok(receipt)
     }
 
@@ -354,7 +378,7 @@ impl MonsterHybridServer {
         total_teacher_layers: usize,
         teacher_fingerprint: atoma_immune::Sha256Digest,
     ) -> Result<ReasoningChainDistillationReceipt, String> {
-        self.distillation_engine.distill_reasoning_chain(
+        let receipt = self.distillation_engine.distill_reasoning_chain(
             chain_id,
             teacher_steps,
             total_teacher_layers,
@@ -362,7 +386,9 @@ impl MonsterHybridServer {
             &self.mlir_catalog,
             &mut self.swarm_map,
             &self.immune.policy,
-        )
+        )?;
+        self.mark_map_updated();
+        Ok(receipt)
     }
 
     /// Execute `Agent → Govern → Immune-check` inter-role handoff through the single server door,
@@ -397,6 +423,12 @@ impl MonsterHybridServer {
         v_head: &[f32],
         o_proj_matrix: &[f32],
     ) -> Result<GovernedForwardReceipt, ComplianceViolation> {
+        self.governor.synchronize_worker_memory(
+            role,
+            self.map_generation,
+            &self.swarm_map,
+            &mut self.immune,
+        )?;
         self.governor.execute_governed_forward(
             role,
             token_id,
@@ -416,9 +448,21 @@ impl MonsterHybridServer {
     pub fn dissolve_agent_and_compile_deposit(
         &mut self,
         role: RoleId,
-    ) -> Result<(EphemeralMapDeposit, DepositCompilationReceipt, CompliancePermit), ComplianceViolation> {
-        self.governor
-            .dissolve_and_compile_deposit(role, &mut self.swarm_map, &mut self.immune)
+    ) -> Result<
+        (
+            EphemeralMapDeposit,
+            DepositCompilationReceipt,
+            CompliancePermit,
+        ),
+        ComplianceViolation,
+    > {
+        let receipt = self.governor.dissolve_and_compile_deposit(
+            role,
+            &mut self.swarm_map,
+            &mut self.immune,
+        )?;
+        self.mark_map_updated();
+        Ok(receipt)
     }
 
     /// Hot-swap a new pluggable model system into the server while preserving 100% of the
@@ -432,6 +476,7 @@ impl MonsterHybridServer {
             .immune
             .authorize_model_hot_swap(&new_weights, preserved)?;
         let receipt = self.swarm_map.hot_swap_model_backend(new_weights);
+        self.mark_map_updated();
         Ok((receipt, permit))
     }
 
@@ -499,11 +544,12 @@ impl MonsterHybridServer {
         let handoff = self.handoff_between_roles(from_role, to_role, shared_atom_id, wire_bytes)?;
 
         // Receiver decodes the binary MLIR_SSA wire payload directly and executes deterministically
-        let decoded_block = MlirSsaBlock::from_wire_bytes(&handoff.wire_packet.payload).map_err(|e| {
-            ComplianceViolation::InvalidMlirSsaBlock {
-                reason: e.to_string(),
-            }
-        })?;
+        let decoded_block =
+            MlirSsaBlock::from_wire_bytes(&handoff.wire_packet.payload).map_err(|e| {
+                ComplianceViolation::InvalidMlirSsaBlock {
+                    reason: e.to_string(),
+                }
+            })?;
         let result_q32 = decoded_block
             .execute_deterministic(&self.mlir_catalog, from_role)
             .map_err(|e| ComplianceViolation::InvalidMlirSsaBlock {
@@ -535,9 +581,15 @@ impl MonsterHybridServer {
     }
 
     /// Execute First-Principle Surgical Right-to-Erasure (`GDPR Art. 17`) across the 1 + 12 Carved Swarm.
-    pub fn surgical_erase(&mut self, atom_id: AtomId) -> Result<SurgicalErasureReceipt, &'static str> {
-        self.swarm_map
-            .surgical_erase_atom(atom_id, &self.immune.policy)
+    pub fn surgical_erase(
+        &mut self,
+        atom_id: AtomId,
+    ) -> Result<SurgicalErasureReceipt, &'static str> {
+        let receipt = self
+            .swarm_map
+            .surgical_erase_atom(atom_id, &self.immune.policy)?;
+        self.mark_map_updated();
+        Ok(receipt)
     }
 
     /// Prove all 8 first-principle invariants and all 5 statutory frameworks directly from live server state.
@@ -566,6 +618,7 @@ impl MonsterHybridServer {
             let (atoms, arcs, sha) = self
                 .swarm_map
                 .load_from_binary_vault(vault_path, &self.immune.policy)?;
+            self.map_generation = self.map_generation.wrapping_add(1);
             Ok((atoms, arcs, Some(sha)))
         } else {
             Ok((
@@ -574,6 +627,11 @@ impl MonsterHybridServer {
                 None,
             ))
         }
+    }
+
+    /// Marks centralized atoms as changed after an external mutation path.
+    pub fn mark_map_updated(&mut self) {
+        self.map_generation = self.map_generation.wrapping_add(1);
     }
 
     /// Execute a full Geodesic Query against the in-memory `CarvedSwarmMap`:
@@ -886,4 +944,3 @@ pub struct SwarmMapQueryResult {
     pub holonomy_flux_rad_q32: Q32_31,
     pub live_ingest: Option<LiveNoveltyDistillationReceipt>,
 }
-

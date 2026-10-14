@@ -813,6 +813,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let learn_query = args.iter().any(|a| a == "--learn-query");
 
     // 1. One-shot or multi-query CLI flag: `--query "<text>"`
+    // Load vault first if --query is present
+    if args.iter().any(|a| a == "--query") {
+        if vault_path.exists() {
+            eprintln!("[info] Loading vault from {}...", vault_path.display());
+            server.load_or_init_persistent_vault(&vault_path)?;
+            eprintln!("[info] Vault loaded.");
+        }
+    }
     for (idx, arg) in args.iter().enumerate() {
         if arg == "--query" {
             if let Some(q_text) = args.get(idx + 1) {
