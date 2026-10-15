@@ -1,0 +1,276 @@
+{
+  "baseline_step_ms": 1768.922541,
+  "coupled_vault": "/Users/stewartbarteau/Desktop/monster-hybrid-server/design/glimmer_52l_map_native.atoma_map",
+  "coupled_vault_0cells": 208,
+  "coupled_vault_1cells": 27,
+  "coupled_vault_sha256": "bedf698bba78e81c64217ec2ce485fa2f0377332f5c6b372abd5f5a4086ffdb0",
+  "model": "/Users/stewartbarteau/models/Muse-Glimmer-q4km-gs128-MLX",
+  "phase2_and_phase3_scaling": [
+    {
+      "coupled_bf16": {
+        "final_hidden_cosine": 0.9999999390051516,
+        "final_hidden_relative_l2": 0.00034934296493561133,
+        "layers_latency_ms": 0.438792,
+        "logit_relative_l2": 0.00036805587183294183,
+        "top1_agreement": true,
+        "top1_token": 262,
+        "top5_overlap": 5
+      },
+      "coupled_f32": {
+        "final_hidden_cosine": 0.9999999999999823,
+        "final_hidden_relative_l2": 1.6840154585115728e-7,
+        "layers_latency_ms": 0.446958,
+        "logit_relative_l2": 2.9638070793270147e-7,
+        "top1_agreement": true,
+        "top1_token": 262,
+        "top5_overlap": 5
+      },
+      "replaced_layers_count": 1,
+      "scale_label": "1_layer (L20, 1.9%)",
+      "total_layers": 52,
+      "uncoupled_raw_weight_control": {
+        "final_hidden_cosine": 0.9824763230996906,
+        "final_hidden_relative_l2": 0.18980810514743163,
+        "logit_relative_l2": 0.20571776836935904,
+        "top1_agreement": true,
+        "top1_token": 262
+      }
+    },
+    {
+      "coupled_bf16": {
+        "final_hidden_cosine": 0.9999998004503828,
+        "final_hidden_relative_l2": 0.0006364907216400536,
+        "layers_latency_ms": 0.45525,
+        "logit_relative_l2": 0.0006684821122315682,
+        "top1_agreement": true,
+        "top1_token": 262,
+        "top5_overlap": 5
+      },
+      "coupled_f32": {
+        "final_hidden_cosine": 0.9999999999999709,
+        "final_hidden_relative_l2": 2.583133485785588e-7,
+        "layers_latency_ms": 0.481125,
+        "logit_relative_l2": 2.9958884865291084e-7,
+        "top1_agreement": true,
+        "top1_token": 262,
+        "top5_overlap": 5
+      },
+      "replaced_layers_count": 4,
+      "scale_label": "4_layers (L10,20,30,40, 7.7%)",
+      "total_layers": 52,
+      "uncoupled_raw_weight_control": {
+        "final_hidden_cosine": 0.9261531409736868,
+        "final_hidden_relative_l2": 0.37978040668849566,
+        "logit_relative_l2": 0.45076418776063,
+        "top1_agreement": false,
+        "top1_token": 290
+      }
+    },
+    {
+      "coupled_bf16": {
+        "final_hidden_cosine": 0.9999993852938681,
+        "final_hidden_relative_l2": 0.001314981702790962,
+        "layers_latency_ms": 0.5198750000000001,
+        "logit_relative_l2": 0.0011989753483978107,
+        "top1_agreement": true,
+        "top1_token": 262,
+        "top5_overlap": 5
+      },
+      "coupled_f32": {
+        "final_hidden_cosine": 0.9999999999999805,
+        "final_hidden_relative_l2": 2.4539010369290133e-7,
+        "layers_latency_ms": 0.577333,
+        "logit_relative_l2": 3.093536578974225e-7,
+        "top1_agreement": true,
+        "top1_token": 262,
+        "top5_overlap": 5
+      },
+      "replaced_layers_count": 13,
+      "scale_label": "13_layers (Every 4th, 25.0%)",
+      "total_layers": 52,
+      "uncoupled_raw_weight_control": {
+        "final_hidden_cosine": 0.5090842715753121,
+        "final_hidden_relative_l2": 0.921317628171914,
+        "logit_relative_l2": 1.0214566807399288,
+        "top1_agreement": false,
+        "top1_token": 170821
+      }
+    },
+    {
+      "coupled_bf16": {
+        "final_hidden_cosine": 0.9999985561631648,
+        "final_hidden_relative_l2": 0.0025489896249413055,
+        "layers_latency_ms": 0.625125,
+        "logit_relative_l2": 0.001890395781873166,
+        "top1_agreement": true,
+        "top1_token": 262,
+        "top5_overlap": 5
+      },
+      "coupled_f32": {
+        "final_hidden_cosine": 0.9999999999999817,
+        "final_hidden_relative_l2": 1.6647721468920053e-7,
+        "layers_latency_ms": 0.742625,
+        "logit_relative_l2": 2.968205166645142e-7,
+        "top1_agreement": true,
+        "top1_token": 262,
+        "top5_overlap": 5
+      },
+      "replaced_layers_count": 26,
+      "scale_label": "26_layers (Every 2nd, 50.0%)",
+      "total_layers": 52,
+      "uncoupled_raw_weight_control": {
+        "final_hidden_cosine": 0.3282012971013635,
+        "final_hidden_relative_l2": 0.9580669523387484,
+        "logit_relative_l2": 1.2482020294884995,
+        "top1_agreement": false,
+        "top1_token": 170821
+      }
+    },
+    {
+      "coupled_bf16": {
+        "final_hidden_cosine": 0.9999979599349091,
+        "final_hidden_relative_l2": 0.002950304229249219,
+        "layers_latency_ms": 0.7160829999999999,
+        "logit_relative_l2": 0.0022270418376098694,
+        "top1_agreement": true,
+        "top1_token": 262,
+        "top5_overlap": 5
+      },
+      "coupled_f32": {
+        "final_hidden_cosine": 0.9999999999999845,
+        "final_hidden_relative_l2": 1.4197634872235864e-7,
+        "layers_latency_ms": 0.896125,
+        "logit_relative_l2": 2.797282984398247e-7,
+        "top1_agreement": true,
+        "top1_token": 262,
+        "top5_overlap": 5
+      },
+      "replaced_layers_count": 39,
+      "scale_label": "39_layers (3 of 4, 75.0%)",
+      "total_layers": 52,
+      "uncoupled_raw_weight_control": {
+        "final_hidden_cosine": 0.027915977095616912,
+        "final_hidden_relative_l2": 1.0063431247450212,
+        "logit_relative_l2": 1.4384273610679947,
+        "top1_agreement": false,
+        "top1_token": 99588
+      }
+    },
+    {
+      "coupled_bf16": {
+        "final_hidden_cosine": 0.999996942570629,
+        "final_hidden_relative_l2": 0.0034346021345708407,
+        "layers_latency_ms": 0.771417,
+        "logit_relative_l2": 0.0025833763340842595,
+        "top1_agreement": true,
+        "top1_token": 262,
+        "top5_overlap": 5
+      },
+      "coupled_f32": {
+        "final_hidden_cosine": 0.9999999999999873,
+        "final_hidden_relative_l2": 1.3844141121701336e-7,
+        "layers_latency_ms": 1.0345840000000002,
+        "logit_relative_l2": 2.8152337691265954e-7,
+        "top1_agreement": true,
+        "top1_token": 262,
+        "top5_overlap": 5
+      },
+      "replaced_layers_count": 52,
+      "scale_label": "52_layers_FULL_WEIGHTLESS (100.0%)",
+      "total_layers": 52,
+      "uncoupled_raw_weight_control": {
+        "final_hidden_cosine": 0.013799900287085413,
+        "final_hidden_relative_l2": 1.0083987573417692,
+        "logit_relative_l2": 1.4478577214820654,
+        "top1_agreement": false,
+        "top1_token": 99588
+      }
+    }
+  ],
+  "phase4_corpus_multi_chart": {
+    "heldout_chart_interpolation_l20": {
+      "multi_chart_k8_attn_cosine": 0.9999602198267235,
+      "multi_chart_k8_out_relative_l2": 0.003659267153832639,
+      "single_chart_k1_attn_cosine": 0.9999602130736592,
+      "single_chart_k1_out_relative_l2": 0.0036595556908544484
+    },
+    "idempotent_replay_coalesced": 208,
+    "idempotent_replay_latency_ms": 3.9719589999999996,
+    "idempotent_replay_novel_minted": 0,
+    "multi_prompt_weightless_results": [
+      {
+        "baseline_token_id": 262,
+        "bf16_final_h_cosine": 0.999996942570629,
+        "bf16_final_h_relative_l2": 0.0034346021345708407,
+        "bf16_logit_relative_l2": 0.0025833763340842595,
+        "coalesced_atoms": 0,
+        "domain": "Geography/Factual",
+        "f32_final_h_relative_l2": 1.3844141121701336e-7,
+        "f32_logit_relative_l2": 2.8152337691265954e-7,
+        "novel_atoms_minted": 52,
+        "predicted_token_id": 262,
+        "predicted_token_text": " a",
+        "prompt": "The capital of France is",
+        "token_id": 373,
+        "top1_agreement": true,
+        "top5_overlap": 5,
+        "weightless_52l_stack_ms": 2.181292
+      },
+      {
+        "baseline_token_id": 13266,
+        "bf16_final_h_cosine": 0.9999983296145467,
+        "bf16_final_h_relative_l2": 0.002848965003084822,
+        "bf16_logit_relative_l2": 0.001533723722373967,
+        "coalesced_atoms": 0,
+        "domain": "Systems/Rust",
+        "f32_final_h_relative_l2": 3.1635973202064896e-7,
+        "f32_logit_relative_l2": 2.725037674405183e-7,
+        "novel_atoms_minted": 52,
+        "predicted_token_id": 13266,
+        "predicted_token_text": "\r\n",
+        "prompt": "fn main() -> Result<(), Error> {",
+        "token_id": 367,
+        "top1_agreement": true,
+        "top5_overlap": 5,
+        "weightless_52l_stack_ms": 2.17075
+      },
+      {
+        "baseline_token_id": 24,
+        "bf16_final_h_cosine": 0.99999403674882,
+        "bf16_final_h_relative_l2": 0.0034535462125840485,
+        "bf16_logit_relative_l2": 0.003033726498882624,
+        "coalesced_atoms": 0,
+        "domain": "Geometry/Math",
+        "f32_final_h_relative_l2": 2.6205872080668884e-7,
+        "f32_logit_relative_l2": 3.144141521589641e-7,
+        "novel_atoms_minted": 52,
+        "predicted_token_id": 24,
+        "predicted_token_text": ",",
+        "prompt": "The hyperbolic metric on Poincare ball",
+        "token_id": 8176,
+        "top1_agreement": true,
+        "top5_overlap": 5,
+        "weightless_52l_stack_ms": 2.104709
+      },
+      {
+        "baseline_token_id": 24,
+        "bf16_final_h_cosine": 0.9999977844319711,
+        "bf16_final_h_relative_l2": 0.002115477781818041,
+        "bf16_logit_relative_l2": 0.0029282974800958414,
+        "coalesced_atoms": 0,
+        "domain": "Security/CWE",
+        "f32_final_h_relative_l2": 2.5324329328401527e-7,
+        "f32_logit_relative_l2": 3.3362855183224686e-7,
+        "novel_atoms_minted": 52,
+        "predicted_token_id": 24,
+        "predicted_token_text": ",",
+        "prompt": "Buffer overflow vulnerability in CWE-787",
+        "token_id": 42727,
+        "top1_agreement": true,
+        "top5_overlap": 5,
+        "weightless_52l_stack_ms": 2.112
+      }
+    ],
+    "prompts_distilled": 4
+  }
+}

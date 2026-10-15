@@ -5,8 +5,17 @@ edition = "2024"
 description = "Layer 2 Governor, Zero-Copy Bridge, and Full 7-Step Carved Swarm Server"
 
 [dependencies]
+core_lm = { path = "../core_lm", optional = true }
 atoma_immune = { path = "../immune_system/implementation" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rustls = "0.23"
 rustls-pemfile = "2.2"
+
+[features]
+glimmer = ["dep:core_lm"]
+
+[[bin]]
+name = "qualify_map_glimmer"
+path = "src/bin/qualify_map_glimmer.rs"
+required-features = ["glimmer"]

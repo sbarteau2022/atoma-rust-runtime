@@ -354,7 +354,9 @@ fn tau_of(best: &[(f64, u64)], k: usize) -> f64 {
     if best.len() < k {
         f64::INFINITY
     } else {
-        best.last().map(|(distance, _)| *distance).unwrap_or(f64::INFINITY)
+        best.last()
+            .map(|(distance, _)| *distance)
+            .unwrap_or(f64::INFINITY)
     }
 }
 
@@ -448,7 +450,11 @@ mod tests {
             Q32_31::from_f64(angle.sin()),
             Q32_31::ZERO,
         ];
-        LorentzVector::boost(&LorentzVector::origin(), &n, Q32_31::from_f64(0.15 + i as f64 * 0.01))
+        LorentzVector::boost(
+            &LorentzVector::origin(),
+            &n,
+            Q32_31::from_f64(0.15 + i as f64 * 0.01),
+        )
     }
 
     #[test]

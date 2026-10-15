@@ -165,12 +165,10 @@ impl QuotientManifoldProof {
         let mut reachable_count = 0usize;
         for n_idx in 0..12u64 {
             for m_idx in 0..12u64 {
-                let tf =
-                    (((n_idx * width_u64 + width_u64 / 2) as i64).wrapping_sub(PI_UNIT) as i32)
-                        as i64;
-                let ts =
-                    (((m_idx * width_u64 + width_u64 / 2) as i64).wrapping_sub(PI_UNIT) as i32)
-                        as i64;
+                let tf = (((n_idx * width_u64 + width_u64 / 2) as i64).wrapping_sub(PI_UNIT) as i32)
+                    as i64;
+                let ts = (((m_idx * width_u64 + width_u64 / 2) as i64).wrapping_sub(PI_UNIT) as i32)
+                    as i64;
                 let inv = extract_invariant(tf, ts);
                 if !grid[inv.n as usize][inv.m as usize] {
                     grid[inv.n as usize][inv.m as usize] = true;
@@ -1360,8 +1358,9 @@ mod tests {
         assert_eq!(b_origin, Q32_31::HALF); // B(0) = 0.50
 
         let atlas = Atlas13::approved_icosahedral();
-        let b_shell =
-            OpticalRiskEngine::optical_blast_radius_q32(&atlas.well(RoleId::SensoryPerception).lorentz_well);
+        let b_shell = OpticalRiskEngine::optical_blast_radius_q32(
+            &atlas.well(RoleId::SensoryPerception).lorentz_well,
+        );
         // At r = 0.382, B = (1 - 0.382^2)/2 = 0.427038
         assert!((b_shell.to_f64() - 0.427038).abs() < 1e-5);
         assert!(b_shell < b_origin);

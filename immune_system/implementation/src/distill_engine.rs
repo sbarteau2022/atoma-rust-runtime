@@ -156,7 +156,11 @@ impl OpenWeightsDistillationEngine {
                 | RoleId::SomaticInteroception
                 | RoleId::LanguageSemiotics
                 | RoleId::SpatialTopography => {
-                    if depth_ratio < 0.34 { 0.35 } else { 0.0 }
+                    if depth_ratio < 0.34 {
+                        0.35
+                    } else {
+                        0.0
+                    }
                 }
                 RoleId::EpisodicMemory
                 | RoleId::PredictiveSimulation
@@ -169,10 +173,12 @@ impl OpenWeightsDistillationEngine {
                         0.0
                     }
                 }
-                RoleId::MotorPraxis
-                | RoleId::SocialCognition
-                | RoleId::MetacognitiveRegulation => {
-                    if depth_ratio >= 0.68 { 0.35 } else { 0.0 }
+                RoleId::MotorPraxis | RoleId::SocialCognition | RoleId::MetacognitiveRegulation => {
+                    if depth_ratio >= 0.68 {
+                        0.35
+                    } else {
+                        0.0
+                    }
                 }
                 RoleId::Coordinator => 0.0,
             };
@@ -401,9 +407,12 @@ impl OpenWeightsDistillationEngine {
 
         // Synthesize the native typed MLIR SSA program for the kept reasoning steps
         let primary_role = role_sequence[0];
-        let geo_decode =
-            GeodesicMlirDecoder::decode_from_hidden_states(mlir_catalog, primary_role, &kept_states)
-                .map_err(|e| e.to_string())?;
+        let geo_decode = GeodesicMlirDecoder::decode_from_hidden_states(
+            mlir_catalog,
+            primary_role,
+            &kept_states,
+        )
+        .map_err(|e| e.to_string())?;
 
         // Build directed 1-cell DistilledReasoningArcs with Levi-Civita Wigner parallel transport
         let mut current_wigner = IDENTITY_FRAME_Q32;
@@ -511,7 +520,11 @@ impl OpenWeightsDistillationEngine {
         map: &mut CarvedSwarmMap,
         policy: &OverlapPolicyMatrix,
     ) -> Result<QuantizedDistillationReceipt, String> {
-        if desc.rows == 0 || desc.cols == 0 || desc.group_size == 0 || desc.cols % desc.group_size != 0 {
+        if desc.rows == 0
+            || desc.cols == 0
+            || desc.group_size == 0
+            || desc.cols % desc.group_size != 0
+        {
             return Err("Invalid quantized tensor dimensions or group_size".to_string());
         }
         let k = top_k_rows.min(desc.rows).max(1);
@@ -532,8 +545,10 @@ impl OpenWeightsDistillationEngine {
                 .unwrap_or(1.0) as f64;
             let mut energy_est = 0.0f64;
             for g in 0..groups_per_row {
-                let s = read_quant_scale_f64(desc.scales_data, desc.scales_dtype, row_group_base + g)?;
-                let b = read_quant_scale_f64(desc.biases_data, desc.biases_dtype, row_group_base + g)?;
+                let s =
+                    read_quant_scale_f64(desc.scales_data, desc.scales_dtype, row_group_base + g)?;
+                let b =
+                    read_quant_scale_f64(desc.biases_data, desc.biases_dtype, row_group_base + g)?;
                 let group_mean = q_mean * s + b;
                 let group_var = q_var * s * s;
                 energy_est += (desc.group_size as f64) * (group_mean * group_mean + group_var);
@@ -542,7 +557,11 @@ impl OpenWeightsDistillationEngine {
         }
 
         // Sort descending by analytical spectral energy and take top_k_rows
-        row_scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1)));
+        row_scores.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
 
         let mut selected_row_indices = Vec::with_capacity(k);
         let mut minted_atom_ids = Vec::with_capacity(k);
@@ -576,7 +595,11 @@ impl OpenWeightsDistillationEngine {
                 let g_start = (b_idx * band_groups).min(groups_per_row);
                 let g_end = ((b_idx + 1) * band_groups).min(groups_per_row);
                 for g in g_start..g_end {
-                    let s = read_quant_scale_f64(desc.scales_data, desc.scales_dtype, row_group_base + g)? as f32;
+                    let s = read_quant_scale_f64(
+                        desc.scales_data,
+                        desc.scales_dtype,
+                        row_group_base + g,
+                    )? as f32;
                     band_e[b_idx] += s * s;
                 }
             }
@@ -628,12 +651,8 @@ impl OpenWeightsDistillationEngine {
 
             let refracted =
                 OpticalLens::refract(&projected, well.phase).map_err(|e| e.to_string())?;
-            let atom_id = map.keep_and_carve_with_origin(
-                refracted,
-                tap.payload,
-                teacher_fingerprint,
-                policy,
-            );
+            let atom_id =
+                map.keep_and_carve_with_origin(refracted, tap.payload, teacher_fingerprint, policy);
 
             selected_row_indices.push(r);
             minted_atom_ids.push(atom_id);
@@ -743,7 +762,15 @@ pub struct RawSafeTensorEntry {
 }
 
 /// Parse the 8-byte little-endian header of a `.safetensors` file buffer without external JSON crates.
-pub fn parse_safetensors_header(file_bytes: &[u8]) -> Result<(usize, std::collections::BTreeMap<String, RawSafeTensorEntry>), String> {
+pub fn parse_safetensors_header(
+    file_bytes: &[u8],
+) -> Result<
+    (
+        usize,
+        std::collections::BTreeMap<String, RawSafeTensorEntry>,
+    ),
+    String,
+> {
     if file_bytes.len() < 8 {
         return Err("Safetensors buffer shorter than 8-byte header".to_string());
     }
@@ -761,14 +788,20 @@ pub fn parse_safetensors_header(file_bytes: &[u8]) -> Result<(usize, std::collec
 
     while pos < bytes.len() {
         // Find next top-level key `"name": {`
-        let Some(q1_rel) = header_str[pos..].find('"') else { break };
+        let Some(q1_rel) = header_str[pos..].find('"') else {
+            break;
+        };
         let k_start = pos + q1_rel + 1;
-        let Some(q2_rel) = header_str[k_start..].find('"') else { break };
+        let Some(q2_rel) = header_str[k_start..].find('"') else {
+            break;
+        };
         let k_end = k_start + q2_rel;
         let key = &header_str[k_start..k_end];
         pos = k_end + 1;
 
-        let Some(brace_open_rel) = header_str[pos..].find('{') else { break };
+        let Some(brace_open_rel) = header_str[pos..].find('{') else {
+            break;
+        };
         let obj_start = pos + brace_open_rel + 1;
         // Find matching closing brace (handling nested metadata objects)
         let mut depth = 1i32;
@@ -789,9 +822,15 @@ pub fn parse_safetensors_header(file_bytes: &[u8]) -> Result<(usize, std::collec
         }
 
         // Extract dtype, shape, and data_offsets from obj_body
-        let Some(dtype) = extract_json_str_field(obj_body, "\"dtype\"") else { continue };
-        let Some(shape) = extract_json_usize_array(obj_body, "\"shape\"") else { continue };
-        let Some(offsets) = extract_json_usize_array(obj_body, "\"data_offsets\"") else { continue };
+        let Some(dtype) = extract_json_str_field(obj_body, "\"dtype\"") else {
+            continue;
+        };
+        let Some(shape) = extract_json_usize_array(obj_body, "\"shape\"") else {
+            continue;
+        };
+        let Some(offsets) = extract_json_usize_array(obj_body, "\"data_offsets\"") else {
+            continue;
+        };
         if offsets.len() == 2 {
             map.insert(
                 key.to_string(),
@@ -851,7 +890,9 @@ impl OpenWeightsDistillationEngine {
         let mut receipts = Vec::new();
 
         for (name, w_info) in &tensors {
-            let Some(prefix) = name.strip_suffix(".weight") else { continue };
+            let Some(prefix) = name.strip_suffix(".weight") else {
+                continue;
+            };
             if w_info.dtype != "U32" && w_info.dtype != "U8" {
                 continue;
             }
@@ -860,8 +901,12 @@ impl OpenWeightsDistillationEngine {
             }
             let scales_name = format!("{prefix}.scales");
             let biases_name = format!("{prefix}.biases");
-            let Some(s_info) = tensors.get(&scales_name) else { continue };
-            let Some(b_info) = tensors.get(&biases_name) else { continue };
+            let Some(s_info) = tensors.get(&scales_name) else {
+                continue;
+            };
+            let Some(b_info) = tensors.get(&biases_name) else {
+                continue;
+            };
             if s_info.shape.len() != 2 || b_info.shape.len() != 2 {
                 continue;
             }
@@ -873,7 +918,11 @@ impl OpenWeightsDistillationEngine {
                 continue;
             }
 
-            let word_bits = if w_info.dtype == "U32" { 32usize } else { 8usize };
+            let word_bits = if w_info.dtype == "U32" {
+                32usize
+            } else {
+                8usize
+            };
             let total_row_bits = packed_cols * word_bits;
 
             // Infer (bits, group_size, cols) from packed_cols and groups_per_row
@@ -888,7 +937,9 @@ impl OpenWeightsDistillationEngine {
                     }
                 }
             }
-            let Some((bits, group_size, cols)) = inferred else { continue };
+            let Some((bits, group_size, cols)) = inferred else {
+                continue;
+            };
 
             // Extract layer_index from tensor prefix (e.g. `model.layers.14.mlp.down_proj`)
             let layer_index = prefix
@@ -896,23 +947,28 @@ impl OpenWeightsDistillationEngine {
                 .find_map(|seg| seg.parse::<usize>().ok())
                 .unwrap_or(0);
 
-            let w_bytes = &file_bytes[data_start + w_info.data_offsets.0..data_start + w_info.data_offsets.1];
-            let s_bytes = &file_bytes[data_start + s_info.data_offsets.0..data_start + s_info.data_offsets.1];
-            let b_bytes = &file_bytes[data_start + b_info.data_offsets.0..data_start + b_info.data_offsets.1];
+            let w_bytes =
+                &file_bytes[data_start + w_info.data_offsets.0..data_start + w_info.data_offsets.1];
+            let s_bytes =
+                &file_bytes[data_start + s_info.data_offsets.0..data_start + s_info.data_offsets.1];
+            let b_bytes =
+                &file_bytes[data_start + b_info.data_offsets.0..data_start + b_info.data_offsets.1];
 
             let out_scale_name = format!("{prefix}.out_scale");
-            let out_scale_vec: Option<Vec<f32>> = tensors.get(&out_scale_name).and_then(|os_info| {
-                if os_info.dtype == "F32" && os_info.shape.first().copied() == Some(rows) {
-                    let raw = &file_bytes[data_start + os_info.data_offsets.0..data_start + os_info.data_offsets.1];
-                    Some(
-                        raw.chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect(),
-                    )
-                } else {
-                    None
-                }
-            });
+            let out_scale_vec: Option<Vec<f32>> =
+                tensors.get(&out_scale_name).and_then(|os_info| {
+                    if os_info.dtype == "F32" && os_info.shape.first().copied() == Some(rows) {
+                        let raw = &file_bytes[data_start + os_info.data_offsets.0
+                            ..data_start + os_info.data_offsets.1];
+                        Some(
+                            raw.chunks_exact(4)
+                                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    }
+                });
 
             let desc = QuantizedLayerTapDescriptor {
                 tensor_name: name,
@@ -989,7 +1045,13 @@ impl OpenWeightsDistillationEngine {
         mlir_catalog: &MlirAtomCatalog,
         map: &mut CarvedSwarmMap,
         policy: &OverlapPolicyMatrix,
-    ) -> Result<(Vec<QuantizedDistillationReceipt>, FullModelDistillationReceipt), String> {
+    ) -> Result<
+        (
+            Vec<QuantizedDistillationReceipt>,
+            FullModelDistillationReceipt,
+        ),
+        String,
+    > {
         use std::io::{Read, Seek, SeekFrom};
 
         let mut file = std::fs::File::open(safetensors_path)
@@ -1027,8 +1089,10 @@ impl OpenWeightsDistillationEngine {
 
         // Track best (certainty, atom_id, role, hidden_state_128d) per transformer layer_index
         // so we can synthesize cross-layer 1-cell reasoning arcs across the shard!
-        let mut layer_anchors: std::collections::BTreeMap<usize, (Q32_31, AtomId, RoleId, Vec<f32>)> =
-            std::collections::BTreeMap::new();
+        let mut layer_anchors: std::collections::BTreeMap<
+            usize,
+            (Q32_31, AtomId, RoleId, Vec<f32>),
+        > = std::collections::BTreeMap::new();
 
         let max_screen_budget = 256usize;
 
@@ -1036,24 +1100,37 @@ impl OpenWeightsDistillationEngine {
             if receipts.len() >= max_layers {
                 break;
             }
-            let Some(prefix) = name.strip_suffix(".weight") else { continue };
+            let Some(prefix) = name.strip_suffix(".weight") else {
+                continue;
+            };
             if w_info.dtype != "U32" && w_info.dtype != "U8" {
                 continue;
             }
             let scales_name = format!("{prefix}.scales");
             let biases_name = format!("{prefix}.biases");
-            let Some(s_info) = tensors.get(&scales_name) else { continue };
-            let Some(b_info) = tensors.get(&biases_name) else { continue };
-
-            let (total_rows, packed_cols, groups_per_row) = match (w_info.shape.as_slice(), s_info.shape.as_slice()) {
-                (&[r, pc], &[sr, gpr]) if r > 0 && gpr > 0 && r == sr => (r, pc, gpr),
-                (&[e, r, pc], &[se, sr, gpr]) if e > 0 && r > 0 && gpr > 0 && e == se && r == sr => {
-                    (e * r, pc, gpr)
-                }
-                _ => continue,
+            let Some(s_info) = tensors.get(&scales_name) else {
+                continue;
+            };
+            let Some(b_info) = tensors.get(&biases_name) else {
+                continue;
             };
 
-            let word_bytes = if w_info.dtype == "U32" { 4usize } else { 1usize };
+            let (total_rows, packed_cols, groups_per_row) =
+                match (w_info.shape.as_slice(), s_info.shape.as_slice()) {
+                    (&[r, pc], &[sr, gpr]) if r > 0 && gpr > 0 && r == sr => (r, pc, gpr),
+                    (&[e, r, pc], &[se, sr, gpr])
+                        if e > 0 && r > 0 && gpr > 0 && e == se && r == sr =>
+                    {
+                        (e * r, pc, gpr)
+                    }
+                    _ => continue,
+                };
+
+            let word_bytes = if w_info.dtype == "U32" {
+                4usize
+            } else {
+                1usize
+            };
             let word_bits = word_bytes * 8;
             let total_row_bits = packed_cols * word_bits;
 
@@ -1107,7 +1184,11 @@ impl OpenWeightsDistillationEngine {
             let screen_count = total_rows.min(max_screen_budget);
             let row_stride = (total_rows / screen_count.max(1)).max(1);
             let k = top_k_rows_per_layer.min(screen_count).max(1);
-            let scale_elem_bytes = if s_info.dtype == "F32" { 4usize } else { 2usize };
+            let scale_elem_bytes = if s_info.dtype == "F32" {
+                4usize
+            } else {
+                2usize
+            };
             let row_scale_bytes = groups_per_row * scale_elem_bytes;
 
             // Read the full or prefix scale/bias slab covering the stratified rows
@@ -1237,7 +1318,10 @@ impl OpenWeightsDistillationEngine {
                 let kv_floats = 64usize;
                 let mut payload = Vec::with_capacity(kv_floats * 4);
                 for i in 0..kv_floats {
-                    let v = dequant_row.get(i % dequant_row.len()).copied().unwrap_or(0.0);
+                    let v = dequant_row
+                        .get(i % dequant_row.len())
+                        .copied()
+                        .unwrap_or(0.0);
                     payload.extend_from_slice(&v.to_le_bytes());
                 }
 
@@ -1348,8 +1432,12 @@ impl OpenWeightsDistillationEngine {
             for step in 0..ordered.len() - 1 {
                 let (_, _, from_atom, from_role, _) = ordered[step];
                 let (_, to_cert, to_atom, to_role, _) = ordered[step + 1];
-                let Some(from_lor) = map.global_atom(from_atom).map(|a| a.lorentz) else { continue };
-                let Some(to_lor) = map.global_atom(to_atom).map(|a| a.lorentz) else { continue };
+                let Some(from_lor) = map.global_atom(from_atom).map(|a| a.lorentz) else {
+                    continue;
+                };
+                let Some(to_lor) = map.global_atom(to_atom).map(|a| a.lorentz) else {
+                    continue;
+                };
                 let cosh_action = OpticalLens::lorentz_inner_product_wide(&from_lor, &to_lor);
                 current_wigner = HyperbolicHolonomyEngine::transport_frame_hop(
                     &from_lor,
@@ -1362,20 +1450,21 @@ impl OpenWeightsDistillationEngine {
                     .map(|inst| inst.op_id)
                     .unwrap_or(MlirOpId(mlir_catalog.base_vocab_size));
 
-                let (_arc_id, is_novel_arc) = map.record_novel_reasoning_arc(DistilledReasoningArc {
-                    arc_id: 0,
-                    chain_id,
-                    step_index: step,
-                    from_atom,
-                    to_atom,
-                    from_role,
-                    to_role,
-                    cosh_action_q32: cosh_action,
-                    wigner_frame: current_wigner,
-                    compiled_mlir_op: compiled_op,
-                    teacher_certainty_q32: to_cert,
-                    origin_model_fingerprint: shard_fingerprint,
-                });
+                let (_arc_id, is_novel_arc) =
+                    map.record_novel_reasoning_arc(DistilledReasoningArc {
+                        arc_id: 0,
+                        chain_id,
+                        step_index: step,
+                        from_atom,
+                        to_atom,
+                        from_role,
+                        to_role,
+                        cosh_action_q32: cosh_action,
+                        wigner_frame: current_wigner,
+                        compiled_mlir_op: compiled_op,
+                        teacher_certainty_q32: to_cert,
+                        origin_model_fingerprint: shard_fingerprint,
+                    });
                 if is_novel_arc {
                     summary.novel_reasoning_arcs_minted += 1;
                 } else {
@@ -1439,8 +1528,7 @@ impl OpenWeightsDistillationEngine {
             (well.unit_dir[2] * d_sph) + offset[2],
         ];
 
-        let refracted =
-            OpticalLens::refract(&projected, well.phase).map_err(|e| e.to_string())?;
+        let refracted = OpticalLens::refract(&projected, well.phase).map_err(|e| e.to_string())?;
         let (atom_id, atom_was_novel) = map.keep_and_carve_novel_only(
             refracted,
             tap.payload.clone(),
@@ -1537,7 +1625,11 @@ pub struct LiveNoveltyDistillationReceipt {
 
 fn load_checkpoint_quant_overrides(
     parent_dir: Option<&std::path::Path>,
-) -> (std::collections::BTreeMap<String, (u32, usize)>, Option<usize>, usize) {
+) -> (
+    std::collections::BTreeMap<String, (u32, usize)>,
+    Option<usize>,
+    usize,
+) {
     let mut map = std::collections::BTreeMap::new();
     let mut default_gs = None;
     let mut total_layers = 64usize;
@@ -1579,13 +1671,20 @@ fn extract_json_usize_scalar(body: &str, field: &str) -> Option<usize> {
     after_colon[..num_end].parse::<usize>().ok()
 }
 
-fn parse_nested_quant_blocks(text: &str, out: &mut std::collections::BTreeMap<String, (u32, usize)>) {
+fn parse_nested_quant_blocks(
+    text: &str,
+    out: &mut std::collections::BTreeMap<String, (u32, usize)>,
+) {
     let bytes = text.as_bytes();
     let mut pos = 0usize;
     while pos < bytes.len() {
-        let Some(q1) = text[pos..].find('"') else { break };
+        let Some(q1) = text[pos..].find('"') else {
+            break;
+        };
         let k_start = pos + q1 + 1;
-        let Some(q2) = text[k_start..].find('"') else { break };
+        let Some(q2) = text[k_start..].find('"') else {
+            break;
+        };
         let k_end = k_start + q2;
         let key = &text[k_start..k_end];
         pos = k_end + 1;
@@ -1598,7 +1697,9 @@ fn parse_nested_quant_blocks(text: &str, out: &mut std::collections::BTreeMap<St
         if !after_colon.starts_with('{') {
             continue;
         }
-        let Some(b_close) = after_colon.find('}') else { continue };
+        let Some(b_close) = after_colon.find('}') else {
+            continue;
+        };
         let inner = &after_colon[1..b_close];
         if inner.contains("\"bits\"") && inner.contains("\"group_size\"") && !inner.contains('{') {
             if let (Some(b), Some(gs)) = (
@@ -1610,5 +1711,3 @@ fn parse_nested_quant_blocks(text: &str, out: &mut std::collections::BTreeMap<St
         }
     }
 }
-
-

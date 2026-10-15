@@ -27,17 +27,25 @@ pub mod compliance;
 pub mod distill_engine;
 pub mod first_principles;
 pub mod holonomy;
+pub mod map_native;
 pub mod mlir_native;
+pub mod native_reader;
 pub mod refraction;
 pub mod silo;
+
+pub use map_native::{
+    COUPLED_OPERATOR_MAGIC, CoupledOperatorAtomPayload, InstrumentedLayerCapture,
+    MapNativeInferenceEngine, MapNativeLayerReceipt, MapSubstitutionMode, RECEPTOR_SKETCH_DIM,
+    VectorComparisonMetrics, compute_receptor_sketch,
+};
 
 pub use atlas13::{
     Atlas13, DualityAxis, EpistemicMark, FrameGeometry, INV_SQRT5_Q32, MEASURED_AXIS_COS_Q32,
     R_SPH_Q32, RoleId, WellDescriptor,
 };
 pub use compliance::{
-    ComplianceAuditEntry, CompliancePermit, ComplianceViolation, ImmuneSystem,
-    OverlapPolicyMatrix, PREREGISTERED_KILL_FINGERPRINT, PreregisteredEvaluation,
+    ComplianceAuditEntry, CompliancePermit, ComplianceViolation, ImmuneSystem, OverlapPolicyMatrix,
+    PREREGISTERED_KILL_FINGERPRINT, PreregisteredEvaluation,
 };
 pub use distill_engine::{
     DistilledReasoningArc, FullModelDistillationReceipt, LiveNoveltyDistillationReceipt,
@@ -47,12 +55,12 @@ pub use distill_engine::{
 pub use first_principles::{
     ATOMIC_IR_MAX_VERIFY_TOKENS, AtomClass, AtomicIrAlphabet, ComplianceMerkleTree,
     FIRST_PRINCIPLE_STATUTES, FirstPrincipleInvariant, FirstPrincipleStatutoryRule,
-    FirstPrinciplesComplianceEngine, FirstPrinciplesComplianceReport, MetaCognitiveRunbookController,
-    MetaCognitiveVerdictQ32, MetaControlDecision, OpticalRiskEngine, OpticalRiskReport,
-    QuotientManifoldProof, QuotientVerificationReport, RegulatoryFramework, RiskTier, RoleSignalQ32,
-    RunbookTelemetryQ32, SecurityOntologyEntry, SphereHomeostasisSpec, SurgicalErasureReceipt,
-    SwarmKnowledgeAndHomeostasis, digest_ct_eq, merkle_hash_leaf, merkle_hash_node,
-    predict_token_envelope,
+    FirstPrinciplesComplianceEngine, FirstPrinciplesComplianceReport,
+    MetaCognitiveRunbookController, MetaCognitiveVerdictQ32, MetaControlDecision,
+    OpticalRiskEngine, OpticalRiskReport, QuotientManifoldProof, QuotientVerificationReport,
+    RegulatoryFramework, RiskTier, RoleSignalQ32, RunbookTelemetryQ32, SecurityOntologyEntry,
+    SphereHomeostasisSpec, SurgicalErasureReceipt, SwarmKnowledgeAndHomeostasis, digest_ct_eq,
+    merkle_hash_leaf, merkle_hash_node, predict_token_envelope,
 };
 pub use holonomy::{
     HolonomyLoopReceipt, HolonomyVerdict, HyperbolicHolonomyEngine, IDENTITY_FRAME_Q32,
@@ -61,6 +69,9 @@ pub use mlir_native::{
     ATOMA_IR_BINARY_MAGIC, GeodesicDecodeReceipt, GeodesicMlirDecoder, MLIR_SSA_WIRE_MAGIC,
     MlirAtomCatalog, MlirDialect, MlirOpDescriptor, MlirOpId, MlirSsaBlock, MlirSsaError,
     MlirSsaValidationReceipt, MlirTransductionLossReport, MlirTypeSig, NativeMlirInstruction,
+};
+pub use native_reader::{
+    NativeContinuation, NativeRead, NativeReader, NativeStop, TrajectoryWrite,
 };
 pub use refraction::{
     FrozenShard, OpticalLens, ProjectedTangent, ProjectionLossReport, RefractedPoint,

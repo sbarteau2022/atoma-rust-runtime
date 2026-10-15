@@ -22,6 +22,7 @@ pub enum MetalQuantError {
     DeviceNotFound,
     LibraryCompile(String),
     FunctionNotFound(String),
+    InvalidShape(String),
 }
 
 impl fmt::Display for MetalQuantError {
@@ -30,6 +31,7 @@ impl fmt::Display for MetalQuantError {
             MetalQuantError::DeviceNotFound => write!(f, "No Metal device found"),
             MetalQuantError::LibraryCompile(e) => write!(f, "MSL compile error: {}", e),
             MetalQuantError::FunctionNotFound(n) => write!(f, "Kernel not found: {}", n),
+            MetalQuantError::InvalidShape(e) => write!(f, "invalid GEMV shape: {}", e),
         }
     }
 }
@@ -44,6 +46,7 @@ pub struct MetalQuantGemm {
     device: Device,
     queue: CommandQueue,
     q4_pipeline: ComputePipelineState,
+    q5_pipeline: ComputePipelineState,
     q6_pipeline: ComputePipelineState,
     q_generic_pipeline: ComputePipelineState,
     /// Persistent cache of `MTLBuffer`s keyed by `(slice_ptr, byte_len)` so mmap'd weights
@@ -69,6 +72,9 @@ impl MetalQuantGemm {
         let q6_fn = library
             .get_function("q6_gemv", None)
             .map_err(|_| MetalQuantError::FunctionNotFound("q6_gemv".to_string()))?;
+        let q5_fn = library
+            .get_function("q5_gemv", None)
+            .map_err(|_| MetalQuantError::FunctionNotFound("q5_gemv".to_string()))?;
         let q_gen_fn = library
             .get_function("q_generic_gemv", None)
             .map_err(|_| MetalQuantError::FunctionNotFound("q_generic_gemv".to_string()))?;
@@ -78,6 +84,9 @@ impl MetalQuantGemm {
             .map_err(|e| MetalQuantError::LibraryCompile(e.to_string()))?;
         let q6_pipeline = device
             .new_compute_pipeline_state_with_function(&q6_fn)
+            .map_err(|e| MetalQuantError::LibraryCompile(e.to_string()))?;
+        let q5_pipeline = device
+            .new_compute_pipeline_state_with_function(&q5_fn)
             .map_err(|e| MetalQuantError::LibraryCompile(e.to_string()))?;
         let q_generic_pipeline = device
             .new_compute_pipeline_state_with_function(&q_gen_fn)
@@ -93,6 +102,7 @@ impl MetalQuantGemm {
             device,
             queue,
             q4_pipeline,
+            q5_pipeline,
             q6_pipeline,
             q_generic_pipeline,
             buffer_cache: Mutex::new(HashMap::new()),
@@ -235,6 +245,66 @@ impl MetalQuantGemm {
         )
     }
 
+    /// Specialized group-128 5-bit GEMV accepting packed U32 weight bytes without
+    /// requiring host-pointer alignment; Metal owns an aligned cached buffer copy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn q5_gemv_bytes(
+        &self,
+        packed_bytes: &[u8],
+        scales: &[u8],
+        biases: &[u8],
+        out_scale: Option<&[f32]>,
+        x: &[f32],
+        rows: u32,
+        cols: u32,
+        group_size: u32,
+        scale_dtype: &str,
+        bias_dtype: &str,
+    ) -> Result<Vec<f32>, MetalQuantError> {
+        let packed_bits = (rows as usize)
+            .checked_mul(cols as usize)
+            .and_then(|n| n.checked_mul(5));
+        let expected_bytes = packed_bits.and_then(|n| n.checked_div(8));
+        let groups = (rows as usize).checked_mul(cols as usize / group_size.max(1) as usize);
+        let scale_bytes = if scale_dtype == "F32" { 4 } else { 2 };
+        let bias_bytes = if bias_dtype == "F32" { 4 } else { 2 };
+        if !packed_bytes.len().is_multiple_of(4)
+            || group_size != 128
+            || cols == 0
+            || !cols.is_multiple_of(group_size)
+            || !(cols as usize * 5).is_multiple_of(32)
+            || x.len() != cols as usize
+            || expected_bytes != Some(packed_bytes.len())
+            || out_scale.is_some_and(|values| values.len() != rows as usize)
+            || groups
+                .and_then(|n| n.checked_mul(scale_bytes))
+                .is_none_or(|n| scales.len() < n)
+            || groups
+                .and_then(|n| n.checked_mul(bias_bytes))
+                .is_none_or(|n| biases.len() < n)
+            || Self::dtype_code(scale_dtype) == 0 && scale_dtype != "F32"
+            || Self::dtype_code(bias_dtype) == 0 && bias_dtype != "F32"
+        {
+            return Err(MetalQuantError::InvalidShape(
+                "q5_gemv requires U32-packed bytes, group_size 128, and word-aligned rows".into(),
+            ));
+        }
+        self.gemv_inner_bytes(
+            &self.q5_pipeline,
+            packed_bytes,
+            scales,
+            biases,
+            out_scale,
+            x,
+            rows,
+            cols,
+            group_size,
+            scale_dtype,
+            bias_dtype,
+            Some(5),
+        )
+    }
+
     fn dtype_code(dtype: &str) -> u32 {
         match dtype {
             "F32" => 0,
@@ -260,7 +330,41 @@ impl MetalQuantGemm {
         bias_dtype: &str,
         generic_bits: Option<u32>,
     ) -> Result<Vec<f32>, MetalQuantError> {
-        let packed_buf = self.get_or_cache_buffer(packed.as_ptr() as *const u8, packed.len() * 4);
+        let packed_bytes =
+            unsafe { std::slice::from_raw_parts(packed.as_ptr().cast::<u8>(), packed.len() * 4) };
+        self.gemv_inner_bytes(
+            pipeline,
+            packed_bytes,
+            scales,
+            biases,
+            out_scale,
+            x,
+            rows,
+            cols,
+            group_size,
+            scale_dtype,
+            bias_dtype,
+            generic_bits,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_inner_bytes(
+        &self,
+        pipeline: &ComputePipelineState,
+        packed_bytes: &[u8],
+        scales: &[u8],
+        biases: &[u8],
+        out_scale: Option<&[f32]>,
+        x: &[f32],
+        rows: u32,
+        cols: u32,
+        group_size: u32,
+        scale_dtype: &str,
+        bias_dtype: &str,
+        generic_bits: Option<u32>,
+    ) -> Result<Vec<f32>, MetalQuantError> {
+        let packed_buf = self.get_or_cache_buffer(packed_bytes.as_ptr(), packed_bytes.len());
         let scales_buf = self.get_or_cache_buffer(scales.as_ptr(), scales.len());
         let biases_buf = self.get_or_cache_buffer(biases.as_ptr(), biases.len());
 
@@ -401,6 +505,77 @@ mod tests {
                 cpu_y4[r]
             );
         }
+
+        // Verify the specialized 5-bit/group-128 path against the exact CPU reference.
+        let q5_rows = 32usize;
+        let q5_cols = 128usize;
+        let q5_words_per_row = q5_cols * 5 / 32;
+        let q5_packed: Vec<u32> = (0..q5_rows * q5_words_per_row)
+            .map(|i| 0x9E37_79B9u32.wrapping_mul(i as u32 + 7))
+            .collect();
+        let q5_bytes: Vec<u8> = q5_packed
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let q5_scales: Vec<u8> = (0..q5_rows)
+            .flat_map(|i| encode_bf16(0.04 + (i % 5) as f32 * 0.01))
+            .collect();
+        let q5_biases: Vec<u8> = (0..q5_rows)
+            .flat_map(|i| encode_bf16(-0.02 + (i % 3) as f32 * 0.01))
+            .collect();
+        let q5_out_scale: Vec<f32> = (0..q5_rows).map(|i| 0.8 + i as f32 * 0.001).collect();
+        let q5_gpu = gemm
+            .q5_gemv_bytes(
+                &q5_bytes,
+                &q5_scales,
+                &q5_biases,
+                Some(&q5_out_scale),
+                &x,
+                q5_rows as u32,
+                q5_cols as u32,
+                128,
+                "BF16",
+                "BF16",
+            )
+            .unwrap();
+        let q5_cpu = crate::metal::qmatvec_fused_zero_copy(
+            &q5_bytes,
+            "U32",
+            &q5_scales,
+            "BF16",
+            &q5_biases,
+            "BF16",
+            Some(&q5_out_scale),
+            5,
+            128,
+            q5_rows,
+            q5_cols,
+            &x,
+        )
+        .unwrap();
+        for r in 0..q5_rows {
+            assert!(
+                (q5_gpu[r] - q5_cpu[r]).abs() < 1e-2,
+                "q5 row {r}: gpu={} vs cpu={}",
+                q5_gpu[r],
+                q5_cpu[r]
+            );
+        }
+        assert!(
+            gemm.q5_gemv_bytes(
+                &q5_bytes,
+                &q5_scales,
+                &q5_biases,
+                Some(&q5_out_scale),
+                &x,
+                q5_rows as u32,
+                q5_cols as u32,
+                64,
+                "BF16",
+                "BF16",
+            )
+            .is_err()
+        );
 
         // 2. Verify 6-bit 96-bit Super-Word SIMD-group kernel
         let words_6 = (rows * cols * 6) / 32;

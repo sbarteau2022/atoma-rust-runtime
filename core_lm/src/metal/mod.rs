@@ -223,7 +223,9 @@ pub fn dequantize_row_zero_copy(
     cols: usize,
 ) -> Result<Vec<f32>, String> {
     if bits == 0 || bits >= 32 || group_size == 0 || cols % group_size != 0 {
-        return Err(format!("Invalid quant params bits={bits} group_size={group_size} cols={cols}"));
+        return Err(format!(
+            "Invalid quant params bits={bits} group_size={group_size} cols={cols}"
+        ));
     }
     let s_code = parse_dtype_code(scales_dtype)?;
     let b_code = parse_dtype_code(biases_dtype)?;

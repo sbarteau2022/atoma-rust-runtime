@@ -179,13 +179,18 @@ pub struct MlirAtomCatalog {
 }
 
 impl MlirAtomCatalog {
-    fn build_opcode_well(ball_xyz: [f64; 3], theta_f_rad: f64, theta_s_rad: f64) -> (LorentzVector, Phase, u8, u8) {
+    fn build_opcode_well(
+        ball_xyz: [f64; 3],
+        theta_f_rad: f64,
+        theta_s_rad: f64,
+    ) -> (LorentzVector, Phase, u8, u8) {
         let ball = [
             Q32_31::from_f64(ball_xyz[0]),
             Q32_31::from_f64(ball_xyz[1]),
             Q32_31::from_f64(ball_xyz[2]),
         ];
-        let lorentz_well = OpticalLens::ball_to_lorentz(&ball).unwrap_or_else(|_| LorentzVector::origin());
+        let lorentz_well =
+            OpticalLens::ball_to_lorentz(&ball).unwrap_or_else(|_| LorentzVector::origin());
         let phase_well = Phase {
             theta_f: Q32_31::from_f64(theta_f_rad),
             theta_s: Q32_31::from_f64(theta_s_rad),
@@ -251,7 +256,11 @@ impl MlirAtomCatalog {
                 "atoma.manifold.embed_lorentz",
                 [0.10, -0.26, 0.18],
                 (-0.80, 0.40),
-                vec![MlirTypeSig::Q32_31, MlirTypeSig::Q32_31, MlirTypeSig::Q32_31],
+                vec![
+                    MlirTypeSig::Q32_31,
+                    MlirTypeSig::Q32_31,
+                    MlirTypeSig::Q32_31,
+                ],
                 MlirTypeSig::LorentzCoord,
                 None,
                 vec![201, 202, 203, 204],
@@ -314,8 +323,20 @@ impl MlirAtomCatalog {
         ];
 
         let mut opcodes = BTreeMap::new();
-        for (id, dialect, mnemonic, ball, (tf, ts), arg_types, ret_type, required_role, token_expansion) in raw_specs {
-            let (lorentz_well, phase_well, sector_n, sector_m) = Self::build_opcode_well(ball, tf, ts);
+        for (
+            id,
+            dialect,
+            mnemonic,
+            ball,
+            (tf, ts),
+            arg_types,
+            ret_type,
+            required_role,
+            token_expansion,
+        ) in raw_specs
+        {
+            let (lorentz_well, phase_well, sector_n, sector_m) =
+                Self::build_opcode_well(ball, tf, ts);
             opcodes.insert(
                 id,
                 MlirOpDescriptor {
@@ -630,7 +651,8 @@ impl MlirAtomCatalog {
             }
             let mut arg_types = Vec::with_capacity(arity);
             for _ in 0..arity {
-                arg_types.push(MlirTypeSig::from_u8(bytes[offset]).ok_or("Invalid arg MlirTypeSig")?);
+                arg_types
+                    .push(MlirTypeSig::from_u8(bytes[offset]).ok_or("Invalid arg MlirTypeSig")?);
                 offset += 1;
             }
             let ret_type =
@@ -722,8 +744,8 @@ impl GeodesicMlirDecoder {
         let total_steps = hidden_states.len();
 
         for (step, h_t) in hidden_states.iter().enumerate() {
-            let (q_lor, q_phase, bridge_loss) =
-                f32_to_atom_address(h_t).map_err(|_| "f32_to_atom_address failed on hidden state")?;
+            let (q_lor, q_phase, bridge_loss) = f32_to_atom_address(h_t)
+                .map_err(|_| "f32_to_atom_address failed on hidden state")?;
             step_bridge_losses.push(bridge_loss);
 
             let is_final_step = step + 1 == total_steps && total_steps > 1;
@@ -762,7 +784,8 @@ impl GeodesicMlirDecoder {
                     continue;
                 }
 
-                let mut dist = MlirAtomCatalog::geodesic_opcode_distance_q32(&q_lor, &q_phase, desc);
+                let mut dist =
+                    MlirAtomCatalog::geodesic_opcode_distance_q32(&q_lor, &q_phase, desc);
                 if is_final_step && desc.dialect == MlirDialect::CoreBuiltin {
                     dist = Q32_31(dist.0 >> 2);
                 }
@@ -774,8 +797,8 @@ impl GeodesicMlirDecoder {
                 }
             }
 
-            let (chosen_desc, chosen_dist) =
-                best_op.ok_or("No structurally legal MLIR opcode available for current SSA scope")?;
+            let (chosen_desc, chosen_dist) = best_op
+                .ok_or("No structurally legal MLIR opcode available for current SSA scope")?;
             geodesic_well_distances_q32.push(chosen_dist);
 
             // Type-Masked Hyperbolic Pointer Network for operand register selection
@@ -814,11 +837,7 @@ impl GeodesicMlirDecoder {
 
             // Extract deterministic Q32.31 immediate value from the leading harmonic of h_t
             let imm_f64 = if chosen_desc.arg_types.is_empty() {
-                let mean_abs: f64 = h_t
-                    .iter()
-                    .take(16)
-                    .map(|&v| (v as f64).abs())
-                    .sum::<f64>()
+                let mean_abs: f64 = h_t.iter().take(16).map(|&v| (v as f64).abs()).sum::<f64>()
                     / (h_t.len().min(16).max(1) as f64);
                 (mean_abs * 4.0).clamp(0.25, 16.0)
             } else {
@@ -901,9 +920,18 @@ impl NativeMlirInstruction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MlirSsaError {
     EmptyBlock,
-    UnknownOpcode { step: usize, op_id: MlirOpId },
-    DuplicateSsaDefinition { step: usize, reg: u16 },
-    UseBeforeDef { step: usize, reg: u16 },
+    UnknownOpcode {
+        step: usize,
+        op_id: MlirOpId,
+    },
+    DuplicateSsaDefinition {
+        step: usize,
+        reg: u16,
+    },
+    UseBeforeDef {
+        step: usize,
+        reg: u16,
+    },
     ArityMismatch {
         step: usize,
         op_id: MlirOpId,
@@ -933,10 +961,18 @@ impl fmt::Display for MlirSsaError {
                 write!(f, "Step {}: unknown MLIR opcode {}", step, op_id)
             }
             Self::DuplicateSsaDefinition { step, reg } => {
-                write!(f, "Step {}: SSA register %{} defined more than once", step, reg)
+                write!(
+                    f,
+                    "Step {}: SSA register %{} defined more than once",
+                    step, reg
+                )
             }
             Self::UseBeforeDef { step, reg } => {
-                write!(f, "Step {}: SSA register %{} used before definition", step, reg)
+                write!(
+                    f,
+                    "Step {}: SSA register %{} used before definition",
+                    step, reg
+                )
             }
             Self::ArityMismatch {
                 step,
@@ -1127,13 +1163,25 @@ impl MlirSsaBlock {
             let val = match desc.mnemonic.as_str() {
                 "arith.constant_q32" => inst.immediate_q32,
                 "arith.add_q32" => {
-                    let a = regs_q32.get(&inst.src_regs[0]).copied().unwrap_or(Q32_31::ZERO);
-                    let b = regs_q32.get(&inst.src_regs[1]).copied().unwrap_or(Q32_31::ZERO);
+                    let a = regs_q32
+                        .get(&inst.src_regs[0])
+                        .copied()
+                        .unwrap_or(Q32_31::ZERO);
+                    let b = regs_q32
+                        .get(&inst.src_regs[1])
+                        .copied()
+                        .unwrap_or(Q32_31::ZERO);
                     a + b
                 }
                 "arith.mul_q32" => {
-                    let a = regs_q32.get(&inst.src_regs[0]).copied().unwrap_or(Q32_31::ZERO);
-                    let b = regs_q32.get(&inst.src_regs[1]).copied().unwrap_or(Q32_31::ZERO);
+                    let a = regs_q32
+                        .get(&inst.src_regs[0])
+                        .copied()
+                        .unwrap_or(Q32_31::ZERO);
+                    let b = regs_q32
+                        .get(&inst.src_regs[1])
+                        .copied()
+                        .unwrap_or(Q32_31::ZERO);
                     a * b
                 }
                 "func.return_q32" => regs_q32
@@ -1185,7 +1233,7 @@ mod tests {
         // 2. Test greedy longest-match token_id -> MlirOpId transduction and lossless round-trip
         let sample_tokens = vec![
             101, 102, // arith.constant_q32
-            42,       // raw single token
+            42,  // raw single token
             103, 104, 105, // arith.add_q32
             301, 302, 303, 304, 305, // atoma.tool.sensory_ingest
             401, 402, // func.return_q32
@@ -1200,7 +1248,8 @@ mod tests {
     }
 
     #[test]
-    fn geodesic_mlir_decoder_synthesizes_valid_ssa_from_continuous_hidden_states_without_tokenizer() {
+    fn geodesic_mlir_decoder_synthesizes_valid_ssa_from_continuous_hidden_states_without_tokenizer()
+    {
         let catalog = MlirAtomCatalog::new_canonical(248_320);
 
         // Synthesize 6 steps of continuous hidden states across different model dimensions (128d and 256d)
@@ -1258,7 +1307,10 @@ mod tests {
     #[test]
     fn typed_mlir_ssa_block_executes_and_rejects_invalid_ssa_or_role_spoofing() {
         let catalog = MlirAtomCatalog::new_canonical(248_320);
-        let op_const = catalog.lookup_by_mnemonic("arith.constant_q32").unwrap().op_id;
+        let op_const = catalog
+            .lookup_by_mnemonic("arith.constant_q32")
+            .unwrap()
+            .op_id;
         let op_add = catalog.lookup_by_mnemonic("arith.add_q32").unwrap().op_id;
         let op_mul = catalog.lookup_by_mnemonic("arith.mul_q32").unwrap().op_id;
         let op_ret = catalog.lookup_by_mnemonic("func.return_q32").unwrap().op_id;

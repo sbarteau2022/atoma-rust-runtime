@@ -77,13 +77,21 @@ impl OverlapPolicyMatrix {
         justification: &str,
     ) -> Result<(), ComplianceViolation> {
         if justification.trim().is_empty() {
-            return Err(ComplianceViolation::UnjustifiedOverlapExpansion { role_a: a, role_b: b });
+            return Err(ComplianceViolation::UnjustifiedOverlapExpansion {
+                role_a: a,
+                role_b: b,
+            });
         }
         if omega.0 < 0 {
-            return Err(ComplianceViolation::NegativeOverlapAllowance { role_a: a, role_b: b });
+            return Err(ComplianceViolation::NegativeOverlapAllowance {
+                role_a: a,
+                role_b: b,
+            });
         }
         let (Some(i), Some(j)) = (a.carved_index(), b.carved_index()) else {
-            return Err(ComplianceViolation::InvalidSpecialistRole(RoleId::Coordinator));
+            return Err(ComplianceViolation::InvalidSpecialistRole(
+                RoleId::Coordinator,
+            ));
         };
         self.matrix[i][j] = omega;
         self.matrix[j][i] = omega;
@@ -283,26 +291,28 @@ impl ImmuneSystem {
     }
 
     /// Gate 1: Verify that the shared base weights are unmodified (`Qualification #8`).
-    pub fn check_base_weights(&mut self, map: &CarvedSwarmMap) -> Result<CompliancePermit, ComplianceViolation> {
-        let actual = Sha256Digest::compute(
-            &map.base_weights
-                .raw_weights()
-                .iter()
-                .fold(
-                    (map.base_weights.num_layers as u64).to_le_bytes().to_vec(),
-                    |mut acc, &w| {
-                        let c = if w == 0.0 { 0.0f32 } else { w };
-                        acc.extend_from_slice(&c.to_le_bytes());
-                        acc
-                    },
-                ),
-        );
+    pub fn check_base_weights(
+        &mut self,
+        map: &CarvedSwarmMap,
+    ) -> Result<CompliancePermit, ComplianceViolation> {
+        let actual = Sha256Digest::compute(&map.base_weights.raw_weights().iter().fold(
+            (map.base_weights.num_layers as u64).to_le_bytes().to_vec(),
+            |mut acc, &w| {
+                let c = if w == 0.0 { 0.0f32 } else { w };
+                acc.extend_from_slice(&c.to_le_bytes());
+                acc
+            },
+        ));
         if actual != self.pinned_weight_fingerprint {
             let err = ComplianceViolation::BaseWeightsModified {
                 expected: self.pinned_weight_fingerprint,
                 found: actual,
             };
-            self.record_audit(format!("REJECT base_weights: {}", err), false, EpistemicMark::Verified);
+            self.record_audit(
+                format!("REJECT base_weights: {}", err),
+                false,
+                EpistemicMark::Verified,
+            );
             return Err(err);
         }
         Ok(self.mint_permit(
@@ -326,7 +336,11 @@ impl ImmuneSystem {
         }
         let Some(silo) = map.silo(role) else {
             let err = ComplianceViolation::InvalidSpecialistRole(role);
-            self.record_audit(format!("REJECT spawn: {}", err), false, EpistemicMark::Verified);
+            self.record_audit(
+                format!("REJECT spawn: {}", err),
+                false,
+                EpistemicMark::Verified,
+            );
             return Err(err);
         };
         // Verify zero-copy weight sharing with frozen base
@@ -335,7 +349,11 @@ impl ImmuneSystem {
                 expected: self.pinned_weight_fingerprint,
                 found: silo.weight_view.base.fingerprint,
             };
-            self.record_audit(format!("REJECT spawn weight ptr: {}", err), false, EpistemicMark::Verified);
+            self.record_audit(
+                format!("REJECT spawn weight ptr: {}", err),
+                false,
+                EpistemicMark::Verified,
+            );
             return Err(err);
         }
         Ok(self.mint_permit(
@@ -368,18 +386,22 @@ impl ImmuneSystem {
 
         if from == RoleId::Coordinator || to == RoleId::Coordinator {
             // Coordinator (The 1) holds the undivided map, but the specialist side must still contain `atom_id`.
-            let specialist = if from == RoleId::Coordinator { to } else { from };
+            let specialist = if from == RoleId::Coordinator {
+                to
+            } else {
+                from
+            };
             if specialist != RoleId::Coordinator {
                 let silo = map
                     .silo(specialist)
                     .ok_or(ComplianceViolation::InvalidSpecialistRole(specialist))?;
                 if !silo.contains_atom(atom_id) {
-                    let err = ComplianceViolation::AtomOutsideBoundaryOverlap {
-                        from,
-                        to,
-                        atom_id,
-                    };
-                    self.record_audit(format!("REJECT coordinator handoff: {}", err), false, EpistemicMark::Verified);
+                    let err = ComplianceViolation::AtomOutsideBoundaryOverlap { from, to, atom_id };
+                    self.record_audit(
+                        format!("REJECT coordinator handoff: {}", err),
+                        false,
+                        EpistemicMark::Verified,
+                    );
                     return Err(err);
                 }
             }
@@ -406,20 +428,32 @@ impl ImmuneSystem {
                 sender: from,
                 atom_id,
             };
-            self.record_audit(format!("REJECT handoff sender: {}", err), false, EpistemicMark::Verified);
+            self.record_audit(
+                format!("REJECT handoff sender: {}", err),
+                false,
+                EpistemicMark::Verified,
+            );
             return Err(err);
         }
 
         let omega = self.policy.overlap_allowance(from, to);
         if omega.0 <= 0 {
             let err = ComplianceViolation::UnauthorizedRolePair { from, to };
-            self.record_audit(format!("REJECT handoff policy: {}", err), false, EpistemicMark::Verified);
+            self.record_audit(
+                format!("REJECT handoff policy: {}", err),
+                false,
+                EpistemicMark::Verified,
+            );
             return Err(err);
         }
 
         if !silo_to.contains_atom(atom_id) {
             let err = ComplianceViolation::AtomOutsideBoundaryOverlap { from, to, atom_id };
-            self.record_audit(format!("REJECT handoff boundary: {}", err), false, EpistemicMark::Verified);
+            self.record_audit(
+                format!("REJECT handoff boundary: {}", err),
+                false,
+                EpistemicMark::Verified,
+            );
             return Err(err);
         }
 
@@ -448,21 +482,33 @@ impl ImmuneSystem {
             let err = ComplianceViolation::SilentInformationLoss {
                 stage: "Stage 3 (Project)",
             };
-            self.record_audit(format!("REJECT loss gate: {}", err), false, EpistemicMark::Verified);
+            self.record_audit(
+                format!("REJECT loss gate: {}", err),
+                false,
+                EpistemicMark::Verified,
+            );
             return Err(err);
         }
         if refr.refractive_index_q32.0 < Q32_31::ONE.0 {
             let err = ComplianceViolation::SilentInformationLoss {
                 stage: "Stage 4 (Refract optical index n(r) < 1)",
             };
-            self.record_audit(format!("REJECT loss gate: {}", err), false, EpistemicMark::Verified);
+            self.record_audit(
+                format!("REJECT loss gate: {}", err),
+                false,
+                EpistemicMark::Verified,
+            );
             return Err(err);
         }
         if carve.global_atom_count == 0 {
             let err = ComplianceViolation::SilentInformationLoss {
                 stage: "Stage 5 (Carve empty global map)",
             };
-            self.record_audit(format!("REJECT loss gate: {}", err), false, EpistemicMark::Verified);
+            self.record_audit(
+                format!("REJECT loss gate: {}", err),
+                false,
+                EpistemicMark::Verified,
+            );
             return Err(err);
         }
         Ok(self.mint_permit(
@@ -537,7 +583,12 @@ impl ImmuneSystem {
                 stage: "core_lm::geometry::bridge::f32_to_atom_address (Forward Pass)",
             };
             self.record_audit(
-                format!("REJECT forward pass role={} pos={}: {}", role.name(), pos, err),
+                format!(
+                    "REJECT forward pass role={} pos={}: {}",
+                    role.name(),
+                    pos,
+                    err
+                ),
                 false,
                 EpistemicMark::Verified,
             );
@@ -761,24 +812,22 @@ impl ImmuneSystem {
             return Err(err);
         }
 
-        let receipt = block
-            .validate_ssa_and_types(catalog, sender)
-            .map_err(|e| {
-                let err = ComplianceViolation::InvalidMlirSsaBlock {
-                    reason: e.to_string(),
-                };
-                self.record_audit(
-                    format!(
-                        "REJECT MlirNativeSsaGate L{} -> L{}: {}",
-                        sender.level(),
-                        receiver.level(),
-                        err
-                    ),
-                    false,
-                    EpistemicMark::Verified,
-                );
-                err
-            })?;
+        let receipt = block.validate_ssa_and_types(catalog, sender).map_err(|e| {
+            let err = ComplianceViolation::InvalidMlirSsaBlock {
+                reason: e.to_string(),
+            };
+            self.record_audit(
+                format!(
+                    "REJECT MlirNativeSsaGate L{} -> L{}: {}",
+                    sender.level(),
+                    receiver.level(),
+                    err
+                ),
+                false,
+                EpistemicMark::Verified,
+            );
+            err
+        })?;
 
         let permit = self.mint_permit(
             format!(

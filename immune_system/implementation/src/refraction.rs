@@ -498,10 +498,7 @@ impl OpticalLens {
     /// `cosh(d) = 1 + 2 * ||p - q||² / ((1 - ||p||²)(1 - ||q||²))`
     /// in wide `i128` fixed-point arithmetic (`[verified]`).
     #[inline]
-    pub fn ball_cosh_distance(
-        p: &[Q32_31; 3],
-        q: &[Q32_31; 3],
-    ) -> Result<Q32_31, RefractionError> {
+    pub fn ball_cosh_distance(p: &[Q32_31; 3], q: &[Q32_31; 3]) -> Result<Q32_31, RefractionError> {
         let rp_sq = Self::norm_sq_q32(p);
         let rq_sq = Self::norm_sq_q32(q);
         if rp_sq < 0 || rp_sq > MAX_BALL_RADIUS_SQ_Q32 {

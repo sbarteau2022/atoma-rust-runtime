@@ -90,7 +90,10 @@ mod tests {
 
         let far = LorentzVector::from_f64([2.0, 1.732, 0.0, 0.0]);
         let mapped = PicardMapper::map_to_fundamental_domain(&far);
-        assert!(mapped.validate().is_ok(), "reduced point left the hyperboloid");
+        assert!(
+            mapped.validate().is_ok(),
+            "reduced point left the hyperboloid"
+        );
         assert!(
             mapped.x[0] > origin.x[0],
             "reduced x0 {} is not farther than the origin",

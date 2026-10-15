@@ -16,12 +16,9 @@ const PI: i64 = 1 << FRAC_BITS;
 // Corrected CORDIC constants (pi-unit Q32.31)
 const CORDIC_GAIN: i64 = 1304065748; // 0.6072529350088814 * 2^31
 const ATAN_TABLE: [i64; 32] = [
-    536870912, 316933406, 167458907, 85004756, 42667331,
-    21354465, 10679838, 5340245, 2670163, 1335087,
-    667544, 333772, 166886, 83443, 41722,
-    20861, 10430, 5215, 2608, 1304,
-    652, 326, 163, 81, 41,
-    20, 10, 5, 3, 1, 1, 0
+    536870912, 316933406, 167458907, 85004756, 42667331, 21354465, 10679838, 5340245, 2670163,
+    1335087, 667544, 333772, 166886, 83443, 41722, 20861, 10430, 5215, 2608, 1304, 652, 326, 163,
+    81, 41, 20, 10, 5, 3, 1, 1, 0,
 ];
 
 /// Converts a radian-unit `Q32_31` angle (`1 << 31 == 1.0 rad`, used in `geometry::fixed`)
@@ -121,19 +118,16 @@ pub fn inject_surprise(theta: &mut [i64], theta_new: &[i64], alpha: i64) {
 }
 
 /// CPU fallback Kuramoto step (for testing; Metal does the real work).
-pub fn kuramoto_step_cpu(
-    theta: &mut [i64],
-    omega: &[i64],
-    dt: i64,
-    k_coupling: i64,
-) -> i64 {
+pub fn kuramoto_step_cpu(theta: &mut [i64], omega: &[i64], dt: i64, k_coupling: i64) -> i64 {
     let n = theta.len();
     let mut max_slip: i64 = 0;
     let mut new_theta = theta.to_vec();
     for i in 0..n {
         let mut sum = 0i64;
         for j in 0..n {
-            if i == j { continue; }
+            if i == j {
+                continue;
+            }
             let diff = (theta[j].wrapping_sub(theta[i]) as i32) as i64;
             sum = sum.wrapping_add(cordic_sin(diff));
         }
@@ -142,7 +136,9 @@ pub fn kuramoto_step_cpu(
         let deriv = omega[i].wrapping_add(interaction);
         let delta = (deriv.wrapping_mul(dt)) >> FRAC_BITS;
         let ad = delta.wrapping_abs();
-        if ad > max_slip { max_slip = ad; }
+        if ad > max_slip {
+            max_slip = ad;
+        }
         new_theta[i] = (theta[i].wrapping_add(delta) as i32) as i64;
     }
     theta.copy_from_slice(&new_theta);
@@ -153,7 +149,9 @@ pub fn kuramoto_step_cpu(
 mod tests {
     use super::*;
     #[test]
-    fn cordic_zero() { assert_eq!(cordic_sin(0), 0); }
+    fn cordic_zero() {
+        assert_eq!(cordic_sin(0), 0);
+    }
     #[test]
     fn sectors_cover_12() {
         let mut seen = std::collections::HashSet::new();

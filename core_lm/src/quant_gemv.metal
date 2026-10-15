@@ -38,6 +38,70 @@ inline float read_scale_or_bias(
     }
 }
 
+inline uint unpack_q5(device const uint* packed, uint row_word_base, uint col) {
+    uint bitpos = col * 5u;
+    uint word_idx = row_word_base + (bitpos >> 5u);
+    uint shift = bitpos & 31u;
+    uint value = packed[word_idx] >> shift;
+    if (shift > 27u) {
+        value |= packed[word_idx + 1u] << (32u - shift);
+    }
+    return value & 31u;
+}
+
+// Specialized 5-bit, group-128 output-head GEMV. Rows and groups are word aligned
+// for Muse Glimmer (6656 columns, 128-value affine groups). Scale/bias are loaded
+// once per group and 5-bit indices avoid the generic kernel's 64-bit per-value math.
+kernel void q5_gemv(
+    device const uint* packed [[buffer(0)]],
+    device const uchar* scales [[buffer(1)]],
+    device const uchar* biases [[buffer(2)]],
+    device const float* out_scale [[buffer(3)]],
+    device const float* x [[buffer(4)]],
+    device float* out [[buffer(5)]],
+    constant uint& rows [[buffer(6)]],
+    constant uint& cols [[buffer(7)]],
+    constant uint& group_size [[buffer(8)]],
+    constant uint& has_out_scale [[buffer(9)]],
+    constant uint& scale_dtype [[buffer(10)]],
+    constant uint& bias_dtype [[buffer(11)]],
+    constant uint& bits [[buffer(12)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint tgid [[threadgroup_position_in_grid]]
+) {
+    uint row = tgid * 8u + simd_gid;
+    if (row >= rows || bits != 5u || group_size != 128u || (cols % 128u) != 0u || ((cols * 5u) % 32u) != 0u) return;
+
+    uint words_per_row = (cols * 5u) >> 5u;
+    uint groups_per_row = cols / group_size;
+    uint row_word_base = row * words_per_row;
+    uint row_group_base = row * groups_per_row;
+    float row_acc = 0.0f;
+
+    for (uint group = 0; group < groups_per_row; ++group) {
+        uint sb_idx = row_group_base + group;
+        float scale = read_scale_or_bias(scales, sb_idx, scale_dtype);
+        float bias = read_scale_or_bias(biases, sb_idx, bias_dtype);
+        uint group_col = group * group_size;
+        float q_dot = 0.0f;
+        float x_sum = 0.0f;
+        for (uint j = simd_lid; j < group_size; j += 32u) {
+            uint col = group_col + j;
+            float xv = x[col];
+            q_dot += (float)unpack_q5(packed, row_word_base, col) * xv;
+            x_sum += xv;
+        }
+        row_acc += scale * q_dot + bias * x_sum;
+    }
+
+    float total = simd_sum(row_acc);
+    if (simd_lid == 0u) {
+        float row_scale = (has_out_scale != 0u) ? out_scale[row] : 1.0f;
+        out[row] = total * row_scale;
+    }
+}
+
 // -----------------------------------------------------------------------------
 // 1. 4-Bit Fused SIMD-Group GEMV (`q4_gemv`)
 //    8 nibbles per U32 word, group_size divisible by 8 (e.g. 32, 64, 128).

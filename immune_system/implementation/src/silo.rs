@@ -36,7 +36,11 @@ pub struct FrozenBaseWeights {
 }
 
 impl FrozenBaseWeights {
-    pub fn freeze(model_name: impl Into<String>, num_layers: usize, weights: Vec<f32>) -> Arc<Self> {
+    pub fn freeze(
+        model_name: impl Into<String>,
+        num_layers: usize,
+        weights: Vec<f32>,
+    ) -> Arc<Self> {
         let fingerprint = Self::hash_f32_slice(num_layers, &weights);
         Arc::new(Self {
             model_name: model_name.into(),
@@ -211,6 +215,43 @@ pub struct SiloView {
     pub base_basin_cosh_radius: Q32_31,
     pub weight_view: CarvedWeightView,
     atoms: BTreeMap<u64, SiloAtom>,
+    /// O(log N) causal lookup for typed token K/V; rebuilt together with carved views.
+    typed_kv: BTreeMap<(u32, u32, u64), TypedKvSequenceIndex>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct TypedKvSequenceIndex {
+    positions: BTreeMap<usize, (AtomId, u16)>,
+    phase_cells: BTreeMap<u16, BTreeMap<usize, AtomId>>,
+}
+
+fn typed_kv_identity(payload: &[u8]) -> Result<Option<(u32, u32, u64, usize)>, String> {
+    if !payload.starts_with(b"ATOMA_KV_V1\0") {
+        return Ok(None);
+    }
+    if payload.len() < 40 {
+        return Err("malformed typed K/V header".into());
+    }
+    let layer = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+    let head = u32::from_le_bytes(payload[20..24].try_into().unwrap());
+    let sequence = u64::from_le_bytes(payload[24..32].try_into().unwrap());
+    let position = usize::try_from(u64::from_le_bytes(payload[32..40].try_into().unwrap()))
+        .map_err(|_| "K/V position exceeds usize")?;
+    Ok(Some((layer, head, sequence, position)))
+}
+
+fn phase_cell(phase: Phase) -> u16 {
+    let bin = |v: f64| {
+        ((v.rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU * 16.0).floor() as u16)
+            .min(15)
+    };
+    bin(phase.theta_f.to_f64()) * 16 + bin(phase.theta_s.to_f64())
+}
+
+fn phase_cell_distance(phase: Phase, cell: u16) -> f64 {
+    let f = (f64::from(cell / 16) + 0.5) * std::f64::consts::TAU / 16.0;
+    let s = (f64::from(cell % 16) + 0.5) * std::f64::consts::TAU / 16.0;
+    2.0 - (phase.theta_f.to_f64() - f).cos() - (phase.theta_s.to_f64() - s).cos()
 }
 
 impl SiloView {
@@ -230,6 +271,97 @@ impl SiloView {
         self.atoms.values()
     }
 
+    /// Exact causal records, without scanning unrelated map atoms or sequences.
+    pub fn typed_kv_range(
+        &self,
+        layer: usize,
+        head: usize,
+        sequence: u64,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<AtomId>, String> {
+        if start > end {
+            return Ok(Vec::new());
+        }
+        let layer = u32::try_from(layer).map_err(|_| "layer exceeds u32")?;
+        let head = u32::try_from(head).map_err(|_| "head exceeds u32")?;
+        Ok(self
+            .typed_kv
+            .get(&(layer, head, sequence))
+            .map(|index| {
+                index
+                    .positions
+                    .range(start..=end)
+                    .map(|(_, (id, _))| *id)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Bounded phase-cell recall. Work depends on the 256-cell torus and result limit,
+    /// not the number of atoms in the carved silo.
+    pub fn typed_kv_near_phase(
+        &self,
+        layer: usize,
+        head: usize,
+        sequence: u64,
+        start: usize,
+        end: usize,
+        phase: Phase,
+        limit: usize,
+    ) -> Result<Vec<AtomId>, String> {
+        if limit == 0 || start > end {
+            return Ok(Vec::new());
+        }
+        let layer = u32::try_from(layer).map_err(|_| "layer exceeds u32")?;
+        let head = u32::try_from(head).map_err(|_| "head exceeds u32")?;
+        let Some(index) = self.typed_kv.get(&(layer, head, sequence)) else {
+            return Ok(Vec::new());
+        };
+        let mut cells: Vec<_> = index
+            .phase_cells
+            .iter()
+            .map(|(&cell, positions)| (phase_cell_distance(phase, cell), cell, positions))
+            .collect();
+        cells.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut ids = Vec::with_capacity(limit);
+        for (_, _, positions) in cells {
+            for (_, id) in positions.range(start..=end).rev().take(limit - ids.len()) {
+                ids.push(*id);
+            }
+            if ids.len() == limit {
+                break;
+            }
+        }
+        Ok(ids)
+    }
+
+    pub fn typed_kv_sequence_count(&self, sequence: u64) -> usize {
+        self.typed_kv
+            .iter()
+            .filter(|((_, _, seq), _)| *seq == sequence)
+            .map(|(_, index)| index.positions.len())
+            .sum()
+    }
+
+    fn index_typed_atom(&mut self, atom: &SiloAtom) {
+        let Ok(Some((layer, head, sequence, position))) = typed_kv_identity(&atom.payload) else {
+            return;
+        };
+        let index = self.typed_kv.entry((layer, head, sequence)).or_default();
+        let cell = phase_cell(atom.phase);
+        if let Some((_, old_cell)) = index.positions.insert(position, (atom.id, cell)) {
+            if let Some(old) = index.phase_cells.get_mut(&old_cell) {
+                old.remove(&position);
+            }
+        }
+        index
+            .phase_cells
+            .entry(cell)
+            .or_default()
+            .insert(position, atom.id);
+    }
+
     /// Retrieve the `top_k` nearest atoms **within this role's carved silo** to `query_global`.
     pub fn retrieve_in_silo(&self, query_global: &LorentzVector, top_k: usize) -> Vec<&SiloAtom> {
         if top_k == 0 || self.atoms.is_empty() {
@@ -239,7 +371,8 @@ impl SiloView {
             .atoms
             .values()
             .map(|atom| {
-                let ip = OpticalLens::lorentz_inner_product_wide(query_global, &atom.global_lorentz);
+                let ip =
+                    OpticalLens::lorentz_inner_product_wide(query_global, &atom.global_lorentz);
                 (ip, atom.id.0, atom)
             })
             .collect();
@@ -296,6 +429,7 @@ impl CarvedSwarmMap {
                 base_basin_cosh_radius: default_basin_cosh,
                 weight_view: base_weights.carve_layer_view(role),
                 atoms: BTreeMap::new(),
+                typed_kv: BTreeMap::new(),
             }
         });
         let lineage = vec![(1, base_weights.model_name.clone(), base_weights.fingerprint)];
@@ -330,6 +464,11 @@ impl CarvedSwarmMap {
 
     pub fn global_atom(&self, id: AtomId) -> Option<&GlobalAtom> {
         self.global_atoms.get(&id.0)
+    }
+
+    /// Iterate over all global `0-cell` atoms in the central map.
+    pub fn iter_global_atoms(&self) -> impl Iterator<Item = (&u64, &GlobalAtom)> {
+        self.global_atoms.iter()
     }
 
     pub(crate) fn remove_global_atom_internal(&mut self, id: AtomId) -> bool {
@@ -398,12 +537,7 @@ impl CarvedSwarmMap {
         payload: Vec<u8>,
         policy: &OverlapPolicyMatrix,
     ) -> AtomId {
-        self.keep_and_carve_with_origin(
-            refracted,
-            payload,
-            self.base_weights.fingerprint,
-            policy,
-        )
+        self.keep_and_carve_with_origin(refracted, payload, self.base_weights.fingerprint, policy)
     }
 
     /// Compute a 64-bit spatial + topological sector bucket key for O(1) geodesic novelty lookup.
@@ -438,21 +572,31 @@ impl CarvedSwarmMap {
             ));
         }
 
-        let coalesce_cosh_threshold = Q32_31::from_f64(1.0005);
+        let coalesce_cosh_threshold = Q32_31::from_f64(1.0000001);
         // Quantize spatial Lorentz coordinates at resolution 2^-10 (~0.001)
-        let q1 = refracted.lorentz.x[1].0 >> 21;
-        let q2 = refracted.lorentz.x[2].0 >> 21;
+        let q1 = refracted.lorentz.x[1].0 >> 15;
+        let q2 = refracted.lorentz.x[2].0 >> 15;
         let q3 = refracted.lorentz.x[3].0 >> 21;
         let sec = refracted.invariant.n;
 
         let mut matched_id: Option<AtomId> = None;
+        // Token KV records carry causal position in their envelope, and Coupled Operator Atoms
+        // (`ATOMA_OP`) are deduplicated by 256d receptor sketch cosine per layer in `map_native.rs`.
         'search: for dx in -1..=1 {
+            if payload.starts_with(b"ATOMA_KV_V1\0") || payload.starts_with(b"ATOMA_OP") {
+                break 'search;
+            }
             for dy in -1..=1 {
                 for dz in -1..=1 {
                     let key = Self::spatial_bucket_key(q1 + dx, q2 + dy, q3 + dz, sec);
                     if let Some(bucket) = self.novelty_buckets.get(&key) {
                         for &cand_id in bucket {
                             if let Some(existing) = self.global_atoms.get(&cand_id.0) {
+                                if existing.payload.starts_with(b"ATOMA_KV_V1\0")
+                                    || existing.payload.starts_with(b"ATOMA_OP")
+                                {
+                                    continue;
+                                }
                                 let ip = OpticalLens::lorentz_inner_product_wide(
                                     &refracted.lorentz,
                                     &existing.lorentz,
@@ -520,11 +664,13 @@ impl CarvedSwarmMap {
             .0
     }
 
-    /// Record a directed 1-cell [`DistilledReasoningArc`] in the global map, deduplicating if an
-    /// equivalent transition (`(from_atom, to_atom, compiled_mlir_op)` or same role transition +
-    /// MLIR opcode within `|Δcosh| <= 0.001`) already exists.
+    /// Record a layer-anchor arc.
+    ///
+    /// An existing arc matches when `(from_atom, to_atom, compiled_mlir_op)` is exact, or when
+    /// the role pair, opcode, and hop length agree within 0.001. Token steps use
+    /// [`Self::record_trajectory_arc`].
     /// Returns `(arc_id, is_novel)`.
-    pub fn record_novel_reasoning_arc(&mut self, mut arc: DistilledReasoningArc) -> (u64, bool) {
+    pub fn record_novel_reasoning_arc(&mut self, arc: DistilledReasoningArc) -> (u64, bool) {
         let cosh_tol = Q32_31::from_f64(0.001).0;
         for existing in &mut self.reasoning_arcs {
             let exact_atoms = existing.from_atom == arc.from_atom
@@ -542,11 +688,48 @@ impl CarvedSwarmMap {
             }
         }
 
+        self.push_reasoning_arc(arc)
+    }
+
+    /// Record a token-trajectory arc.
+    ///
+    /// An existing arc matches when `(from_atom, compiled_mlir_op, wigner_frame)` is exact.
+    /// A second token well that continues to the same ID stays in the map, and two histories
+    /// that leave one well for different next IDs each keep their frame.
+    /// Returns `(arc_id, is_novel)`.
+    pub fn record_trajectory_arc(&mut self, arc: DistilledReasoningArc) -> (u64, bool) {
+        for existing in &mut self.reasoning_arcs {
+            if existing.from_atom == arc.from_atom
+                && existing.compiled_mlir_op == arc.compiled_mlir_op
+                && existing.wigner_frame == arc.wigner_frame
+            {
+                if arc.teacher_certainty_q32.0 > existing.teacher_certainty_q32.0 {
+                    existing.teacher_certainty_q32 = arc.teacher_certainty_q32;
+                }
+                return (existing.arc_id, false);
+            }
+        }
+        self.push_reasoning_arc(arc)
+    }
+
+    fn push_reasoning_arc(&mut self, mut arc: DistilledReasoningArc) -> (u64, bool) {
         let id = self.next_arc_id;
         self.next_arc_id += 1;
         arc.arc_id = id;
         self.reasoning_arcs.push(arc);
         (id, true)
+    }
+
+    /// Write `payload` onto `id` when that atom exists and still carries an empty payload.
+    pub fn store_payload_if_empty(&mut self, id: AtomId, payload: Vec<u8>) {
+        if payload.is_empty() {
+            return;
+        }
+        if let Some(atom) = self.global_atoms.get_mut(&id.0) {
+            if atom.payload.is_empty() {
+                atom.payload = std::sync::Arc::from(payload.into_boxed_slice());
+            }
+        }
     }
 
     /// Record a directed 1-cell [`DistilledReasoningArc`] in the global map.
@@ -602,7 +785,7 @@ impl CarvedSwarmMap {
         policy: &OverlapPolicyMatrix,
     ) -> DepositCompilationReceipt {
         let well = self.atlas.well(deposit.from_role);
-        let coalesce_cosh_threshold = Q32_31::from_f64(1.0005);
+        let coalesce_cosh_threshold = Q32_31::from_f64(1.0000001);
 
         let mut newly_compiled = 0usize;
         let mut coalesced = 0usize;
@@ -633,7 +816,14 @@ impl CarvedSwarmMap {
             // Check for geodesic coalescence with an existing GlobalAtom
             let mut matched_existing_id: Option<AtomId> = None;
             for existing in self.global_atoms.values_mut() {
-                let ip = OpticalLens::lorentz_inner_product_wide(&global_lorentz, &existing.lorentz);
+                if rec.payload.starts_with(b"ATOMA_KV_V1\0") {
+                    break;
+                }
+                if existing.payload.starts_with(b"ATOMA_KV_V1\0") {
+                    continue;
+                }
+                let ip =
+                    OpticalLens::lorentz_inner_product_wide(&global_lorentz, &existing.lorentz);
                 if ip <= coalesce_cosh_threshold && existing.invariant.n == invariant.n {
                     existing.salience_count = existing.salience_count.saturating_add(1);
                     matched_existing_id = Some(existing.id);
@@ -648,8 +838,7 @@ impl CarvedSwarmMap {
                 let id = AtomId(self.next_id);
                 self.next_id += 1;
                 self.clock.0 += 1;
-                let shared_payload: Arc<[u8]> =
-                    Arc::from(rec.payload.clone().into_boxed_slice());
+                let shared_payload: Arc<[u8]> = Arc::from(rec.payload.clone().into_boxed_slice());
                 let atom = GlobalAtom {
                     id,
                     clock: self.clock,
@@ -730,6 +919,7 @@ impl CarvedSwarmMap {
                     origin_model_fingerprint: atom.origin_model_fingerprint,
                     salience_count: atom.salience_count,
                 };
+                self.silos[r_idx].index_typed_atom(&silo_atom);
                 self.silos[r_idx].atoms.insert(atom.id.0, silo_atom);
                 placed_silos[r_idx] = true;
             }
@@ -767,6 +957,7 @@ impl CarvedSwarmMap {
     pub fn recarve_all_twelve(&mut self, policy: &OverlapPolicyMatrix) -> CarveLossReport {
         for silo in &mut self.silos {
             silo.atoms.clear();
+            silo.typed_kv.clear();
         }
         self.novelty_buckets.clear();
         self.last_carve_loss.shared_boundary_atoms = [[0usize; 12]; 12];
@@ -787,8 +978,13 @@ impl CarvedSwarmMap {
     /// Save the entire centralized `(H³ × T²)/Γ₁₂` map (`0-cell` `GlobalAtom`s, `1-cell`
     /// `DistilledReasoningArc`s, `ingested_tensor_digests`, and `model_lineage`) to a
     /// SHA-256-authenticated `.atoma_map` binary vault on disk.
-    pub fn save_to_binary_vault(&self, path: &std::path::Path) -> Result<(usize, usize, Sha256Digest), String> {
-        let mut buf = Vec::with_capacity(1024 + self.global_atoms.len() * 160 + self.reasoning_arcs.len() * 144);
+    pub fn save_to_binary_vault(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(usize, usize, Sha256Digest), String> {
+        let mut buf = Vec::with_capacity(
+            1024 + self.global_atoms.len() * 160 + self.reasoning_arcs.len() * 144,
+        );
         buf.extend_from_slice(b"ATOMA_MAP_V1");
         buf.extend_from_slice(&self.model_epoch.to_le_bytes());
         buf.extend_from_slice(&self.next_id.to_le_bytes());
@@ -824,7 +1020,7 @@ impl CarvedSwarmMap {
             }
             buf.extend_from_slice(&atom.phase.theta_f.0.to_le_bytes());
             buf.extend_from_slice(&atom.phase.theta_s.0.to_le_bytes());
-            buf.extend_from_slice(&atom. origin_model_fingerprint.0);
+            buf.extend_from_slice(&atom.origin_model_fingerprint.0);
             buf.extend_from_slice(&atom.salience_count.to_le_bytes());
             buf.extend_from_slice(&(atom.payload.len() as u32).to_le_bytes());
             buf.extend_from_slice(&atom.payload);
@@ -857,7 +1053,8 @@ impl CarvedSwarmMap {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        std::fs::write(path, &buf).map_err(|e| format!("Failed to write vault {}: {e}", path.display()))?;
+        std::fs::write(path, &buf)
+            .map_err(|e| format!("Failed to write vault {}: {e}", path.display()))?;
         Ok((self.global_atoms.len(), self.reasoning_arcs.len(), digest))
     }
 
@@ -890,9 +1087,7 @@ impl CarvedSwarmMap {
             *pos += 8;
             Ok(v)
         };
-        let read_i64 = |pos: &mut usize| -> Result<i64, String> {
-            Ok(read_u64(pos)? as i64)
-        };
+        let read_i64 = |pos: &mut usize| -> Result<i64, String> { Ok(read_u64(pos)? as i64) };
         let read_u32 = |pos: &mut usize| -> Result<u32, String> {
             if *pos + 4 > payload_len {
                 return Err("Unexpected EOF reading u32".to_string());
@@ -1034,11 +1229,17 @@ impl CarvedSwarmMap {
         }
 
         self.recarve_all_twelve(policy);
-        Ok((self.global_atoms.len(), self.reasoning_arcs.len(), expected_sha))
+        Ok((
+            self.global_atoms.len(),
+            self.reasoning_arcs.len(),
+            expected_sha,
+        ))
     }
 
     pub fn is_registered_model_fingerprint(&self, fp: &Sha256Digest) -> bool {
-        self.model_lineage.iter().any(|(_, _, lineage_fp)| lineage_fp == fp)
+        self.model_lineage
+            .iter()
+            .any(|(_, _, lineage_fp)| lineage_fp == fp)
     }
 
     fn boost_to_well_frame(&self, role: RoleId, global: &LorentzVector) -> LorentzVector {
@@ -1275,4 +1476,3 @@ impl ModelAdapterLens {
         unit * (std::f64::consts::PI * 0.25)
     }
 }
-

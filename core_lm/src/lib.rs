@@ -4,6 +4,7 @@
 //! every forward pass in `Engine`, `GlimmerModel`, and `QwenModel` requires a verified
 //! `ForwardCompliancePermit` before execution (`core_lm -> immune_system`).
 
+pub mod attention_backend;
 pub mod geometry;
 pub mod cache {
     pub mod geometric;

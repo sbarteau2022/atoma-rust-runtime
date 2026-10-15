@@ -672,7 +672,10 @@ mod tests {
         assert_eq!(RoleId::CARVED_12.len(), 12);
         assert_eq!(DualityAxis::ALL.len(), 6);
 
-        let total_members: u32 = RoleId::ALL_13.iter().map(|r| r.reported_live_members()).sum();
+        let total_members: u32 = RoleId::ALL_13
+            .iter()
+            .map(|r| r.reported_live_members())
+            .sum();
         // 1227 (L0) + 222 + 412 + 1 + 27 + 2 + 26 + 35 = 1952 total reported nodes
         assert_eq!(total_members, 1952);
     }

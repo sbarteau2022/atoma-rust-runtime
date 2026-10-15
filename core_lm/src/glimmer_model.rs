@@ -433,15 +433,29 @@ impl WeightManager {
         if !matches!(s_dtype, "BF16" | "F16" | "F32") || !matches!(b_dtype, "BF16" | "F16" | "F32") {
             return None;
         }
-        if w_dtype != "U32" || w_data.len() % 4 != 0 || (w_data.as_ptr() as usize) % 4 != 0 {
+        if w_dtype != "U32" || !w_data.len().is_multiple_of(4) {
             return None;
         }
 
-        let packed: &[u32] = unsafe {
-            std::slice::from_raw_parts(w_data.as_ptr() as *const u32, w_data.len() / 4)
-        };
-
-        let result = if bits == 4 {
+        let result = if bits == 5 && group_size == 128 {
+            gemm.q5_gemv_bytes(
+                w_data,
+                s_data,
+                b_data,
+                out_scale,
+                x,
+                rows as u32,
+                cols as u32,
+                group_size as u32,
+                s_dtype,
+                b_dtype,
+            )
+        } else if !(w_data.as_ptr() as usize).is_multiple_of(4) {
+            return None;
+        } else if bits == 4 {
+            let packed: &[u32] = unsafe {
+                std::slice::from_raw_parts(w_data.as_ptr() as *const u32, w_data.len() / 4)
+            };
             gemm.q4_gemv(
                 packed,
                 s_data,
@@ -455,6 +469,9 @@ impl WeightManager {
                 b_dtype,
             )
         } else if bits == 6 {
+            let packed: &[u32] = unsafe {
+                std::slice::from_raw_parts(w_data.as_ptr() as *const u32, w_data.len() / 4)
+            };
             gemm.q6_gemv(
                 packed,
                 s_data,
@@ -468,6 +485,9 @@ impl WeightManager {
                 b_dtype,
             )
         } else if bits > 0 && bits <= 16 {
+            let packed: &[u32] = unsafe {
+                std::slice::from_raw_parts(w_data.as_ptr() as *const u32, w_data.len() / 4)
+            };
             gemm.q_generic_gemv(
                 packed,
                 s_data,

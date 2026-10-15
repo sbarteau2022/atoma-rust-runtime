@@ -24,6 +24,7 @@
 //!   eliminating ~108 GB/token of temporary `Vec<f32>` heap allocations.
 
 use crate::cache::geometric::{GeometricMemoryMap, MemoryError};
+use crate::attention_backend::{AttentionBackend, AttentionInput};
 use crate::geometry::bridge::{BridgeError, BridgeLossReport, f32_to_atom_address, f32_to_lorentz};
 use crate::glimmer_model::{GlimmerConfig, GlimmerError, WeightManager};
 use crate::ops::{OpsError, rmsnorm, silu, softmax};
@@ -228,6 +229,8 @@ impl GlimmerModel {
         layer: usize,
         x: &[f32],
         pos: usize,
+        token_id: u32,
+        backend: Option<&mut dyn AttentionBackend>,
     ) -> Result<(Vec<f32>, Option<BridgeLossReport>), ForwardError> {
         let h = self.config.hidden_size;
         let nh = self.config.num_attention_heads;
@@ -278,6 +281,23 @@ impl GlimmerModel {
             apply_rope_traditional(&mut k, hd, pos, theta)?;
         }
 
+        let (mut attn_out, last_loss) = if let Some(backend) = backend {
+            let input = AttentionInput {
+                layer, token_id, position: pos,
+                window_start: if self.config.is_sliding(layer) {
+                    pos.saturating_sub(self.config.sliding_window.saturating_sub(1))
+                } else { 0 },
+                query_heads: nh, kv_heads: nkv, head_dim: hd, dot_scale: scale as f64,
+                query: &q, key: &k, value: &v,
+            };
+            input.validate().map_err(ForwardError::Shape)?;
+            let output = backend.attend(input).map_err(ForwardError::Compliance)?;
+            if output.len() != nh * hd || !output.iter().all(|x| x.is_finite()) {
+                return Err(ForwardError::Shape("attention backend returned invalid output".into()));
+            }
+            let (_, _, loss) = f32_to_atom_address(&k[..hd])?;
+            (output, Some(loss))
+        } else {
         let mut last_loss: Option<BridgeLossReport> = None;
         for kv_h in 0..nkv {
             let geo = &mut self.geo_maps[layer][kv_h];
@@ -345,6 +365,8 @@ impl GlimmerModel {
                 attn_out[qh * hd + d] = acc;
             }
         }
+        (attn_out, last_loss)
+        };
         if let Some(g) = gate {
             for i in 0..attn_out.len() {
                 attn_out[i] *= sigmoid(g[i]);
@@ -385,11 +407,13 @@ impl GlimmerModel {
         layer: usize,
         x: &[f32],
         pos: usize,
+        token_id: u32,
+        backend: Option<&mut dyn AttentionBackend>,
     ) -> Result<(Vec<f32>, Option<BridgeLossReport>), ForwardError> {
         let eps = self.config.rms_norm_eps;
         let post_eps = self.config.post_norm_eps;
         let p = self.layer_prefix(layer);
-        let (attn_branch, loss_rep) = self.attention(layer, x, pos)?;
+        let (attn_branch, loss_rep) = self.attention(layer, x, pos, token_id, backend)?;
         let attn_normed = rmsnorm(
             &attn_branch,
             &self
@@ -433,15 +457,35 @@ impl GlimmerModel {
         pos: usize,
         permit: &ForwardCompliancePermit,
     ) -> Result<Vec<f32>, ForwardError> {
+        self.forward_internal(token_id, pos, permit, None)
+    }
+
+    fn forward_internal(
+        &mut self,
+        token_id: u32,
+        pos: usize,
+        permit: &ForwardCompliancePermit,
+        mut backend: Option<&mut dyn AttentionBackend>,
+    ) -> Result<Vec<f32>, ForwardError> {
         self.immune_gate
             .verify_permit_and_loss(permit, None)
             .map_err(ForwardError::Compliance)?;
 
         let mut x = self.embed(token_id)?;
         let mut last_loss: Option<BridgeLossReport> = None;
+        // Debug: dump hidden states if ATOMA_DUMP_HIDDEN is set
+        let dump_hidden = std::env::var("ATOMA_DUMP_HIDDEN").is_ok();
         for layer in 0..self.config.num_hidden_layers {
-            let (next_x, layer_loss) = self.decoder_layer(layer, &x, pos)?;
+            let (next_x, layer_loss) = match backend.as_deref_mut() {
+                Some(b) => self.decoder_layer(layer, &x, pos, token_id, Some(b))?,
+                None => self.decoder_layer(layer, &x, pos, token_id, None)?,
+            };
             x = next_x;
+            if dump_hidden && layer == 20 && pos == 0 {
+                let bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write("/tmp/hidden_l20.bin", &bytes).ok();
+                eprintln!("[debug] Dumped hidden state layer 20: {} floats", x.len());
+            }
             if layer_loss.is_some() {
                 last_loss = layer_loss;
             }
@@ -497,6 +541,225 @@ impl GlimmerModel {
             }
         }
     }
+
+    /// Use the universal server's memory backend for every layer. The backend selects
+    /// intervention layers; output gates, projections, norms, and MLPs remain model-owned.
+    pub fn forward_with_backend(
+        &mut self, token_id: u32, pos: usize, backend: &mut dyn AttentionBackend,
+    ) -> Result<Vec<f32>, ForwardError> {
+        let permit = self.immune_gate.authorize_forward_pass(
+            token_id, pos, self.weights.structural_fingerprint(),
+        ).map_err(ForwardError::Compliance)?;
+        self.forward_internal(token_id, pos, &permit, Some(backend))
+    }
+
+    /// Execute a single decoder layer while capturing all intermediate hidden states:
+    /// `(x_in, attn_delta, x_mid, mlp_delta, x_out)`.
+    pub fn decoder_layer_instrumented(
+        &mut self,
+        layer: usize,
+        x: &[f32],
+        pos: usize,
+        token_id: u32,
+    ) -> Result<(LayerActivationRecord, Option<BridgeLossReport>), ForwardError> {
+        let eps = self.config.rms_norm_eps;
+        let post_eps = self.config.post_norm_eps;
+        let p = self.layer_prefix(layer);
+        let (attn_branch, loss_rep) = self.attention(layer, x, pos, token_id, None)?;
+        let attn_delta = rmsnorm(
+            &attn_branch,
+            &self
+                .weights
+                .get_weight(&format!("{}.post_attn_norm.weight", p))?,
+            post_eps,
+        )?;
+        let x_mid: Vec<f32> = x
+            .iter()
+            .zip(attn_delta.iter())
+            .map(|(a, b)| a + b)
+            .collect();
+        let mlp_in = rmsnorm(
+            &x_mid,
+            &self
+                .weights
+                .get_weight(&format!("{}.post_attention_layernorm.weight", p))?,
+            eps,
+        )?;
+        let mlp_branch = self.mlp(layer, &mlp_in)?;
+        let mlp_delta = rmsnorm(
+            &mlp_branch,
+            &self
+                .weights
+                .get_weight(&format!("{}.post_ffn_norm.weight", p))?,
+            post_eps,
+        )?;
+        let x_out: Vec<f32> = x_mid
+            .iter()
+            .zip(mlp_delta.iter())
+            .map(|(a, b)| a + b)
+            .collect();
+        Ok((
+            LayerActivationRecord {
+                layer,
+                token_id,
+                next_token_id: None,
+                pos,
+                x_in: x.to_vec(),
+                attn_delta,
+                x_mid,
+                mlp_delta,
+                x_out,
+            },
+            loss_rep,
+        ))
+    }
+
+    /// Execute only the MLP half of `layer` given `x_mid = x_in + attn_delta_from_map`
+    /// (`Phase 1` & `Phase 2` Attention-Only Map Substitution).
+    pub fn mlp_subblock_from_mid(
+        &mut self,
+        layer: usize,
+        x_mid: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>), ForwardError> {
+        let eps = self.config.rms_norm_eps;
+        let post_eps = self.config.post_norm_eps;
+        let p = self.layer_prefix(layer);
+        let mlp_in = rmsnorm(
+            x_mid,
+            &self
+                .weights
+                .get_weight(&format!("{}.post_attention_layernorm.weight", p))?,
+            eps,
+        )?;
+        let mlp_branch = self.mlp(layer, &mlp_in)?;
+        let mlp_delta = rmsnorm(
+            &mlp_branch,
+            &self
+                .weights
+                .get_weight(&format!("{}.post_ffn_norm.weight", p))?,
+            post_eps,
+        )?;
+        let x_out: Vec<f32> = x_mid
+            .iter()
+            .zip(mlp_delta.iter())
+            .map(|(a, b)| a + b)
+            .collect();
+        Ok((mlp_delta, x_out))
+    }
+
+    /// Public wrapper around `embed(token_id)` (`embed_tokens` + `scaleless_rmsnorm`) for
+    /// Map-Native Phase 1/2/3 instrumentation and Phase 3 Weightless mode.
+    pub fn embed_token(&mut self, token_id: u32) -> Result<Vec<f32>, ForwardError> {
+        self.embed(token_id)
+    }
+
+    /// Public wrapper around final `model.norm` + `lm_head.weight` + soft-cap `tanh`
+    /// (`Phase 3 Full Weightless` where only the decoder head runs after 52 map layers).
+    pub fn decode_lm_head(&mut self, final_hidden: &[f32]) -> Result<Vec<f32>, ForwardError> {
+        let xn = rmsnorm(
+            final_hidden,
+            &self.weights.get_weight("model.norm.weight")?,
+            self.config.rms_norm_eps,
+        )?;
+        let mut logits = self.weights.matvec_weight(
+            "lm_head.weight",
+            self.config.vocab_size,
+            self.config.hidden_size,
+            &xn,
+        )?;
+        let cap = self.config.output_soft_cap_temp;
+        let mult = self.config.output_multiplier;
+        if cap > 0.0 {
+            for v in logits.iter_mut() {
+                *v = cap * (*v * mult / cap).tanh();
+            }
+        } else {
+            for v in logits.iter_mut() {
+                *v *= mult;
+            }
+        }
+        Ok(logits)
+    }
+
+    /// Execute a single non-replaced decoder layer (`attention` + `mlp`) during hybrid
+    /// Phase 1 / Phase 2 Map-Native scaling experiments.
+    pub fn execute_standard_layer(
+        &mut self,
+        layer: usize,
+        x: &[f32],
+        pos: usize,
+        token_id: u32,
+    ) -> Result<(Vec<f32>, Option<BridgeLossReport>), ForwardError> {
+        self.decoder_layer(layer, x, pos, token_id, None)
+    }
+
+    /// Instrumented forward pass that captures `(x_in, attn_delta, x_mid, mlp_delta, x_out)`
+    /// for every layer in `capture_layers` (`Phase 1` Layer 20 or all 52 layers).
+    pub fn forward_instrumented(
+        &mut self,
+        token_id: u32,
+        pos: usize,
+        capture_layers: &std::collections::BTreeSet<usize>,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<LayerActivationRecord>), ForwardError> {
+        let current_fp = self.weights.structural_fingerprint();
+        let permit = self
+            .immune_gate
+            .authorize_forward_pass(token_id, pos, current_fp)
+            .map_err(ForwardError::Compliance)?;
+        self.immune_gate
+            .verify_permit_and_loss(&permit, None)
+            .map_err(ForwardError::Compliance)?;
+
+        let mut x = self.embed(token_id)?;
+        let mut last_loss: Option<BridgeLossReport> = None;
+        let mut captures = Vec::with_capacity(capture_layers.len());
+
+        for layer in 0..self.config.num_hidden_layers {
+            if capture_layers.contains(&layer) {
+                let (rec, layer_loss) = self.decoder_layer_instrumented(layer, &x, pos, token_id)?;
+                x = rec.x_out.clone();
+                captures.push(rec);
+                if layer_loss.is_some() {
+                    last_loss = layer_loss;
+                }
+            } else {
+                let (next_x, layer_loss) = self.decoder_layer(layer, &x, pos, token_id, None)?;
+                x = next_x;
+                if layer_loss.is_some() {
+                    last_loss = layer_loss;
+                }
+            }
+        }
+
+        self.immune_gate
+            .verify_permit_and_loss(&permit, last_loss)
+            .map_err(ForwardError::Compliance)?;
+        let logits = self.decode_lm_head(&x)?;
+        let next_token_id = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32);
+        for cap in captures.iter_mut() {
+            cap.next_token_id = next_token_id;
+        }
+        Ok((logits, x, captures))
+    }
+}
+
+/// Complete activation record captured at a single Glimmer transformer layer.
+#[derive(Debug, Clone)]
+pub struct LayerActivationRecord {
+    pub layer: usize,
+    pub token_id: u32,
+    /// Next token ID (argmax of the step logits); stamped by `forward_instrumented`.
+    pub next_token_id: Option<u32>,
+    pub pos: usize,
+    pub x_in: Vec<f32>,
+    pub attn_delta: Vec<f32>,
+    pub x_mid: Vec<f32>,
+    pub mlp_delta: Vec<f32>,
+    pub x_out: Vec<f32>,
 }
 
 #[cfg(test)]

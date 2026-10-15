@@ -10,9 +10,9 @@
 //! - Preserves exact legacy 3-coordinate behavior for short test slices (`key.len() <= 7`)
 //!   so all existing low-dimensional unit tests remain 100% backward-compatible.
 
-use crate::cache::geometric::Phase;
 use super::fixed::Q32_31;
 use super::lorentz::LorentzVector;
+use crate::cache::geometric::Phase;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeError {
@@ -190,7 +190,8 @@ pub fn f32_to_atom_address(
         return Ok((v, phase, report));
     }
 
-    let (z3, z2, input_norm_sq, retained_3d_sq, retained_5d_sq) = fold_full_spectrum_rope_aware(key);
+    let (z3, z2, input_norm_sq, retained_3d_sq, retained_5d_sq) =
+        fold_full_spectrum_rope_aware(key);
     let lv = optical_lens_lift_h3(z3);
     lv.validate().map_err(BridgeError::InvalidVector)?;
 
@@ -288,7 +289,11 @@ mod tests {
         assert!(lv.validate().is_ok());
         // Unlike legacy truncation (which mapped this vector to origin (1,0,0,0)),
         // full-spectrum folding captures non-zero H^3 boost and non-zero T^2 phase!
-        assert!(lv.x[0].to_f64() > 1.0001, "x0={} should be > 1.0", lv.x[0].to_f64());
+        assert!(
+            lv.x[0].to_f64() > 1.0001,
+            "x0={} should be > 1.0",
+            lv.x[0].to_f64()
+        );
         assert!(phase.theta_f != Q32_31::ZERO || phase.theta_s != Q32_31::ZERO);
         assert_eq!(report.input_dimensions, 128);
         assert_eq!(report.discarded_dimensions, 123);

@@ -11,8 +11,11 @@ pub mod bridge;
 pub mod http_api;
 pub mod routing;
 pub mod swarm;
+pub mod toroidal_attention;
+#[cfg(feature = "glimmer")]
+pub mod glimmer_map;
 
-use atoma_immune::cache::geometric::AtomId;
+use atoma_immune::cache::geometric::{AtomId, Phase};
 use atoma_immune::geometry::fixed::Q32_31;
 use atoma_immune::{
     Atlas13, AtomicIrAlphabet, CarveLossReport, CarvedSwarmMap, CompliancePermit,
@@ -20,12 +23,12 @@ use atoma_immune::{
     FirstPrinciplesComplianceEngine, FirstPrinciplesComplianceReport, FrozenBaseWeights,
     FrozenShard, FullModelDistillationReceipt, GeodesicDecodeReceipt, GeodesicMlirDecoder,
     HolonomyLoopReceipt, HyperbolicHolonomyEngine, IDENTITY_FRAME_Q32, ImmuneSystem,
-    LiveNoveltyDistillationReceipt, MetaCognitiveRunbookController, MlirAtomCatalog, MlirSsaBlock,
-    MlirSsaValidationReceipt, ModelHotSwapReceipt, OpenWeightsDistillationEngine, OpticalLens,
-    OverlapPolicyMatrix, ProjectedTangent, QuantizedDistillationReceipt,
-    QuantizedLayerTapDescriptor, ReasoningChainDistillationReceipt, RefractedPoint, RoleId,
-    SurgicalErasureReceipt, SwarmKnowledgeAndHomeostasis, TangentProjector, TeacherTapRecord,
-    WeightDistillationReceipt,
+    LiveNoveltyDistillationReceipt, MapNativeInferenceEngine, MetaCognitiveRunbookController,
+    MlirAtomCatalog, MlirSsaBlock, MlirSsaValidationReceipt, ModelHotSwapReceipt,
+    OpenWeightsDistillationEngine, OpticalLens, OverlapPolicyMatrix, ProjectedTangent,
+    QuantizedDistillationReceipt, QuantizedLayerTapDescriptor, ReasoningChainDistillationReceipt,
+    RefractedPoint, RoleId, SurgicalErasureReceipt, SwarmKnowledgeAndHomeostasis,
+    TangentProjector, TeacherTapRecord, WeightDistillationReceipt,
 };
 use routing::{DeliveredHandoff, HandoffRequest};
 use std::sync::Arc;
@@ -79,6 +82,8 @@ pub struct MonsterHybridServer {
     pub holonomy_engine: HyperbolicHolonomyEngine,
     /// Autonomous Open-Weights Knowledge (`0-cells`) & Reasoning (`1-cells` / `2-cells`) Distillation Engine.
     pub distillation_engine: OpenWeightsDistillationEngine,
+    /// Map-Native Coupled Operator-Atom Inference Engine (`Phase 1 -> Phase 2 -> Phase 3 Weightless`).
+    pub map_native_engine: MapNativeInferenceEngine,
     /// Last ingested live inference atom & role for continuous `1-cell` reasoning-arc synthesis.
     pub last_live_atom: Option<(AtomId, RoleId)>,
     /// Optional path to the persistent `.atoma_map` binary vault on disk.
@@ -119,6 +124,7 @@ impl MonsterHybridServer {
             knowledge_homeostasis: SwarmKnowledgeAndHomeostasis::new(),
             holonomy_engine: HyperbolicHolonomyEngine::default(),
             distillation_engine: OpenWeightsDistillationEngine::default(),
+            map_native_engine: MapNativeInferenceEngine::default(),
             last_live_atom: None,
             persistent_vault_path: None,
             map_generation: 0,
@@ -133,10 +139,26 @@ impl MonsterHybridServer {
         target_role: RoleId,
         radial_offset_tangent: [Q32_31; 3],
     ) -> Result<DistillRefractCarveReceipt, String> {
+        self.ingest_teacher_tap_at_phase(tap, target_role, radial_offset_tangent, None)
+    }
+
+    pub(crate) fn ingest_teacher_tap_at_phase(
+        &mut self,
+        tap: &TeacherTapRecord,
+        target_role: RoleId,
+        radial_offset_tangent: [Q32_31; 3],
+        target_phase: Option<Phase>,
+    ) -> Result<DistillRefractCarveReceipt, String> {
         let shard = FrozenShard::from_tap(tap).map_err(|e| e.to_string())?;
         let mut projected = self.projector.project(tap).map_err(|e| e.to_string())?;
 
         let well = self.swarm_map.atlas.well(target_role);
+        if let Some(phase) = target_phase {
+            projected.phase_drive_t2 = [
+                Q32_31(phase.theta_f.0.wrapping_sub(well.phase.theta_f.0)),
+                Q32_31(phase.theta_s.0.wrapping_sub(well.phase.theta_s.0)),
+            ];
+        }
         let d_sph = Q32_31::from_f64(0.804_735_5);
         projected.tangent_h3 = [
             (well.unit_dir[0] * d_sph) + radial_offset_tangent[0],
