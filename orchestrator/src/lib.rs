@@ -10,6 +10,7 @@
 pub mod bridge;
 pub mod http_api;
 pub mod routing;
+pub mod runtime_model;
 pub mod swarm;
 pub mod toroidal_attention;
 #[cfg(feature = "glimmer")]

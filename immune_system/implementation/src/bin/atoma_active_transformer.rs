@@ -21,10 +21,9 @@ use atoma_immune::geometry::fixed::Q32_31;
 use atoma_immune::{
     Atlas13, CarvedSwarmMap, DEFAULT_ACTIVE_MIND_VAULT, EpisodeWorkingTrace, FrozenBaseWeights,
     GeodesicActiveTransformer, GeodesicCursor, MlirOpId, NativeReader, NativeWireRequest,
-    NativeWireResponse, OverlapPolicyMatrix, Sha256Digest, fold_high_certainty_trajectory_spans,
+    NativeWireResponse, OverlapPolicyMatrix, fold_high_certainty_trajectory_spans,
 };
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 
 const DEFAULT_TOKENIZER_CANDIDATES: &[&str] = &[
@@ -441,7 +440,21 @@ fn main() -> Result<(), String> {
     let iterations = 50usize;
     let steps_per_iter = 32usize;
 
-    // 3A. Incremental O(1) GeodesicCursor Decode (`decode_fast_incremental`)
+    // 3A. Span-Accelerated O(1) GeodesicCursor Decode (`decode_span_accelerated_incremental`)
+    let t_span = Instant::now();
+    let mut total_span_ops = 0usize;
+    let mut total_span_tokens = 0usize;
+    for _ in 0..iterations {
+        let (ops, exp, _txt) =
+            transformer.decode_span_accelerated_incremental(&map, &bench_prefix, steps_per_iter)?;
+        total_span_ops += ops.len();
+        total_span_tokens += exp.len();
+    }
+    let span_elapsed = t_span.elapsed().as_secs_f64();
+    let span_ops_per_sec = (total_span_ops as f64) / span_elapsed;
+    let span_tok_per_sec = (total_span_tokens as f64) / span_elapsed;
+
+    // 3B. Incremental O(1) GeodesicCursor Decode (`decode_fast_incremental`)
     let t_cursor = Instant::now();
     let mut total_cursor_ops = 0usize;
     let mut total_cursor_tokens = 0usize;
@@ -455,7 +468,7 @@ fn main() -> Result<(), String> {
     let cursor_ops_per_sec = (total_cursor_ops as f64) / cursor_elapsed;
     let cursor_tok_per_sec = (total_cursor_tokens as f64) / cursor_elapsed;
 
-    // 3B. Full Active-Inference + Superposition + Span-Expanded Decode (`continue_ids_active_mut`)
+    // 3C. Full Active-Inference + Superposition + Span-Expanded Decode (`continue_ids_active_mut`)
     let t_active = Instant::now();
     let mut total_active_ops = 0usize;
     let mut total_active_tokens = 0usize;
@@ -478,12 +491,12 @@ fn main() -> Result<(), String> {
     let active_ops_per_sec = (total_active_ops as f64) / active_elapsed;
     let active_tok_per_sec = (total_active_tokens as f64) / active_elapsed;
 
-    // 3C. Zero-JSON `ATOMA_WR` Binary Wire Protocol Round-Trip Benchmark
+    // 3D. Zero-JSON `ATOMA_WR` Binary Wire Protocol Round-Trip Benchmark
     let wire_req = NativeWireRequest {
         active_inference: true,
         crystallize_on_success: true,
         max_new: 32,
-        base_vocab: 248_320,
+        base_vocab: 202_048,
         prefix: bench_prefix.to_vec(),
         eos: transformer.transducer.eos_ids.clone(),
     };
@@ -494,19 +507,25 @@ fn main() -> Result<(), String> {
     let wire_resp = NativeWireResponse::from_wire_bytes(&wire_resp_bytes)?;
 
     println!(
-        "  1. O(1) GeodesicCursor Incremental Decode (`decode_fast_incremental`):\n     -> {:>10.1} MlirOp steps/sec | {:>10.1} effective tokens/sec ({:.1}x above 300 tok/s target)",
+        "  1. Span-Accelerated O(1) GeodesicCursor Decode (`decode_span_accelerated_incremental`):\n     -> {:>10.1} MlirOp steps/sec | {:>10.1} effective tokens/sec ({:.1}x above 300 tok/s target)",
+        span_ops_per_sec,
+        span_tok_per_sec,
+        span_tok_per_sec / 300.0
+    );
+    println!(
+        "  2. Token-by-Token O(1) GeodesicCursor Decode (`decode_fast_incremental`):\n     -> {:>10.1} MlirOp steps/sec | {:>10.1} effective tokens/sec ({:.1}x above 300 tok/s target)",
         cursor_ops_per_sec,
         cursor_tok_per_sec,
         cursor_tok_per_sec / 300.0
     );
     println!(
-        "  2. Full Active-Inference + Superposition + Span-Expanded Decode:\n     -> {:>10.1} MlirOp steps/sec | {:>10.1} effective tokens/sec ({:.1}x above 300 tok/s target)",
+        "  3. Full Active-Inference + Superposition + Span-Expanded Decode:\n     -> {:>10.1} MlirOp steps/sec | {:>10.1} effective tokens/sec ({:.1}x above 300 tok/s target)",
         active_ops_per_sec,
         active_tok_per_sec,
         active_tok_per_sec / 300.0
     );
     println!(
-        "  3. Zero-JSON `ATOMA_WR` Binary Wire Frame Round-Trip (32 steps):\n     -> Request: {} bytes | Response: {} bytes | Latency: {:.1} µs | Emitted: {} ops ({} expanded tokens)",
+        "  4. Zero-JSON `ATOMA_WR` Binary Wire Frame Round-Trip (32 steps):\n     -> Request: {} bytes | Response: {} bytes | Latency: {:.1} µs | Emitted: {} ops ({} expanded tokens)",
         wire_req_bytes.len(),
         wire_resp_bytes.len(),
         wire_us,
@@ -514,7 +533,7 @@ fn main() -> Result<(), String> {
         wire_resp.expanded_tokens.len()
     );
     println!(
-        "  4. Causal State Memory Footprint:\n     -> GeodesicCursor: {} bytes constant O(1) (KV Cache = 0 bytes, Python = 0, JSON = 0)",
+        "  5. Causal State Memory Footprint:\n     -> GeodesicCursor: {} bytes constant O(1) (KV Cache = 0 bytes, Python = 0, JSON = 0)",
         std::mem::size_of::<GeodesicCursor>()
     );
 

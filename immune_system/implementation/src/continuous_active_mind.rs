@@ -354,17 +354,18 @@ pub fn fold_high_certainty_trajectory_spans(
     let min_cert = Q32_31::from_f64(0.95).0;
     let max_span_len = (ATOMIC_IR_MAX_VERIFY_TOKENS - 1).clamp(3, 6);
 
-    let mut deterministic_starts: Vec<AtomId> = Vec::new();
-    for atom_u64 in map.arc_bearing_atom_ids() {
-        let aid = AtomId(atom_u64);
-        let indices = map.outgoing_arc_indices(aid);
-        if indices.len() == 1 {
-            let arc = &map.reasoning_arcs[indices[0]];
-            if arc.teacher_certainty_q32.0 >= min_cert
-                && arc.compiled_mlir_op.0 < alphabet.base_vocab_size
-            {
-                deterministic_starts.push(aid);
-            }
+    // Group base-token arcs by `(from_atom, chain_id)` so shared carrier tokens (like " is")
+    // still fold along each specific deterministic reasoning trajectory (`chain_id`).
+    let mut chain_starts: Vec<(AtomId, u64)> = Vec::new();
+    for idx in 0..map.reasoning_arcs.len() {
+        let arc = &map.reasoning_arcs[idx];
+        if arc.teacher_certainty_q32.0 >= min_cert
+            && arc.compiled_mlir_op.0 < alphabet.base_vocab_size
+        {
+            chain_starts.push((arc.from_atom, arc.chain_id));
+        }
+        if chain_starts.len() >= max_spans_to_mint.saturating_mul(6) {
+            break;
         }
     }
 
@@ -372,43 +373,55 @@ pub fn fold_high_certainty_trajectory_spans(
     let mut pinned = 0usize;
     let mut shortcut_arcs = 0usize;
 
-    for start_atom in deterministic_starts {
+    for (start_atom, start_chain_id) in chain_starts {
         if pinned >= max_spans_to_mint {
             break;
         }
         inspected += 1;
 
         let mut curr = start_atom;
+        let mut curr_chain = start_chain_id;
         let mut expansion = Vec::with_capacity(max_span_len);
         let mut first_frame = None;
-        let mut first_chain_id = 0u64;
         let mut first_step_idx = 0usize;
         let mut origin_fp = Sha256Digest([0u8; 32]);
         let mut min_chain_cert = Q32_31::ONE;
 
         for _ in 0..max_span_len {
             let out = map.outgoing_arc_indices(curr);
-            if out.len() != 1 {
+            let mut matching: Option<&DistilledReasoningArc> = None;
+            let mut match_count = 0usize;
+            for &arc_idx in out {
+                let cand = &map.reasoning_arcs[arc_idx];
+                if cand.chain_id == curr_chain
+                    && cand.compiled_mlir_op.0 < alphabet.base_vocab_size
+                    && cand.teacher_certainty_q32.0 >= min_cert
+                {
+                    matching = Some(cand);
+                    match_count += 1;
+                }
+            }
+            if match_count != 1 {
                 break;
             }
-            let arc = &map.reasoning_arcs[out[0]];
-            if arc.teacher_certainty_q32.0 < min_cert
-                || arc.compiled_mlir_op.0 >= alphabet.base_vocab_size
-                || expansion.contains(&arc.compiled_mlir_op.0)
-            {
+            let arc = matching.unwrap();
+            if expansion.contains(&arc.compiled_mlir_op.0) {
                 break;
             }
             if first_frame.is_none() {
                 first_frame = Some(arc.wigner_frame);
-                first_chain_id = arc.chain_id;
                 first_step_idx = arc.step_index;
                 origin_fp = arc.origin_model_fingerprint;
             }
             if arc.teacher_certainty_q32.0 < min_chain_cert.0 {
                 min_chain_cert = arc.teacher_certainty_q32;
             }
-            expansion.push(arc.compiled_mlir_op.0);
+            let emitted_tok = arc.compiled_mlir_op.0;
+            expansion.push(emitted_tok);
             curr = arc.to_atom;
+            curr_chain = curr_chain
+                .wrapping_mul(0x0000_0100_0000_01B3)
+                .wrapping_add(u64::from(emitted_tok));
         }
 
         if expansion.len() >= 3 {
@@ -448,12 +461,9 @@ pub fn fold_high_certainty_trajectory_spans(
                     .map(|a| a.lorentz)
                     .ok_or_else(|| "missing end atom".to_string())?;
                 let cosh_action = OpticalLens::lorentz_inner_product_wide(&from_lor, &to_lor);
-                // Store span arc under a dedicated span chain namespace (`first_chain_id ^ 0x5350_414E`)
-                // so exact token-by-token replay tests remain 1:1 while span-accelerated cursors
-                // can leap across the entire multi-token span in a single hop.
                 let (_aid, is_novel) = map.record_trajectory_arc(DistilledReasoningArc {
                     arc_id: 0,
-                    chain_id: first_chain_id ^ 0x5350_414E_5F56_3100u64,
+                    chain_id: start_chain_id ^ 0x5350_414E_5F56_3100u64,
                     step_index: first_step_idx,
                     from_atom: start_atom,
                     to_atom: curr,
@@ -752,6 +762,93 @@ impl GeodesicActiveTransformer {
             }
             emitted_ops.push(next_op);
             cursor.advance(&self.transducer.catalog, next_op)?;
+        }
+
+        let (expanded_tokens, text) = self.transducer.transduce_egress_ops(&emitted_ops);
+        Ok((emitted_ops, expanded_tokens, text))
+    }
+
+    /// Span-Accelerated `O(1)` Incremental Geodesic Decode:
+    /// Prefers folded `AtomicIrAlphabet` multi-token span shortcut arcs (`MlirOpId >= base_vocab_size`,
+    /// `chain_id == cursor.chain_id ^ 0x5350_414E_5F56_3100`, `3..=6` tokens inside the `<= 7`-token
+    /// verify cliff) when standing at a deterministic chain anchor, advancing the `GeodesicCursor`
+    /// across all expanded tokens of the span and multiplying effective token throughput by `3..6x`.
+    pub fn decode_span_accelerated_incremental(
+        &self,
+        map: &CarvedSwarmMap,
+        prefix: &[MlirOpId],
+        max_new_tokens: usize,
+    ) -> Result<(Vec<MlirOpId>, Vec<u32>, String), String> {
+        let mut cursor = GeodesicCursor::from_prefix(&self.transducer.catalog, prefix)?;
+        let mut emitted_ops = Vec::with_capacity(max_new_tokens);
+        let mut total_expanded_count = 0usize;
+        let slack = Q32_31::from_f64(0.05).0;
+        let max_basin = self.active_config.primary_basin_cosh_q32.0;
+        let base_vocab = self.transducer.atomic_ir.base_vocab_size;
+
+        while total_expanded_count < max_new_tokens {
+            let Some((_best_atom, best_cosh, candidates)) =
+                map.candidate_arc_atoms_near(&cursor.lorentz, cursor.phase, slack)
+            else {
+                break;
+            };
+            if best_cosh > max_basin {
+                break;
+            }
+            let expected_chain = cursor.chain_id;
+            let expected_span_chain = cursor.chain_id ^ 0x5350_414E_5F56_3100u64;
+            let frame = cursor.wigner_frame;
+            let remaining = max_new_tokens - total_expanded_count;
+
+            let Some((winner, _)) = candidates
+                .iter()
+                .flat_map(|&(aid, c)| {
+                    map.outgoing_arc_indices(AtomId(aid))
+                        .iter()
+                        .map(move |&idx| (&map.reasoning_arcs[idx], c))
+                })
+                .min_by(|(a, _), (b, _)| {
+                    let is_span_a = a.compiled_mlir_op.0 >= base_vocab
+                        && a.chain_id == expected_span_chain
+                        && a.wigner_frame == frame
+                        && remaining >= 6;
+                    let is_span_b = b.compiled_mlir_op.0 >= base_vocab
+                        && b.chain_id == expected_span_chain
+                        && b.wigner_frame == frame
+                        && remaining >= 6;
+                    let exact_a = a.chain_id == expected_chain && a.wigner_frame == frame;
+                    let exact_b = b.chain_id == expected_chain && b.wigner_frame == frame;
+                    let align_a = normalized_frame_alignment_q32(&a.wigner_frame, &frame).0;
+                    let align_b = normalized_frame_alignment_q32(&b.wigner_frame, &frame).0;
+                    let dist_a = frame_frobenius_dist_sq_q32(&a.wigner_frame, &frame).0;
+                    let dist_b = frame_frobenius_dist_sq_q32(&b.wigner_frame, &frame).0;
+                    is_span_b
+                        .cmp(&is_span_a)
+                        .then(exact_b.cmp(&exact_a))
+                        .then(align_b.cmp(&align_a))
+                        .then(dist_a.cmp(&dist_b))
+                        .then(a.cosh_action_q32.0.cmp(&b.cosh_action_q32.0))
+                        .then(a.arc_id.cmp(&b.arc_id))
+                })
+            else {
+                break;
+            };
+
+            let next_op = winner.compiled_mlir_op;
+            if self.transducer.eos_ids.contains(&next_op) || next_op == cursor.standing_op {
+                break;
+            }
+            emitted_ops.push(next_op);
+            if next_op.0 >= base_vocab {
+                let expanded = self.transducer.atomic_ir.expand(&[next_op.0]);
+                for &tok in &expanded {
+                    cursor.advance(&self.transducer.catalog, MlirOpId(tok))?;
+                }
+                total_expanded_count += expanded.len().max(1);
+            } else {
+                cursor.advance(&self.transducer.catalog, next_op)?;
+                total_expanded_count += 1;
+            }
         }
 
         let (expanded_tokens, text) = self.transducer.transduce_egress_ops(&emitted_ops);

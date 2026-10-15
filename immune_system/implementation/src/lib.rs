@@ -34,7 +34,13 @@ pub mod mlir_native;
 pub mod native_reader;
 pub mod refraction;
 pub mod silo;
+pub mod skill_evolution;
 pub mod superposition;
+
+pub use skill_evolution::{
+    AutonomousSkillCrystal, LiveVerificationReceipt, PolyglotCodeTrajectorySpec, PolyglotLanguage,
+    SkillEvolutionEngine, SuperpowersAndPolyglotHarvestReceipt, VerifiedCodeSynthesisReceipt,
+};
 
 pub use continuous_active_mind::{
     ATOMA_WAL_MAGIC, ATOMA_WIRE_MAGIC, AgenticTaskCompletionReceipt, BoundaryLexicalTransducer,

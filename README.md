@@ -36,6 +36,7 @@ Requires the Muse Glimmer checkpoint at `~/models/Muse-Glimmer-q4km-gs128-MLX` (
 - `docs/` — session notes and handoff docs
 - `harness/` — qualification tooling
 - `orchestrator/` — Rust control plane, authenticated HTTP/TLS edge, metrics, health checks, snapshots, and worker-cache generation gates
+- `orchestrator/src/runtime_model.rs` — unified vault controller, UTF-8/MLIR edge, compact Wigner sessions, active-inference cascade, measured kill gate, and feature-gated Glimmer teacher forward pass
 - `core_lm/src/attention_backend.rs` and `orchestrator/src/glimmer_map.rs` — opt-in boundary that routes real Glimmer layer attention through the universal server map; enable with the orchestrator `glimmer` feature
 - `orchestrator/src/bin/qualify_map_glimmer.rs` — warmed, paired Glimmer comparison for baseline softmax, P2 pair angles, map-T² weighting, and direct value recall
 - The qualifier captures a selected layer's real Q/K/V and baseline attention output, then evaluates a gain grid on an early/held-out split; typed map atoms carry the key-derived T² phase rather than a placeholder phase
