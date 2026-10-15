@@ -24,3 +24,9 @@ target/
 perf.data
 perf.data.old
 flamegraph.svg
+*.atoma_map
+*.progress
+*.log
+__pycache__/
+*.pyc
+*.wal

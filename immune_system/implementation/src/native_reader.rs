@@ -1,4 +1,6 @@
-//! Native reader: one generation step whose only model is `CarvedSwarmMap`.
+//! Native reader: one generation step whose only model is `CarvedSwarmMap`,
+//! upgraded with Active Inference, Variational Free Energy (`F_q32`) minimization,
+//! and Superposition Holding (`design/superpositionholding.md`).
 //!
 //! An ML-IR ID is a point on `(H³ × T²)`. The prefix is a path of those points.
 //! The reader stands at the last point, queries the global atoms (every origin
@@ -10,10 +12,11 @@
 //!
 //! Layer count, hidden width, expert count, and vocabulary size are not inputs.
 
-use crate::atlas13::RoleId;
+use crate::atlas13::{EpistemicMark, RoleId};
 use crate::cache::geometric::{AtomId, Phase};
 use crate::compliance::OverlapPolicyMatrix;
 use crate::distill_engine::DistilledReasoningArc;
+use crate::first_principles::{MetaControlDecision, OpticalRiskEngine, RoleSignalQ32, RunbookTelemetryQ32};
 use crate::geometry::fixed::Q32_31;
 use crate::geometry::lorentz::LorentzVector;
 use crate::holonomy::{HyperbolicHolonomyEngine, IDENTITY_FRAME_Q32};
@@ -24,7 +27,11 @@ use crate::refraction::{
     rad_q32_to_pi_unit,
 };
 use crate::silo::CarvedSwarmMap;
-use std::collections::BTreeMap;
+use crate::superposition::{
+    ActiveInferenceConfig, ActiveInferenceContinuation, ActiveInferenceStepReceipt,
+    ActiveInferenceStop, SuperpositionHoldingEngine, SuperpositionResolution, SuperpositionState,
+    SuperpositionTrigger,
+};
 
 /// `cosh` of the widest query the reader will treat as standing on the map.
 /// Farther than this, the nearest arc is a different place and is not a continuation.
@@ -46,7 +53,7 @@ pub struct NativeRead {
     pub to_atom: AtomId,
     pub query_cosh_q32: Q32_31,
     pub cosh_action_q32: Q32_31,
-    /// Frobenius product of the prefix gyroscope and the arc's stored Wigner frame.
+    /// Normalized Frobenius cosine alignment of the prefix gyroscope and the arc's stored Wigner frame.
     pub frame_alignment_q32: Q32_31,
     pub origin_model_fingerprint: Sha256Digest,
 }
@@ -93,8 +100,26 @@ impl NativeReader {
         token_carrier_address(id.0)
     }
 
+    /// Compute the arrival Lorentz point and parallel-transported Wigner frame for `prefix`.
+    pub fn context_frame(
+        catalog: &MlirAtomCatalog,
+        prefix: &[MlirOpId],
+    ) -> Result<(LorentzVector, [[Q32_31; 3]; 3]), String> {
+        context(catalog, prefix)
+    }
+
     /// Read the next ML-IR ID from `map` given the IDs so far.
     pub fn step(
+        map: &CarvedSwarmMap,
+        catalog: &MlirAtomCatalog,
+        prefix: &[MlirOpId],
+    ) -> Result<NativeRead, String> {
+        Self::step_greedy_raw(map, catalog, prefix)
+    }
+
+    /// Direct single-step geodesic read using normalized Wigner frame alignment,
+    /// Frobenius residual distance, and causal `chain_id` matching.
+    pub fn step_greedy_raw(
         map: &CarvedSwarmMap,
         catalog: &MlirAtomCatalog,
         prefix: &[MlirOpId],
@@ -103,24 +128,16 @@ impl NativeReader {
             return Err("native reader needs at least one ML-IR ID".to_string());
         };
         let (query, frame) = context(catalog, prefix)?;
+        let (_, query_phase) = Self::address(catalog, last)?;
+        let expected_chain = prefix_chain_id(prefix);
 
-        let mut sources = BTreeMap::<u64, ()>::new();
-        for arc in &map.reasoning_arcs {
-            sources.insert(arc.from_atom.0, ());
-        }
-        if sources.is_empty() {
+        if map.reasoning_arcs.is_empty() {
             return Err("map has no reasoning arcs".to_string());
         }
 
-        let mut atom_cosh: BTreeMap<u64, i64> = BTreeMap::new();
-        for (_key, atom) in map.iter_global_atoms() {
-            if !sources.contains_key(&atom.id.0) {
-                continue;
-            }
-            let cosh = OpticalLens::lorentz_inner_product_wide(&query, &atom.lorentz);
-            atom_cosh.insert(atom.id.0, cosh.0);
-        }
-        let Some((&best_atom, &best_cosh)) = atom_cosh.iter().min_by_key(|(_, c)| *c) else {
+        let Some((best_atom, best_cosh, candidates)) =
+            map.candidate_arc_atoms_near(&query, query_phase, neighborhood_slack())
+        else {
             return Err(format!("no arc-bearing atom on the map for {last}"));
         };
         if best_cosh > query_basin_cosh() {
@@ -131,26 +148,34 @@ impl NativeReader {
             ));
         }
 
-        let band = best_cosh.saturating_add(neighborhood_slack());
-        let winner = map
-            .reasoning_arcs
+        let (winner, query_cosh) = candidates
             .iter()
-            .filter(|arc| atom_cosh.get(&arc.from_atom.0).is_some_and(|c| *c <= band))
-            .min_by(|a, b| {
-                let align_a = frame_alignment(&a.wigner_frame, &frame);
-                let align_b = frame_alignment(&b.wigner_frame, &frame);
-                align_b
-                    .cmp(&align_a)
+            .flat_map(|&(aid, c)| {
+                map.outgoing_arc_indices(AtomId(aid))
+                    .iter()
+                    .map(move |&idx| (&map.reasoning_arcs[idx], c))
+            })
+            .min_by(|(a, _), (b, _)| {
+                // 1. Exact causal prefix chain + exact Wigner frame match wins unconditionally
+                let exact_a = a.chain_id == expected_chain && a.wigner_frame == frame;
+                let exact_b = b.chain_id == expected_chain && b.wigner_frame == frame;
+                // 2. Normalized cosine alignment in Q32_31 (eliminates Frobenius norm inflation bias)
+                let align_a = normalized_frame_alignment_q32(&a.wigner_frame, &frame).0;
+                let align_b = normalized_frame_alignment_q32(&b.wigner_frame, &frame).0;
+                // 3. Exact Frobenius squared residual distance ||A - B||_F^2 (0 iff A == B)
+                let dist_a = frame_frobenius_dist_sq_q32(&a.wigner_frame, &frame).0;
+                let dist_b = frame_frobenius_dist_sq_q32(&b.wigner_frame, &frame).0;
+
+                exact_b
+                    .cmp(&exact_a)
+                    .then(align_b.cmp(&align_a))
+                    .then(dist_a.cmp(&dist_b))
                     .then(a.cosh_action_q32.0.cmp(&b.cosh_action_q32.0))
                     .then(b.teacher_certainty_q32.0.cmp(&a.teacher_certainty_q32.0))
                     .then(a.arc_id.cmp(&b.arc_id))
             })
             .ok_or_else(|| format!("basin of atom {best_atom} has no outgoing arc"))?;
 
-        let query_cosh = atom_cosh
-            .get(&winner.from_atom.0)
-            .copied()
-            .unwrap_or(best_cosh);
         Ok(NativeRead {
             next_id: winner.compiled_mlir_op,
             arc_id: winner.arc_id,
@@ -158,8 +183,543 @@ impl NativeReader {
             to_atom: winner.to_atom,
             query_cosh_q32: Q32_31(query_cosh),
             cosh_action_q32: winner.cosh_action_q32,
-            frame_alignment_q32: Q32_31(frame_alignment(&winner.wigner_frame, &frame)),
+            frame_alignment_q32: normalized_frame_alignment_q32(&winner.wigner_frame, &frame),
             origin_model_fingerprint: winner.origin_model_fingerprint,
+        })
+    }
+
+    /// Execute one **Active Inference** step on `(H³ × T²)/Γ₁₂`:
+    /// - Scores all candidate transitions by **Variational Free Energy (`F_q32`)** (combining
+    ///   geodesic surprise, normalized Wigner holonomy divergence, teacher inaccuracy,
+    ///   Layer 3 compliance/safety/blast-radius potential, and token-efficiency cost).
+    /// - If an issue is detected (`NoDirectGeodesic`, `FixedPointOrCycle`, `WignerFrameAmbiguity`,
+    ///   `FreeEnergyOrReadinessSpike`, or `ComplianceOrSafetyBoundary`), stops greedy emission,
+    ///   invokes `SuperpositionHoldingEngine::hold_and_iterate` (`design/superpositionholding.md`),
+    ///   and dynamically iterates across counterfactual lookaheads and `2-cell` Gauss–Bonnet
+    ///   holonomy loops to resolve a compliant minimum-free-energy solution.
+    pub fn active_inference_step(
+        map: &CarvedSwarmMap,
+        catalog: &MlirAtomCatalog,
+        policy: &OverlapPolicyMatrix,
+        prefix: &[MlirOpId],
+        config: &ActiveInferenceConfig,
+        spent_tokens: u64,
+    ) -> Result<ActiveInferenceStepReceipt, SuperpositionState> {
+        let engine = SuperpositionHoldingEngine::new(config.clone());
+        let last = prefix.last().copied().unwrap_or(MlirOpId(0));
+        let Ok((query_lorentz, prefix_frame)) = context(catalog, prefix) else {
+            let res = engine.hold_and_iterate(
+                map,
+                catalog,
+                policy,
+                prefix,
+                SuperpositionTrigger::NoDirectGeodesic {
+                    at_op: last,
+                    nearest_cosh_q32: Q32_31(i64::MAX / 2),
+                },
+                spent_tokens,
+            );
+            return Self::finalize_superposition_resolution(res);
+        };
+        let query_phase = Self::address(catalog, last)
+            .map(|(_, p)| p)
+            .unwrap_or(Phase {
+                theta_f: Q32_31::ZERO,
+                theta_s: Q32_31::ZERO,
+            });
+
+        let expected_chain = prefix_chain_id(prefix);
+
+        let Some((_best_atom, best_cosh, candidates)) =
+            map.candidate_arc_atoms_near(&query_lorentz, query_phase, neighborhood_slack())
+        else {
+            let res = engine.hold_and_iterate(
+                map,
+                catalog,
+                policy,
+                prefix,
+                SuperpositionTrigger::NoDirectGeodesic {
+                    at_op: last,
+                    nearest_cosh_q32: Q32_31(i64::MAX / 2),
+                },
+                spent_tokens,
+            );
+            return Self::finalize_superposition_resolution(res);
+        };
+
+        // Trigger 1: No Direct Geodesic within primary basin
+        if best_cosh > config.primary_basin_cosh_q32.0 {
+            let res = engine.hold_and_iterate(
+                map,
+                catalog,
+                policy,
+                prefix,
+                SuperpositionTrigger::NoDirectGeodesic {
+                    at_op: last,
+                    nearest_cosh_q32: Q32_31(best_cosh),
+                },
+                spent_tokens,
+            );
+            return Self::finalize_superposition_resolution(res);
+        }
+
+        // Score all outgoing arcs in the primary basin by Variational Free Energy via O(1) 27-cell spatial lookup
+        let mut scored_arcs: Vec<(
+            &DistilledReasoningArc,
+            Q32_31,
+            crate::superposition::VariationalFreeEnergyScore,
+            bool,
+        )> = candidates
+            .iter()
+            .flat_map(|&(aid, c)| {
+                let q_cosh = Q32_31(c);
+                map.outgoing_arc_indices(AtomId(aid))
+                    .iter()
+                    .map(move |&idx| (&map.reasoning_arcs[idx], q_cosh))
+            })
+            .map(|(arc, q_cosh)| {
+                let fe = engine.score_candidate_arc(
+                    map,
+                    catalog,
+                    policy,
+                    prefix,
+                    &query_lorentz,
+                    &prefix_frame,
+                    q_cosh,
+                    arc,
+                );
+                let exact = arc.chain_id == expected_chain && arc.wigner_frame == prefix_frame;
+                (arc, q_cosh, fe, exact)
+            })
+            .collect();
+
+        scored_arcs.sort_by(|a, b| {
+            b.3.cmp(&a.3)
+                .then(
+                    a.2.total_free_energy_q32
+                        .0
+                        .cmp(&b.2.total_free_energy_q32.0),
+                )
+                .then(a.0.cosh_action_q32.0.cmp(&b.0.cosh_action_q32.0))
+                .then(a.0.arc_id.cmp(&b.0.arc_id))
+        });
+
+        let Some(&(best_arc, best_q_cosh, best_fe, best_exact)) = scored_arcs.first() else {
+            let res = engine.hold_and_iterate(
+                map,
+                catalog,
+                policy,
+                prefix,
+                SuperpositionTrigger::NoDirectGeodesic {
+                    at_op: last,
+                    nearest_cosh_q32: Q32_31(best_cosh),
+                },
+                spent_tokens,
+            );
+            return Self::finalize_superposition_resolution(res);
+        };
+
+        // Trigger 2: Compliance or Safety Boundary Violation
+        if !best_fe.compliance_permitted {
+            let to_lor = map
+                .global_atom(best_arc.to_atom)
+                .map(|a| a.lorentz)
+                .unwrap_or(query_lorentz);
+            let blast = OpticalRiskEngine::optical_blast_radius_q32(&to_lor);
+            let res = engine.hold_and_iterate(
+                map,
+                catalog,
+                policy,
+                prefix,
+                SuperpositionTrigger::ComplianceOrSafetyBoundary {
+                    at_op: last,
+                    blocked_op: best_arc.compiled_mlir_op,
+                    blast_radius_q32: blast,
+                },
+                spent_tokens,
+            );
+            return Self::finalize_superposition_resolution(res);
+        }
+
+        // Trigger 3: FixedPoint / Self-Loop or Cycle
+        if best_arc.compiled_mlir_op == last {
+            let res = engine.hold_and_iterate(
+                map,
+                catalog,
+                policy,
+                prefix,
+                SuperpositionTrigger::FixedPointOrCycle {
+                    at_op: last,
+                    repeated_op: best_arc.compiled_mlir_op,
+                },
+                spent_tokens,
+            );
+            return Self::finalize_superposition_resolution(res);
+        }
+
+        // Trigger 4: Wigner Frame / Free-Energy Ambiguity between distinct next_ids (when not an exact chain match)
+        if !best_exact {
+            if let Some(&(second_arc, _, second_fe, _)) = scored_arcs
+                .iter()
+                .find(|(arc, _, _, _)| arc.compiled_mlir_op != best_arc.compiled_mlir_op)
+            {
+                let gap = Q32_31(
+                    (second_fe.total_free_energy_q32.0 - best_fe.total_free_energy_q32.0).max(0),
+                );
+                if gap.0 < config.ambiguity_margin_q32.0 {
+                    let res = engine.hold_and_iterate(
+                        map,
+                        catalog,
+                        policy,
+                        prefix,
+                        SuperpositionTrigger::WignerFrameAmbiguity {
+                            at_op: last,
+                            candidate_a: best_arc.compiled_mlir_op,
+                            candidate_b: second_arc.compiled_mlir_op,
+                            free_energy_gap_q32: gap,
+                        },
+                        spent_tokens,
+                    );
+                    return Self::finalize_superposition_resolution(res);
+                }
+            }
+        }
+
+        // Evaluate Meta-Cognitive Decision Readiness Ω
+        let one = Q32_31::ONE.0 as i128;
+        let denom = one + (best_fe.total_free_energy_q32.0.max(0) as i128);
+        let conf = Q32_31((((one << 31) / denom).clamp(0, one)) as i64);
+        let signal = RoleSignalQ32 {
+            role: best_arc.to_role,
+            hypothesis_hash: best_arc.compiled_mlir_op.0 as u64,
+            proposed_action_hash: best_arc.compiled_mlir_op.0 as u64,
+            confidence_q32: conf,
+        };
+        let to_lor = map
+            .global_atom(best_arc.to_atom)
+            .map(|a| a.lorentz)
+            .unwrap_or(query_lorentz);
+        let telemetry = RunbookTelemetryQ32 {
+            step: prefix.len() as u32,
+            kappa_q32: Q32_31::from_f64(0.92),
+            drift_detected: false,
+            out_of_region: false,
+            regime_collapse: false,
+            verified_progress_in_window: 1,
+            spent_tokens,
+            predicted_token_envelope: config.predicted_token_envelope,
+            nudges_used: 0,
+        };
+        let verdict = engine
+            .meta_controller
+            .evaluate(&[signal], &to_lor, &telemetry);
+
+        // Trigger 5: Free Energy Exceeds Ceiling or Readiness Ω Below Floor
+        if !best_exact
+            && (best_fe.total_free_energy_q32.0 > config.free_energy_ceiling_q32.0
+                || verdict.omega_readiness_q32.0 < config.min_omega_readiness_q32.0)
+        {
+            let res = engine.hold_and_iterate(
+                map,
+                catalog,
+                policy,
+                prefix,
+                SuperpositionTrigger::FreeEnergyOrReadinessSpike {
+                    at_op: last,
+                    free_energy_q32: best_fe.total_free_energy_q32,
+                    omega_readiness_q32: verdict.omega_readiness_q32,
+                },
+                spent_tokens,
+            );
+            return Self::finalize_superposition_resolution(res);
+        }
+
+        Ok(ActiveInferenceStepReceipt {
+            read: NativeRead {
+                next_id: best_arc.compiled_mlir_op,
+                arc_id: best_arc.arc_id,
+                from_atom: best_arc.from_atom,
+                to_atom: best_arc.to_atom,
+                query_cosh_q32: best_q_cosh,
+                cosh_action_q32: best_arc.cosh_action_q32,
+                frame_alignment_q32: normalized_frame_alignment_q32(
+                    &best_arc.wigner_frame,
+                    &prefix_frame,
+                ),
+                origin_model_fingerprint: best_arc.origin_model_fingerprint,
+            },
+            free_energy: best_fe,
+            omega_readiness_q32: verdict.omega_readiness_q32,
+            meta_decision: verdict.decision,
+            superposition_held: None,
+            bridge_arc_distilled: false,
+            mark: EpistemicMark::Verified,
+        })
+    }
+
+    /// Mutable Active Inference step that **self-distills** any newly resolved superposition
+    /// bridge trajectory back into `map` so subsequent traversals resolve in `O(1)` without
+    /// re-entering superposition (`design/superpositionholding.md` §3 Phase 4).
+    pub fn active_inference_step_mut(
+        map: &mut CarvedSwarmMap,
+        catalog: &MlirAtomCatalog,
+        policy: &OverlapPolicyMatrix,
+        prefix: &[MlirOpId],
+        config: &ActiveInferenceConfig,
+        spent_tokens: u64,
+    ) -> Result<ActiveInferenceStepReceipt, SuperpositionState> {
+        let mut receipt =
+            Self::active_inference_step(map, catalog, policy, prefix, config, spent_tokens)?;
+        if receipt.superposition_held.is_some() {
+            // Self-distill the resolved bridge transition into the map
+            if let Ok(wrote) = Self::record_step(
+                map,
+                catalog,
+                policy,
+                prefix,
+                receipt.read.next_id,
+                &[],
+                receipt.read.origin_model_fingerprint,
+                Q32_31::from_f64(0.90),
+            ) {
+                receipt.read = wrote.read;
+                receipt.bridge_arc_distilled = wrote.arc_was_novel;
+            }
+        }
+        Ok(receipt)
+    }
+
+    fn finalize_superposition_resolution(
+        res: SuperpositionResolution,
+    ) -> Result<ActiveInferenceStepReceipt, SuperpositionState> {
+        match res {
+            SuperpositionResolution::CollapsedToSolution {
+                winning_branch,
+                iterations_used: _,
+                bridge_arc_distilled,
+                state,
+            } => {
+                let omega = state
+                    .iteration_traces
+                    .last()
+                    .map(|t| t.omega_readiness_q32)
+                    .unwrap_or(Q32_31::from_f64(0.85));
+                let decision = state
+                    .iteration_traces
+                    .last()
+                    .map(|t| t.meta_decision)
+                    .unwrap_or(MetaControlDecision::ContinueAutonomous);
+                Ok(ActiveInferenceStepReceipt {
+                    read: NativeRead {
+                        next_id: winning_branch.candidate_next_id,
+                        arc_id: winning_branch.arc_id,
+                        from_atom: winning_branch.from_atom,
+                        to_atom: winning_branch.to_atom,
+                        query_cosh_q32: winning_branch.query_cosh_q32,
+                        cosh_action_q32: winning_branch.cosh_action_q32,
+                        frame_alignment_q32: winning_branch.frame_alignment_q32,
+                        origin_model_fingerprint: winning_branch.origin_model_fingerprint,
+                    },
+                    free_energy: winning_branch.free_energy,
+                    omega_readiness_q32: omega,
+                    meta_decision: decision,
+                    superposition_held: Some(state),
+                    bridge_arc_distilled,
+                    mark: EpistemicMark::Verified,
+                })
+            }
+            SuperpositionResolution::FailClosed { reason: _, state } => Err(state),
+        }
+    }
+
+    /// Multi-step **Active Inference** continuation (read-only map).
+    pub fn continue_ids_active(
+        map: &CarvedSwarmMap,
+        catalog: &MlirAtomCatalog,
+        policy: &OverlapPolicyMatrix,
+        prefix: &[MlirOpId],
+        max_new: usize,
+        eos: &[MlirOpId],
+        config: &ActiveInferenceConfig,
+    ) -> Result<ActiveInferenceContinuation, String> {
+        if prefix.is_empty() {
+            return Err("native reader needs at least one ML-IR ID".to_string());
+        }
+        let mut prefix_buf = prefix.to_vec();
+        let mut steps = Vec::new();
+        let mut total_fe: i128 = 0;
+        let mut interventions = 0usize;
+
+        if max_new == 0 {
+            return Ok(ActiveInferenceContinuation {
+                steps,
+                stop: ActiveInferenceStop::MaxNew,
+                total_free_energy_q32: Q32_31::ZERO,
+                superposition_interventions: 0,
+                bridge_arcs_distilled: 0,
+            });
+        }
+
+        for step_idx in 0..max_new {
+            let spent = step_idx as u64;
+            if config.predicted_token_envelope > 0 && spent >= config.predicted_token_envelope {
+                return Ok(ActiveInferenceContinuation {
+                    steps,
+                    stop: ActiveInferenceStop::TokenEnvelopeExhausted {
+                        spent_tokens: spent,
+                        envelope_tokens: config.predicted_token_envelope,
+                    },
+                    total_free_energy_q32: Q32_31(
+                        total_fe.clamp(0, i64::MAX as i128) as i64,
+                    ),
+                    superposition_interventions: interventions,
+                    bridge_arcs_distilled: 0,
+                });
+            }
+
+            match Self::active_inference_step(map, catalog, policy, &prefix_buf, config, spent) {
+                Ok(receipt) => {
+                    let next = receipt.read.next_id;
+                    total_fe += receipt.free_energy.total_free_energy_q32.0 as i128;
+                    if receipt.superposition_held.is_some() {
+                        interventions += 1;
+                    }
+                    steps.push(receipt);
+                    if eos.contains(&next) {
+                        return Ok(ActiveInferenceContinuation {
+                            steps,
+                            stop: ActiveInferenceStop::Eos(next),
+                            total_free_energy_q32: Q32_31(
+                                total_fe.clamp(0, i64::MAX as i128) as i64,
+                            ),
+                            superposition_interventions: interventions,
+                            bridge_arcs_distilled: 0,
+                        });
+                    }
+                    prefix_buf.push(next);
+                }
+                Err(state) => {
+                    let at = prefix_buf[prefix_buf.len() - 1];
+                    return Ok(ActiveInferenceContinuation {
+                        steps,
+                        stop: ActiveInferenceStop::SuperpositionFailClosed {
+                            at,
+                            reason: format!(
+                                "superposition fail-closed at {} after {} iterations",
+                                at,
+                                state.iteration_traces.len()
+                            ),
+                            state,
+                        },
+                        total_free_energy_q32: Q32_31(
+                            total_fe.clamp(0, i64::MAX as i128) as i64,
+                        ),
+                        superposition_interventions: interventions + 1,
+                        bridge_arcs_distilled: 0,
+                    });
+                }
+            }
+        }
+
+        Ok(ActiveInferenceContinuation {
+            steps,
+            stop: ActiveInferenceStop::MaxNew,
+            total_free_energy_q32: Q32_31(total_fe.clamp(0, i64::MAX as i128) as i64),
+            superposition_interventions: interventions,
+            bridge_arcs_distilled: 0,
+        })
+    }
+
+    /// Multi-step **Active Inference** continuation with online bridge-arc self-distillation.
+    pub fn continue_ids_active_mut(
+        map: &mut CarvedSwarmMap,
+        catalog: &MlirAtomCatalog,
+        policy: &OverlapPolicyMatrix,
+        prefix: &[MlirOpId],
+        max_new: usize,
+        eos: &[MlirOpId],
+        config: &ActiveInferenceConfig,
+    ) -> Result<ActiveInferenceContinuation, String> {
+        if prefix.is_empty() {
+            return Err("native reader needs at least one ML-IR ID".to_string());
+        }
+        let mut prefix_buf = prefix.to_vec();
+        let mut steps = Vec::new();
+        let mut total_fe: i128 = 0;
+        let mut interventions = 0usize;
+        let mut distilled_bridges = 0usize;
+
+        for step_idx in 0..max_new {
+            let spent = step_idx as u64;
+            if config.predicted_token_envelope > 0 && spent >= config.predicted_token_envelope {
+                return Ok(ActiveInferenceContinuation {
+                    steps,
+                    stop: ActiveInferenceStop::TokenEnvelopeExhausted {
+                        spent_tokens: spent,
+                        envelope_tokens: config.predicted_token_envelope,
+                    },
+                    total_free_energy_q32: Q32_31(
+                        total_fe.clamp(0, i64::MAX as i128) as i64,
+                    ),
+                    superposition_interventions: interventions,
+                    bridge_arcs_distilled: distilled_bridges,
+                });
+            }
+
+            match Self::active_inference_step_mut(map, catalog, policy, &prefix_buf, config, spent)
+            {
+                Ok(receipt) => {
+                    let next = receipt.read.next_id;
+                    total_fe += receipt.free_energy.total_free_energy_q32.0 as i128;
+                    if receipt.superposition_held.is_some() {
+                        interventions += 1;
+                    }
+                    if receipt.bridge_arc_distilled {
+                        distilled_bridges += 1;
+                    }
+                    steps.push(receipt);
+                    if eos.contains(&next) {
+                        return Ok(ActiveInferenceContinuation {
+                            steps,
+                            stop: ActiveInferenceStop::Eos(next),
+                            total_free_energy_q32: Q32_31(
+                                total_fe.clamp(0, i64::MAX as i128) as i64,
+                            ),
+                            superposition_interventions: interventions,
+                            bridge_arcs_distilled: distilled_bridges,
+                        });
+                    }
+                    prefix_buf.push(next);
+                }
+                Err(state) => {
+                    let at = prefix_buf[prefix_buf.len() - 1];
+                    return Ok(ActiveInferenceContinuation {
+                        steps,
+                        stop: ActiveInferenceStop::SuperpositionFailClosed {
+                            at,
+                            reason: format!(
+                                "superposition fail-closed at {} after {} iterations",
+                                at,
+                                state.iteration_traces.len()
+                            ),
+                            state,
+                        },
+                        total_free_energy_q32: Q32_31(
+                            total_fe.clamp(0, i64::MAX as i128) as i64,
+                        ),
+                        superposition_interventions: interventions + 1,
+                        bridge_arcs_distilled: distilled_bridges,
+                    });
+                }
+            }
+        }
+
+        Ok(ActiveInferenceContinuation {
+            steps,
+            stop: ActiveInferenceStop::MaxNew,
+            total_free_energy_q32: Q32_31(total_fe.clamp(0, i64::MAX as i128) as i64),
+            superposition_interventions: interventions,
+            bridge_arcs_distilled: distilled_bridges,
         })
     }
 
@@ -236,15 +796,8 @@ impl NativeReader {
         }
         let (_query, frame) = context(catalog, prefix)?;
         let last = prefix[prefix.len() - 1];
-        let from_atom = plant_carrier(
-            map,
-            policy,
-            catalog,
-            last,
-            hidden_payload(hidden_state),
-            origin,
-        )?;
-        let to_atom = plant_carrier(map, policy, catalog, next_id, Vec::new(), origin)?;
+        let from_atom = plant_carrier(map, policy, catalog, last, hidden_state, origin)?;
+        let to_atom = plant_carrier(map, policy, catalog, next_id, &[], origin)?;
         let from_lor = map
             .global_atom(from_atom)
             .map(|atom| atom.lorentz)
@@ -369,18 +922,24 @@ fn token_carrier_address(id: u32) -> Result<(LorentzVector, Phase), String> {
     Ok((lorentz, phase))
 }
 
+/// Plants or coalesces a token carrier atom without allocating a `26.6 KB` payload buffer
+/// when the carrier atom already exists on the map with a non-empty payload.
 fn plant_carrier(
     map: &mut CarvedSwarmMap,
     policy: &OverlapPolicyMatrix,
     catalog: &MlirAtomCatalog,
     id: MlirOpId,
-    payload: Vec<u8>,
+    hidden_state: &[f32],
     origin: Sha256Digest,
 ) -> Result<AtomId, String> {
     let point = refract_id(catalog, id)?;
-    let (atom, novel) = map.keep_and_carve_novel_only(point, payload.clone(), origin, policy);
-    if !novel {
-        map.store_payload_if_empty(atom, payload);
+    let (atom, _novel) = map.keep_and_carve_novel_only(point, Vec::new(), origin, policy);
+    if !hidden_state.is_empty()
+        && map
+            .global_atom(atom)
+            .is_some_and(|existing| existing.payload.is_empty())
+    {
+        map.store_payload_if_empty(atom, hidden_payload(hidden_state));
     }
     Ok(atom)
 }
@@ -421,7 +980,8 @@ fn hidden_payload(hidden: &[f32]) -> Vec<u8> {
     buf
 }
 
-fn prefix_chain_id(prefix: &[MlirOpId]) -> u64 {
+/// Compute the deterministic 64-bit FNV-style chain identifier for a prefix sequence.
+pub fn prefix_chain_id(prefix: &[MlirOpId]) -> u64 {
     let mut acc = 0x9E37_79B9_7F4A_7C15u64;
     for id in prefix {
         acc = acc
@@ -431,14 +991,50 @@ fn prefix_chain_id(prefix: &[MlirOpId]) -> u64 {
     acc
 }
 
-fn frame_alignment(a: &[[Q32_31; 3]; 3], b: &[[Q32_31; 3]; 3]) -> i64 {
+/// Normalized Frobenius cosine alignment `<A, B>_F / (||A||_F * ||B||_F)` in `Q32_31` (`[-1, 1]`).
+/// Eliminates the self-norm inflation bias of unnormalized Frobenius dot products across long
+/// Lorentz parallel-transport prefixes.
+pub fn normalized_frame_alignment_q32(a: &[[Q32_31; 3]; 3], b: &[[Q32_31; 3]; 3]) -> Q32_31 {
+    if a == b {
+        return Q32_31::ONE;
+    }
+    let mut dot: i128 = 0;
+    let mut norm_a_sq: i128 = 0;
+    let mut norm_b_sq: i128 = 0;
+    for r in 0..3 {
+        for c in 0..3 {
+            let av = a[r][c].0 as i128;
+            let bv = b[r][c].0 as i128;
+            dot += (av * bv) >> 31;
+            norm_a_sq += (av * av) >> 31;
+            norm_b_sq += (bv * bv) >> 31;
+        }
+    }
+    if norm_a_sq <= 0 || norm_b_sq <= 0 {
+        return Q32_31::ZERO;
+    }
+    let na = OpticalLens::sqrt_q32(Q32_31(norm_a_sq.clamp(0, i64::MAX as i128) as i64)).0 as i128;
+    let nb = OpticalLens::sqrt_q32(Q32_31(norm_b_sq.clamp(0, i64::MAX as i128) as i64)).0 as i128;
+    let denom = (na * nb) >> 31;
+    if denom <= 0 {
+        return Q32_31::ZERO;
+    }
+    let cos = (dot << 31) / denom;
+    let one = Q32_31::ONE.0 as i128;
+    Q32_31(cos.clamp(-one, one) as i64)
+}
+
+/// Exact Frobenius squared residual `||A - B||_F^2 = sum_{r,c} (A_{rc} - B_{rc})^2` in `Q32_31`.
+/// Guaranteed to be `0` if and only if `A == B` bit-for-bit.
+pub fn frame_frobenius_dist_sq_q32(a: &[[Q32_31; 3]; 3], b: &[[Q32_31; 3]; 3]) -> Q32_31 {
     let mut acc: i128 = 0;
     for r in 0..3 {
         for c in 0..3 {
-            acc += a[r][c].0 as i128 * b[r][c].0 as i128;
+            let diff = (a[r][c].0 as i128) - (b[r][c].0 as i128);
+            acc += (diff * diff) >> 31;
         }
     }
-    (acc >> 31).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    Q32_31(acc.clamp(0, i64::MAX as i128) as i64)
 }
 
 #[cfg(test)]

@@ -18,17 +18,21 @@ pub mod glimmer_map;
 use atoma_immune::cache::geometric::{AtomId, Phase};
 use atoma_immune::geometry::fixed::Q32_31;
 use atoma_immune::{
-    Atlas13, AtomicIrAlphabet, CarveLossReport, CarvedSwarmMap, CompliancePermit,
-    ComplianceViolation, DepositCompilationReceipt, EphemeralMapDeposit,
+    ActiveInferenceConfig, ActiveInferenceContinuation, ActiveInferenceStepReceipt,
+    AgenticTaskCompletionReceipt, Atlas13, AtomicIrAlphabet, BoundaryLexicalTransducer,
+    CarveLossReport, CarvedSwarmMap, CompliancePermit, ComplianceViolation,
+    CrystallizationReceipt, DepositCompilationReceipt, EphemeralMapDeposit,
     FirstPrinciplesComplianceEngine, FirstPrinciplesComplianceReport, FrozenBaseWeights,
-    FrozenShard, FullModelDistillationReceipt, GeodesicDecodeReceipt, GeodesicMlirDecoder,
-    HolonomyLoopReceipt, HyperbolicHolonomyEngine, IDENTITY_FRAME_Q32, ImmuneSystem,
-    LiveNoveltyDistillationReceipt, MapNativeInferenceEngine, MetaCognitiveRunbookController,
-    MlirAtomCatalog, MlirSsaBlock, MlirSsaValidationReceipt, ModelHotSwapReceipt,
-    OpenWeightsDistillationEngine, OpticalLens, OverlapPolicyMatrix, ProjectedTangent,
-    QuantizedDistillationReceipt, QuantizedLayerTapDescriptor, ReasoningChainDistillationReceipt,
-    RefractedPoint, RoleId, SurgicalErasureReceipt, SwarmKnowledgeAndHomeostasis,
-    TangentProjector, TeacherTapRecord, WeightDistillationReceipt,
+    FrozenShard, FullModelDistillationReceipt, GeodesicActiveTransformer, GeodesicDecodeReceipt,
+    GeodesicMlirDecoder, HolonomyLoopReceipt, HyperbolicHolonomyEngine, IDENTITY_FRAME_Q32,
+    ImmuneSystem, LiveNoveltyDistillationReceipt, MapNativeInferenceEngine,
+    MetaCognitiveRunbookController, MlirAtomCatalog, MlirOpId, MlirSsaBlock,
+    MlirSsaValidationReceipt, ModelHotSwapReceipt, NativeReader, NativeWireRequest,
+    NativeWireResponse, OpenWeightsDistillationEngine, OpticalLens, OverlapPolicyMatrix,
+    ProjectedTangent, QuantizedDistillationReceipt, QuantizedLayerTapDescriptor,
+    ReasoningChainDistillationReceipt, RefractedPoint, RoleId, SpanFoldingReceipt,
+    SuperpositionState, SurgicalErasureReceipt, SwarmKnowledgeAndHomeostasis, TangentProjector,
+    TeacherTapRecord, WeightDistillationReceipt, fold_high_certainty_trajectory_spans,
 };
 use routing::{DeliveredHandoff, HandoffRequest};
 use std::sync::Arc;
@@ -72,6 +76,8 @@ pub struct MonsterHybridServer {
     pub projector: TangentProjector,
     /// Q32.31 Meta-Cognitive Readiness (Ω) & Runbook Controller (`arXiv:2602.11897v3` + Elle Runbook).
     pub meta_controller: MetaCognitiveRunbookController,
+    /// Active Inference & Superposition Holding configuration (`design/superpositionholding.md`).
+    pub active_inference_config: ActiveInferenceConfig,
     /// Pinned Atomic IR lossless alphabet (`SPEC_atomic_ir.md`).
     pub atomic_ir: AtomicIrAlphabet,
     /// Pinned Geodesic MLIR Opcode Catalog on `(H³ × T²)/Γ₁₂` (`.atoma_ir` / `mlir_atom_catalog.sql`).
@@ -84,6 +90,9 @@ pub struct MonsterHybridServer {
     pub distillation_engine: OpenWeightsDistillationEngine,
     /// Map-Native Coupled Operator-Atom Inference Engine (`Phase 1 -> Phase 2 -> Phase 3 Weightless`).
     pub map_native_engine: MapNativeInferenceEngine,
+    /// Continuous Geodesic Active-Inference Transformer (`O(1)` `GeodesicCursor`, Boundary
+    /// Transducer, Mid-Task Crystallization, and Binary WAL Journal).
+    pub active_transformer: GeodesicActiveTransformer,
     /// Last ingested live inference atom & role for continuous `1-cell` reasoning-arc synthesis.
     pub last_live_atom: Option<(AtomId, RoleId)>,
     /// Optional path to the persistent `.atoma_map` binary vault on disk.
@@ -112,6 +121,7 @@ impl MonsterHybridServer {
         );
 
         governor.spawn_swarm(&swarm_map, &mut immune)?;
+        let active_transformer = GeodesicActiveTransformer::new(248_320, None);
 
         Ok(Self {
             immune,
@@ -119,16 +129,102 @@ impl MonsterHybridServer {
             swarm_map,
             projector: TangentProjector::default(),
             meta_controller: MetaCognitiveRunbookController::default(),
+            active_inference_config: ActiveInferenceConfig::default(),
             atomic_ir: AtomicIrAlphabet::new_canonical(248_320),
             mlir_catalog: MlirAtomCatalog::new_canonical(248_320),
             knowledge_homeostasis: SwarmKnowledgeAndHomeostasis::new(),
             holonomy_engine: HyperbolicHolonomyEngine::default(),
             distillation_engine: OpenWeightsDistillationEngine::default(),
             map_native_engine: MapNativeInferenceEngine::default(),
+            active_transformer,
             last_live_atom: None,
             persistent_vault_path: None,
             map_generation: 0,
         })
+    }
+
+    /// Execute an autonomous task in motion through the server's `GeodesicActiveTransformer`,
+    /// transducing raw UTF-8 text at the outer boundary, navigating via $O(1)$ `GeodesicCursor`
+    /// + `SuperpositionHoldingEngine`, and crystallizing verified trajectories into `self.swarm_map`
+    /// and its write-ahead delta journal (`.atoma_map.wal`).
+    pub fn execute_active_transformer_task(
+        &mut self,
+        episode_id: u64,
+        prompt_text: &str,
+        explicit_prefix: Option<&[MlirOpId]>,
+        max_new_steps: usize,
+        auto_crystallize_on_success: bool,
+    ) -> Result<AgenticTaskCompletionReceipt, String> {
+        self.active_transformer.wal_path = self.persistent_vault_path.as_ref().map(|p| {
+            let mut s = p.as_os_str().to_os_string();
+            s.push(".wal");
+            std::path::PathBuf::from(s)
+        });
+        let receipt = self.active_transformer.execute_task_in_motion(
+            episode_id,
+            prompt_text,
+            explicit_prefix,
+            max_new_steps,
+            auto_crystallize_on_success,
+            &mut self.swarm_map,
+            &self.immune.policy,
+        )?;
+        if receipt.superposition_interventions > 0 || receipt.crystallization.is_some() {
+            self.mark_map_updated();
+        }
+        Ok(receipt)
+    }
+
+    /// Fold high-certainty unbranched trajectory chains (`3..=6` tokens inside the `<= 7`-token
+    /// verify cliff) into single-hop `AtomicIrAlphabet` span opcodes (`MlirOpId >= base_vocab_size`).
+    pub fn fold_map_trajectory_spans(
+        &mut self,
+        max_spans_to_mint: usize,
+    ) -> Result<SpanFoldingReceipt, String> {
+        let receipt = fold_high_certainty_trajectory_spans(
+            &mut self.swarm_map,
+            &self.mlir_catalog,
+            &self.immune.policy,
+            &mut self.active_transformer.transducer.atomic_ir,
+            max_spans_to_mint,
+        )?;
+        if receipt.shortcut_span_arcs_minted > 0 || receipt.new_span_atoms_pinned > 0 {
+            self.mark_map_updated();
+        }
+        Ok(receipt)
+    }
+
+    /// Merge another `.atoma_map` binary vault (e.g. a newly distilled model's static modes or
+    /// token trajectories) directly into `self.swarm_map` with 3-level deduplication.
+    pub fn merge_additional_model_vault(
+        &mut self,
+        other_vault_path: &std::path::Path,
+        recarve: bool,
+    ) -> Result<(usize, usize), String> {
+        let res = self
+            .swarm_map
+            .merge_vault_from(other_vault_path, &self.immune.policy, recarve)?;
+        self.mark_map_updated();
+        if let Some(ref vp) = self.persistent_vault_path {
+            let _ = self.swarm_map.save_to_binary_vault(vp);
+        }
+        Ok(res)
+    }
+
+    /// Handle a zero-JSON `ATOMA_WR` binary wire frame (`NativeWireRequest` -> `NativeWireResponse`).
+    pub fn handle_native_wire_frame(&mut self, request_bytes: &[u8]) -> Result<Vec<u8>, String> {
+        self.active_transformer.wal_path = self.persistent_vault_path.as_ref().map(|p| {
+            let mut s = p.as_os_str().to_os_string();
+            s.push(".wal");
+            std::path::PathBuf::from(s)
+        });
+        let res = self.active_transformer.handle_binary_wire_frame(
+            request_bytes,
+            &mut self.swarm_map,
+            &self.immune.policy,
+        )?;
+        self.mark_map_updated();
+        Ok(res)
     }
 
     /// Execute `Distill (Tap + Hash) → Refract (Project + ExpMap) → Carve (×12) → Silo → Immune-check`
@@ -627,6 +723,60 @@ impl MonsterHybridServer {
             &self.immune.policy,
             &digests,
         )
+    }
+
+    /// Execute one **Active Inference** step on `(H³ × T²)/Γ₁₂` (`design/superpositionholding.md`),
+    /// minimizing Variational Free Energy (`F_q32`), enforcing Layer 3 compliance/safety/blast-radius
+    /// ceilings and token consumption bounds, holding superposition when an issue occurs, and
+    /// self-distilling any newly resolved bridge arc into `self.swarm_map`.
+    pub fn active_inference_step(
+        &mut self,
+        prefix: &[MlirOpId],
+        spent_tokens: u64,
+    ) -> Result<ActiveInferenceStepReceipt, SuperpositionState> {
+        let receipt = NativeReader::active_inference_step_mut(
+            &mut self.swarm_map,
+            &self.mlir_catalog,
+            &self.immune.policy,
+            prefix,
+            &self.active_inference_config,
+            spent_tokens,
+        )?;
+        if receipt.bridge_arc_distilled {
+            self.mark_map_updated();
+            if let Some(ref vp) = self.persistent_vault_path {
+                let _ = self.swarm_map.save_to_binary_vault(vp);
+            }
+        }
+        Ok(receipt)
+    }
+
+    /// Execute a multi-step **Active Inference** continuation on `(H³ × T²)/Γ₁₂`
+    /// (`design/superpositionholding.md`), automatically stopping, holding superposition,
+    /// reasoning across counterfactual `1-cell`/`2-cell` holonomy loops, and iterating to a
+    /// new solution whenever an issue is encountered.
+    pub fn active_inference_decode(
+        &mut self,
+        prefix: &[MlirOpId],
+        max_new: usize,
+        eos: &[MlirOpId],
+    ) -> Result<ActiveInferenceContinuation, String> {
+        let cont = NativeReader::continue_ids_active_mut(
+            &mut self.swarm_map,
+            &self.mlir_catalog,
+            &self.immune.policy,
+            prefix,
+            max_new,
+            eos,
+            &self.active_inference_config,
+        )?;
+        if cont.bridge_arcs_distilled > 0 {
+            self.mark_map_updated();
+            if let Some(ref vp) = self.persistent_vault_path {
+                let _ = self.swarm_map.save_to_binary_vault(vp);
+            }
+        }
+        Ok(cont)
     }
 
     /// Load an existing `.atoma_map` binary vault into `self.swarm_map` (if it exists on disk)

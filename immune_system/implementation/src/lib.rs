@@ -1,7 +1,8 @@
 //! `atoma_immune`: Layer 3 Immune System, DHNG II Optical Refraction, DHNG III 12-Around-1 Silos,
 //! Non-Abelian Hyperbolic Holonomy (`holonomy.rs`), Ephemeral Agent Map Deposits, Model-Agnostic
 //! Centralized Memory, Geodesic MLIR Engine (`mlir_native.rs`), Open-Weights Knowledge & Reasoning
-//! Distillation Engine (`distill_engine.rs`), and First-Principles Superpowers Integration.
+//! Distillation Engine (`distill_engine.rs`), First-Principles Superpowers Integration
+//! (`first_principles.rs`), and Active Inference / Superposition Holding (`superposition.rs`).
 
 #[path = "../../../core_lm/src/geometry/mod.rs"]
 pub mod geometry;
@@ -24,6 +25,7 @@ pub mod ops;
 
 pub mod atlas13;
 pub mod compliance;
+pub mod continuous_active_mind;
 pub mod distill_engine;
 pub mod first_principles;
 pub mod holonomy;
@@ -32,6 +34,14 @@ pub mod mlir_native;
 pub mod native_reader;
 pub mod refraction;
 pub mod silo;
+pub mod superposition;
+
+pub use continuous_active_mind::{
+    ATOMA_WAL_MAGIC, ATOMA_WIRE_MAGIC, AgenticTaskCompletionReceipt, BoundaryLexicalTransducer,
+    CrystallizationReceipt, DEFAULT_ACTIVE_MIND_VAULT, EpisodeWorkingTrace,
+    GeodesicActiveTransformer, GeodesicCursor, NativeWireRequest, NativeWireResponse,
+    SpanFoldingReceipt, fold_high_certainty_trajectory_spans,
+};
 
 pub use map_native::{
     COUPLED_OPERATOR_MAGIC, CoupledOperatorAtomPayload, InstrumentedLayerCapture,
@@ -72,6 +82,7 @@ pub use mlir_native::{
 };
 pub use native_reader::{
     NativeContinuation, NativeRead, NativeReader, NativeStop, TrajectoryWrite,
+    frame_frobenius_dist_sq_q32, normalized_frame_alignment_q32, prefix_chain_id,
 };
 pub use refraction::{
     FrozenShard, OpticalLens, ProjectedTangent, ProjectionLossReport, RefractedPoint,
@@ -82,4 +93,10 @@ pub use silo::{
     AdaptedKvRecord, AdapterLossReport, CarveLossReport, CarvedSwarmMap, CarvedWeightView,
     DepositCompilationReceipt, DepositedAtomRecord, EphemeralMapDeposit, FrozenBaseWeights,
     GlobalAtom, ModelAdapterLens, ModelHotSwapReceipt, SiloAtom, SiloView,
+};
+pub use superposition::{
+    ActiveInferenceConfig, ActiveInferenceContinuation, ActiveInferenceStepReceipt,
+    ActiveInferenceStop, SuperpositionBranch, SuperpositionBranchSource,
+    SuperpositionHoldingEngine, SuperpositionIterationTrace, SuperpositionResolution,
+    SuperpositionState, SuperpositionTrigger, VariationalFreeEnergyScore,
 };

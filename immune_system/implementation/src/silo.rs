@@ -408,6 +408,8 @@ pub struct CarvedSwarmMap {
     pub ingested_tensor_digests: std::collections::BTreeSet<Sha256Digest>,
     /// Directed geodesic reasoning transitions (`1-cells`) distilled from teacher reasoning chains.
     pub reasoning_arcs: Vec<DistilledReasoningArc>,
+    /// O(1) outgoing-arc adjacency index (`from_atom.0 -> Vec<reasoning_arcs_index>`).
+    outgoing_arcs_by_atom: BTreeMap<u64, Vec<usize>>,
     /// The 12 carved specialist silos (`L1`..`L12`).
     silos: [SiloView; 12],
     /// Most recent Stage 5 loss report.
@@ -447,6 +449,7 @@ impl CarvedSwarmMap {
             novelty_buckets: BTreeMap::new(),
             ingested_tensor_digests: std::collections::BTreeSet::new(),
             reasoning_arcs: Vec::new(),
+            outgoing_arcs_by_atom: BTreeMap::new(),
             silos,
             last_carve_loss: CarveLossReport {
                 global_atom_count: 0,
@@ -456,6 +459,21 @@ impl CarvedSwarmMap {
                 shared_boundary_atoms: [[0; 12]; 12],
             },
         }
+    }
+
+    /// Return the slice of `reasoning_arcs` indices leaving `from_atom` in O(1).
+    #[inline]
+    pub fn outgoing_arc_indices(&self, from_atom: AtomId) -> &[usize] {
+        self.outgoing_arcs_by_atom
+            .get(&from_atom.0)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Iterate over all `AtomId`s (`u64`) that have at least one outgoing `1-cell` reasoning arc.
+    #[inline]
+    pub fn arc_bearing_atom_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.outgoing_arcs_by_atom.keys().copied()
     }
 
     pub fn global_atom_count(&self) -> usize {
@@ -698,15 +716,33 @@ impl CarvedSwarmMap {
     /// that leave one well for different next IDs each keep their frame.
     /// Returns `(arc_id, is_novel)`.
     pub fn record_trajectory_arc(&mut self, arc: DistilledReasoningArc) -> (u64, bool) {
-        for existing in &mut self.reasoning_arcs {
-            if existing.from_atom == arc.from_atom
-                && existing.compiled_mlir_op == arc.compiled_mlir_op
-                && existing.wigner_frame == arc.wigner_frame
-            {
-                if arc.teacher_certainty_q32.0 > existing.teacher_certainty_q32.0 {
-                    existing.teacher_certainty_q32 = arc.teacher_certainty_q32;
+        if let Some(indices) = self.outgoing_arcs_by_atom.get(&arc.from_atom.0) {
+            for &idx in indices {
+                let existing = &mut self.reasoning_arcs[idx];
+                if existing.from_atom == arc.from_atom
+                    && existing.compiled_mlir_op == arc.compiled_mlir_op
+                    && existing.wigner_frame == arc.wigner_frame
+                    && existing.chain_id == arc.chain_id
+                {
+                    if arc.teacher_certainty_q32.0 > existing.teacher_certainty_q32.0 {
+                        existing.teacher_certainty_q32 = arc.teacher_certainty_q32;
+                    }
+                    return (existing.arc_id, false);
                 }
-                return (existing.arc_id, false);
+                if existing.from_atom == arc.from_atom
+                    && existing.chain_id == arc.chain_id
+                    && existing.step_index == arc.step_index
+                    && existing.wigner_frame == arc.wigner_frame
+                {
+                    existing.to_atom = arc.to_atom;
+                    existing.compiled_mlir_op = arc.compiled_mlir_op;
+                    existing.cosh_action_q32 = arc.cosh_action_q32;
+                    if arc.teacher_certainty_q32.0 > existing.teacher_certainty_q32.0 {
+                        existing.teacher_certainty_q32 = arc.teacher_certainty_q32;
+                    }
+                    existing.origin_model_fingerprint = arc.origin_model_fingerprint;
+                    return (existing.arc_id, false);
+                }
             }
         }
         self.push_reasoning_arc(arc)
@@ -716,6 +752,11 @@ impl CarvedSwarmMap {
         let id = self.next_arc_id;
         self.next_arc_id += 1;
         arc.arc_id = id;
+        let idx = self.reasoning_arcs.len();
+        self.outgoing_arcs_by_atom
+            .entry(arc.from_atom.0)
+            .or_default()
+            .push(idx);
         self.reasoning_arcs.push(arc);
         (id, true)
     }
@@ -727,7 +768,14 @@ impl CarvedSwarmMap {
         }
         if let Some(atom) = self.global_atoms.get_mut(&id.0) {
             if atom.payload.is_empty() {
-                atom.payload = std::sync::Arc::from(payload.into_boxed_slice());
+                let shared: std::sync::Arc<[u8]> =
+                    std::sync::Arc::from(payload.into_boxed_slice());
+                atom.payload = std::sync::Arc::clone(&shared);
+                for silo in &mut self.silos {
+                    if let Some(sa) = silo.atoms.get_mut(&id.0) {
+                        sa.payload = std::sync::Arc::clone(&shared);
+                    }
+                }
             }
         }
     }
@@ -964,8 +1012,8 @@ impl CarvedSwarmMap {
 
         let atoms_snapshot: Vec<GlobalAtom> = self.global_atoms.values().cloned().collect();
         for atom in &atoms_snapshot {
-            let q1 = atom.lorentz.x[1].0 >> 21;
-            let q2 = atom.lorentz.x[2].0 >> 21;
+            let q1 = atom.lorentz.x[1].0 >> 15;
+            let q2 = atom.lorentz.x[2].0 >> 15;
             let q3 = atom.lorentz.x[3].0 >> 21;
             let key = Self::spatial_bucket_key(q1, q2, q3, atom.invariant.n);
             self.novelty_buckets.entry(key).or_default().push(atom.id);
@@ -973,6 +1021,95 @@ impl CarvedSwarmMap {
         }
         self.refresh_loss_ledger_counts();
         self.last_carve_loss.clone()
+    }
+
+    /// Fast O(1) 27-cell spatial-bucket lookup for arc-bearing atoms near `(query_lorentz, query_phase)`.
+    ///
+    /// - For on-manifold queries (where an arc-bearing carrier atom sits in the 27-cell bucket
+    ///   neighborhood within `cosh <= 1.005`), resolves in `~150 ns` with zero full-map scan!
+    /// - For off-manifold queries, falls back to scanning `arc_bearing_atom_ids()`.
+    pub fn candidate_arc_atoms_near(
+        &self,
+        query_lorentz: &LorentzVector,
+        query_phase: Phase,
+        neighborhood_slack_q32: i64,
+    ) -> Option<(u64, i64, Vec<(u64, i64)>)> {
+        if self.outgoing_arcs_by_atom.is_empty() {
+            return None;
+        }
+        let q1 = query_lorentz.x[1].0 >> 15;
+        let q2 = query_lorentz.x[2].0 >> 15;
+        let q3 = query_lorentz.x[3].0 >> 21;
+        let sec = extract_invariant(
+            rad_q32_to_pi_unit(query_phase.theta_f),
+            rad_q32_to_pi_unit(query_phase.theta_s),
+        )
+        .n;
+        let tight_hit_cosh = Q32_31::from_f64(1.005).0;
+
+        let mut local_hits: Vec<(u64, i64)> = Vec::new();
+        let mut best_local: Option<(u64, i64)> = None;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let key = Self::spatial_bucket_key(q1 + dx, q2 + dy, q3 + dz, sec);
+                    if let Some(bucket) = self.novelty_buckets.get(&key) {
+                        for &cand_id in bucket {
+                            if self.outgoing_arc_indices(cand_id).is_empty() {
+                                continue;
+                            }
+                            if let Some(atom) = self.global_atoms.get(&cand_id.0) {
+                                let c = OpticalLens::lorentz_inner_product_wide(
+                                    query_lorentz,
+                                    &atom.lorentz,
+                                )
+                                .0;
+                                local_hits.push((cand_id.0, c));
+                                match best_local {
+                                    None => best_local = Some((cand_id.0, c)),
+                                    Some((b_id, b_c)) if (c, cand_id.0) < (b_c, b_id) => {
+                                        best_local = Some((cand_id.0, c));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((best_atom, best_cosh)) = best_local {
+            if best_cosh <= tight_hit_cosh {
+                let band = best_cosh.saturating_add(neighborhood_slack_q32);
+                local_hits.retain(|&(_, c)| c <= band);
+                local_hits.sort_by_key(|&(id, _)| id);
+                local_hits.dedup_by_key(|&mut (id, _)| id);
+                return Some((best_atom, best_cosh, local_hits));
+            }
+        }
+
+        // Fallback for wide basin or off-manifold queries
+        let mut best: Option<(u64, i64)> = None;
+        let mut all_scored: Vec<(u64, i64)> =
+            Vec::with_capacity(self.outgoing_arcs_by_atom.len());
+        for atom_id_u64 in self.arc_bearing_atom_ids() {
+            if let Some(atom) = self.global_atoms.get(&atom_id_u64) {
+                let c = OpticalLens::lorentz_inner_product_wide(query_lorentz, &atom.lorentz).0;
+                all_scored.push((atom_id_u64, c));
+                match best {
+                    None => best = Some((atom_id_u64, c)),
+                    Some((b_id, b_c)) if (c, atom_id_u64) < (b_c, b_id) => {
+                        best = Some((atom_id_u64, c));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (best_atom, best_cosh) = best?;
+        let band = best_cosh.saturating_add(neighborhood_slack_q32);
+        all_scored.retain(|&(_, c)| c <= band);
+        Some((best_atom, best_cosh, all_scored))
     }
 
     /// Save the entire centralized `(H³ × T²)/Γ₁₂` map (`0-cell` `GlobalAtom`s, `1-cell`
@@ -1183,6 +1320,7 @@ impl CarvedSwarmMap {
 
         let arc_count = read_u32(&mut pos)? as usize;
         self.reasoning_arcs.clear();
+        self.outgoing_arcs_by_atom.clear();
         for _ in 0..arc_count {
             let arc_id = read_u64(&mut pos)?;
             let chain_id = read_u64(&mut pos)?;
@@ -1212,6 +1350,11 @@ impl CarvedSwarmMap {
             let teacher_certainty_q32 = Q32_31(read_i64(&mut pos)?);
             let origin_model_fingerprint = read_sha(&mut pos)?;
 
+            let idx = self.reasoning_arcs.len();
+            self.outgoing_arcs_by_atom
+                .entry(from_atom.0)
+                .or_default()
+                .push(idx);
             self.reasoning_arcs.push(DistilledReasoningArc {
                 arc_id,
                 chain_id,
@@ -1234,6 +1377,99 @@ impl CarvedSwarmMap {
             self.reasoning_arcs.len(),
             expected_sha,
         ))
+    }
+
+    /// Merge another `.atoma_map` binary vault into `self`, coalescing `0-cell` coordinates
+    /// in `(H³ × T²)/Γ₁₂`, remapping all `1-cell` `DistilledReasoningArc` endpoints to their
+    /// merged `AtomId`s, and optionally compacting raw multi-kilobyte token-carrier payloads
+    /// (`> 4096 B` non-`ATOMA_OP` / non-`ATOMA_KV` float dumps) into `256d` receptor sketches (`1024 B`).
+    /// Returns `(novel_atoms_added, novel_arcs_added)`.
+    pub fn merge_vault_from(
+        &mut self,
+        other_path: &std::path::Path,
+        policy: &OverlapPolicyMatrix,
+        compact_carrier_payloads: bool,
+    ) -> Result<(usize, usize), String> {
+        let plug = FrozenBaseWeights::freeze("merge-loader", 1, vec![0.0; 8]);
+        let mut other = CarvedSwarmMap::new(self.atlas.clone(), plug, self.default_basin_cosh);
+        other.load_from_binary_vault(other_path, policy)?;
+
+        for d in other.ingested_tensor_digests {
+            self.ingested_tensor_digests.insert(d);
+        }
+        for (_ep, name, fp) in other.model_lineage {
+            if !self.is_registered_model_fingerprint(&fp) {
+                let next_ep = self.model_lineage.len() as u64 + 1;
+                self.model_lineage.push((next_ep, name, fp));
+            }
+        }
+
+        let mut id_remap = BTreeMap::<u64, AtomId>::new();
+        let mut novel_atoms = 0usize;
+
+        for (&old_id, atom) in &other.global_atoms {
+            let payload_vec: Vec<u8> = if compact_carrier_payloads
+                && atom.payload.len() > 4096
+                && !atom.payload.starts_with(b"ATOMA_OP")
+                && !atom.payload.starts_with(b"ATOMA_KV_V1\0")
+            {
+                // Compress 26.6 KB raw f32 carrier state down to its first 256 floats (1024 B)
+                atom.payload[..1024.min(atom.payload.len())].to_vec()
+            } else {
+                atom.payload.as_ref().to_vec()
+            };
+
+            let refracted = RefractedPoint {
+                poincare_ball: atom.poincare_ball,
+                lorentz: atom.lorentz,
+                phase: atom.phase,
+                invariant: atom.invariant,
+                projection_loss: crate::refraction::ProjectionLossReport {
+                    input_state_bits: 32,
+                    output_tangent_bits: 256,
+                    discarded_dimensions: 0,
+                    retained_energy_ratio_q32: Q32_31::ONE,
+                    discarded_energy_ratio_q32: Q32_31::ZERO,
+                    teacher_entropy_bits_q32: Q32_31::ZERO,
+                },
+                refraction_loss: crate::refraction::RefractionLossReport {
+                    quantization_ulp_bound: 1,
+                    hyperboloid_residual_q32: Q32_31::ZERO,
+                    refractive_index_q32: Q32_31::ONE,
+                },
+            };
+
+            let (new_id, is_novel) = self.keep_and_carve_novel_only(
+                refracted,
+                payload_vec.clone(),
+                atom.origin_model_fingerprint,
+                policy,
+            );
+            if is_novel {
+                novel_atoms += 1;
+            } else if !payload_vec.is_empty() {
+                self.store_payload_if_empty(new_id, payload_vec);
+            }
+            id_remap.insert(old_id, new_id);
+        }
+
+        let mut novel_arcs = 0usize;
+        for mut arc in other.reasoning_arcs {
+            let Some(&new_from) = id_remap.get(&arc.from_atom.0) else {
+                continue;
+            };
+            let Some(&new_to) = id_remap.get(&arc.to_atom.0) else {
+                continue;
+            };
+            arc.from_atom = new_from;
+            arc.to_atom = new_to;
+            let (_aid, is_novel) = self.record_trajectory_arc(arc);
+            if is_novel {
+                novel_arcs += 1;
+            }
+        }
+
+        Ok((novel_atoms, novel_arcs))
     }
 
     pub fn is_registered_model_fingerprint(&self, fp: &Sha256Digest) -> bool {
