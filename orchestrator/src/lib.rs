@@ -8,13 +8,14 @@
 //! Distillation Engine** (`OpenWeightsDistillationEngine`).
 
 pub mod bridge;
+#[cfg(feature = "glimmer")]
+pub mod glimmer_map;
 pub mod http_api;
+pub mod live_map_ui;
 pub mod routing;
 pub mod runtime_model;
 pub mod swarm;
 pub mod toroidal_attention;
-#[cfg(feature = "glimmer")]
-pub mod glimmer_map;
 
 use atoma_immune::cache::geometric::{AtomId, Phase};
 use atoma_immune::geometry::fixed::Q32_31;
@@ -266,9 +267,9 @@ impl MonsterHybridServer {
         other_vault_path: &std::path::Path,
         recarve: bool,
     ) -> Result<(usize, usize), String> {
-        let res = self
-            .swarm_map
-            .merge_vault_from(other_vault_path, &self.immune.policy, recarve)?;
+        let res =
+            self.swarm_map
+                .merge_vault_from(other_vault_path, &self.immune.policy, recarve)?;
         self.mark_map_updated();
         if let Some(ref vp) = self.persistent_vault_path {
             self.swarm_map
@@ -543,8 +544,7 @@ impl MonsterHybridServer {
         if let (Some(aid), Some(r)) = (receipt.atom_id, receipt.role) {
             self.last_live_atom = Some((aid, r));
         }
-        if (receipt.atom_was_novel || receipt.arc_was_novel)
-            && self.persistent_vault_path.is_some()
+        if (receipt.atom_was_novel || receipt.arc_was_novel) && self.persistent_vault_path.is_some()
         {
             self.persist_global_map_live_turn()?;
         }

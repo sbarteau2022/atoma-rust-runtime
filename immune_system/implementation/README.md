@@ -15,3 +15,9 @@ Consumes `TeacherTapRecord`s (frozen layer states + next-op probabilities), `Fro
 ## Qualification
 
 Run `cargo test --manifest-path Cargo.toml` from this directory, or run the full chain qualification in [../../orchestrator/tests/full_chain_qualification.rs](../../orchestrator/tests/full_chain_qualification.rs) (`[verified]`).
+
+## Unified vault merger
+
+Build with `cargo build --offline --release --manifest-path immune_system/implementation/Cargo.toml --bin merge_unified_mind` from the repository root. The binary merges the four default inputs (`design/global_100pc.atoma_map`, `design/glimmer_52l_map_native.atoma_map`, and Glimmer/Qwen token trajectory vaults) into `design/unified_one_mind.atoma_map`; trajectory carrier payloads are compacted by the existing merger API. Use `--help` to override paths. It refuses to overwrite the destination or an input vault. This creates a merged memory vault; it does not itself start the server or prove model-quality claims.
+
+Run: `cargo run --offline --release --manifest-path immune_system/implementation/Cargo.toml --bin merge_unified_mind`.

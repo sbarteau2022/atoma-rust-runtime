@@ -35,7 +35,13 @@ pub mod native_reader;
 pub mod refraction;
 pub mod silo;
 pub mod skill_evolution;
+pub mod specialist_carving;
 pub mod superposition;
+
+pub use specialist_carving::{
+    BasinActivationMetric, CANONICAL_DOMAIN_PRESETS, CarvedSpecialistProfile, DomainProbePreset,
+    LitAtomPoint, LitTrajectoryArc, project_qwen_token_sketch,
+};
 
 pub use skill_evolution::{
     AutonomousSkillCrystal, LiveVerificationReceipt, PolyglotCodeTrajectorySpec, PolyglotLanguage,
