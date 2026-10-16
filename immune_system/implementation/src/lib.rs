@@ -40,7 +40,7 @@ pub mod superposition;
 
 pub use specialist_carving::{
     BasinActivationMetric, CANONICAL_DOMAIN_PRESETS, CarvedSpecialistProfile, DomainProbePreset,
-    LitAtomPoint, LitTrajectoryArc, project_qwen_token_sketch,
+    LitAtomPoint, LitTrajectoryArc, project_qwen_token_sketch, volumetric_cone_ball_coord,
 };
 
 pub use skill_evolution::{

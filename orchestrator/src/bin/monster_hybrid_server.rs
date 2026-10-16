@@ -13,7 +13,7 @@ use atoma_immune::{
 };
 use atoma_orchestrator::MonsterHybridServer;
 use atoma_orchestrator::live_map_ui::INTERACTIVE_MAP_VISUALIZER_HTML;
-use atoma_orchestrator::runtime_model::MainModelCoordinatorRuntime;
+use atoma_orchestrator::runtime_model::{LiveOperationalTurnReceipt, MainModelCoordinatorRuntime};
 use std::collections::HashMap;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let wants_query_or_serve = args.iter().any(|a| {
         a == "--query"
+            || a == "--turn"
             || a == "--serve-stdin"
             || a == "--serve"
             || a == "--probe-domains"
@@ -834,7 +835,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Load persistent vault ONCE when `--query`, `--serve-stdin`, `--serve`, or `--probe-domains` is requested
+    // Load persistent vault ONCE when `--query`, `--turn`, `--serve-stdin`, `--serve`, or `--probe-domains` is requested
     if wants_query_or_serve && server.persistent_vault_path.is_none() {
         let t_load = std::time::Instant::now();
         let (loaded_atoms, loaded_arcs, sha_opt) =
@@ -910,6 +911,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // 1b. One-shot or multi-turn Live Operational Turn & Real-Time Learning: `--turn "<prompt>"`
+    let has_turn_flags = args.iter().any(|a| a == "--turn");
+    if has_turn_flags {
+        let mut runtime = MainModelCoordinatorRuntime {
+            server,
+            sessions: Default::default(),
+        };
+        for (idx, arg) in args.iter().enumerate() {
+            if arg == "--turn" {
+                if let Some(prompt_text) = args.get(idx + 1) {
+                    let op =
+                        runtime.execute_live_operational_turn(1, prompt_text, max_new, None)?;
+                    print_live_operational_turn(&op);
+                }
+            }
+        }
+        server = runtime.server;
+    }
+
     // 2. Persistent Interactive REPL / Pipe Daemon Mode: `--serve-stdin`
     if args.iter().any(|a| a == "--serve-stdin") {
         use std::io::BufRead;
@@ -918,7 +938,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sessions: Default::default(),
         };
         println!(
-            "[verified] GeodesicActiveTransformer stdin ready (bare prompts generate from the global map; `query <text>` retrieves only, `learn <text>` intakes only, `save` snapshots vault, `/reset`, `status`, `quit`; max_new={}, global_0cells={}, global_1cell_arcs={})",
+            "[verified] GeodesicActiveTransformer stdin ready (bare prompts execute 3-Tier Live Operational Turn + Real-Time Learning; `query <text>` retrieves only, `learn <text>` intakes only, `save` snapshots vault, `/reset`, `status`, `quit`; max_new={}, global_0cells={}, global_1cell_arcs={})",
             max_new,
             runtime.server.swarm_map.global_atom_count(),
             runtime.server.swarm_map.reasoning_arcs.len()
@@ -1012,23 +1032,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(error) => eprintln!("[subagent held] {error}"),
                 }
             } else {
-                let t_turn = std::time::Instant::now();
-                match runtime.execute_human_turn(1, trimmed, max_new, |_, _| {
-                    Err(
-                        "no external teacher is configured and map inference returned no output"
-                            .to_string(),
-                    )
-                }) {
-                    Ok(turn) => {
-                        println!("{}", turn.response_text);
-                        println!(
-                            "[turn] tier={:?} emitted={} tier2_holds={} new_arcs={} elapsed_ms={:.1}",
-                            turn.tier,
-                            turn.emitted_ops.len(),
-                            turn.tier2_superposition_interventions,
-                            turn.crystallized_arcs,
-                            t_turn.elapsed().as_secs_f64() * 1000.0
-                        );
+                match runtime.execute_live_operational_turn(1, trimmed, max_new, None) {
+                    Ok(op) => {
+                        print_live_operational_turn(&op);
                     }
                     Err(error) => eprintln!("[generation held] {error}"),
                 }
@@ -1052,14 +1058,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(usize::MAX);
             run_persistent_tcp_server(
-                &mut server,
+                server,
                 bind_addr,
                 role_override,
                 top_k_retrieve,
                 max_hops,
                 learn_query,
+                max_new,
                 max_requests,
             )?;
+            return Ok(());
         }
     }
 
@@ -1078,6 +1086,30 @@ fn parse_role_arg(s: &str) -> Option<RoleId> {
         }
     }
     None
+}
+
+fn print_live_operational_turn(op: &LiveOperationalTurnReceipt) {
+    let basins: Vec<String> = op
+        .specialist_profile
+        .lit_basins
+        .iter()
+        .map(|r| format!("{}({})", r.short_code(), r.name()))
+        .collect();
+    println!("{}", op.turn.response_text);
+    println!(
+        "[live-turn] tier={:?} teacher={} specialist=[{}] emitted={} tier2_holds={} novel_0cells=+{} novel_1cells=+{} wal_bytes=+{} total_0cells={} total_1cells={} latency={:.2}ms",
+        op.turn.tier,
+        op.teacher_source,
+        basins.join(" + "),
+        op.turn.emitted_ops.len(),
+        op.turn.tier2_superposition_interventions,
+        op.novel_atoms_minted,
+        op.novel_arcs_minted,
+        op.wal_bytes_appended,
+        op.atoms_after,
+        op.arcs_after,
+        op.latency_us as f64 / 1000.0
+    );
 }
 
 fn print_all_domain_specialist_carvings(server: &MonsterHybridServer) {
@@ -1196,35 +1228,49 @@ fn print_query_result(res: &atoma_orchestrator::SwarmMapQueryResult, elapsed_us:
 }
 
 fn run_persistent_tcp_server(
-    server: &mut MonsterHybridServer,
+    server: MonsterHybridServer,
     bind_addr: &str,
     role_override: Option<RoleId>,
     top_k: usize,
     max_hops: usize,
     learn_default: bool,
+    default_max_new: usize,
     max_requests: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{Read, Write};
 
-    // PRE-CACHE THE ENTIRE SERVER MAP & CANONICAL DOMAIN PROBES ONCE AT STARTUP
+    let mut runtime = MainModelCoordinatorRuntime {
+        server,
+        sessions: Default::default(),
+    };
+
+    // PRE-CACHE THE ENTIRE SERVER MAP, FULL 3D VOLUMETRIC POINT CLOUD & CANONICAL DOMAIN PROBES ONCE AT STARTUP
     let t_precache = std::time::Instant::now();
-    let cached_map_state_json = server.render_map_state_json();
+    let mut cached_map_state_json = runtime.server.render_map_state_json();
+    let cached_point_cloud_bin = runtime.server.render_full_point_cloud_binary();
     let mut cached_domain_profiles: HashMap<String, String> = HashMap::new();
     println!(
-        "\n[pre-cache] Pre-computing 12-Basin Attractor Map & 5 Canonical Domain Specialist Carvings ONCE..."
+        "\n[pre-cache] Pre-computing 12-Basin 3D Volumetric Point Cloud ({} atoms = {} bytes) & 5 Canonical Domain Specialist Carvings ONCE...",
+        runtime.server.swarm_map.global_atom_count(),
+        cached_point_cloud_bin.len()
     );
     for preset in CANONICAL_DOMAIN_PRESETS {
         let t_p = std::time::Instant::now();
-        let profile = server.probe_and_carve_live_specialist(preset.domain_id, None);
+        let profile = runtime
+            .server
+            .probe_and_carve_live_specialist(preset.domain_id, None);
         let p_us = t_p.elapsed().as_micros();
         print_specialist_carving_profile(&profile);
-        let json = server.render_specialist_profile_json(&profile, p_us);
+        let json = runtime
+            .server
+            .render_specialist_profile_json(&profile, p_us);
         cached_domain_profiles.insert(preset.domain_id.to_string(), json);
     }
     println!(
-        "[verified] Server Pre-Cache Complete in {:.2}ms (map_state_json={} bytes, preset_domains={})\n",
+        "[verified] Server Pre-Cache Complete in {:.2}ms (map_state_json={} bytes, full_3d_point_cloud={} bytes, preset_domains={})\n",
         t_precache.elapsed().as_secs_f64() * 1000.0,
         cached_map_state_json.len(),
+        cached_point_cloud_bin.len(),
         cached_domain_profiles.len()
     );
 
@@ -1232,8 +1278,8 @@ fn run_persistent_tcp_server(
     println!(
         "[verified] Live Qwen-Connected Map Visualizer & Pre-Cached HTTP Daemon listening on http://{} (global_0cells={}, global_1cell_arcs={})",
         bind_addr,
-        server.swarm_map.global_atom_count(),
-        server.swarm_map.reasoning_arcs.len()
+        runtime.server.swarm_map.global_atom_count(),
+        runtime.server.swarm_map.reasoning_arcs.len()
     );
 
     let mut handled = 0usize;
@@ -1281,6 +1327,77 @@ fn run_persistent_tcp_server(
                 continue;
             }
 
+            if route_path == "/api/map-points.bin" {
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    cached_point_cloud_bin.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&cached_point_cloud_bin);
+                handled += 1;
+                continue;
+            }
+
+            if route_path == "/api/turn" {
+                let q_param = extract_query_param(query_part, "q").unwrap_or_else(|| {
+                    if first_line.starts_with("POST ") {
+                        req_str
+                            .split("\r\n\r\n")
+                            .nth(1)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string()
+                    } else {
+                        "The capital of France is".to_string()
+                    }
+                });
+                let session_id = extract_query_param(query_part, "session")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(1);
+                let turn_max_new = extract_query_param(query_part, "max_new")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(default_max_new);
+                let basins_param = extract_query_param(query_part, "basins");
+                let manual_basins: Option<Vec<RoleId>> = basins_param.and_then(|b_str| {
+                    let parsed: Vec<RoleId> =
+                        b_str.split(',').filter_map(|s| parse_role_arg(s)).collect();
+                    if parsed.is_empty() {
+                        None
+                    } else {
+                        Some(parsed)
+                    }
+                });
+
+                let json_body = match runtime.execute_live_operational_turn(
+                    session_id,
+                    &q_param,
+                    turn_max_new,
+                    manual_basins.as_deref(),
+                ) {
+                    Ok(op_receipt) => {
+                        print_live_operational_turn(&op_receipt);
+                        if op_receipt.novel_atoms_minted > 0 || op_receipt.novel_arcs_minted > 0 {
+                            cached_map_state_json = runtime.server.render_map_state_json();
+                        }
+                        runtime
+                            .server
+                            .render_live_operational_turn_json(&op_receipt)
+                    }
+                    Err(err) => {
+                        format!("{{\"error\":\"{}\"}}", err.to_string().replace('"', "\\\""))
+                    }
+                };
+
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    json_body.len(),
+                    json_body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                handled += 1;
+                continue;
+            }
+
             if route_path == "/api/probe" {
                 let q_param = extract_query_param(query_part, "q")
                     .unwrap_or_else(|| "coding_intensive".to_string());
@@ -1301,14 +1418,21 @@ fn run_persistent_tcp_server(
                         cached.clone()
                     } else {
                         let t_p = std::time::Instant::now();
-                        let profile = server.probe_and_carve_live_specialist(&q_param, None);
-                        server.render_specialist_profile_json(&profile, t_p.elapsed().as_micros())
+                        let profile = runtime
+                            .server
+                            .probe_and_carve_live_specialist(&q_param, None);
+                        runtime
+                            .server
+                            .render_specialist_profile_json(&profile, t_p.elapsed().as_micros())
                     }
                 } else {
                     let t_p = std::time::Instant::now();
-                    let profile =
-                        server.probe_and_carve_live_specialist(&q_param, manual_basins.as_deref());
-                    server.render_specialist_profile_json(&profile, t_p.elapsed().as_micros())
+                    let profile = runtime
+                        .server
+                        .probe_and_carve_live_specialist(&q_param, manual_basins.as_deref());
+                    runtime
+                        .server
+                        .render_specialist_profile_json(&profile, t_p.elapsed().as_micros())
                 };
 
                 let resp = format!(
@@ -1349,8 +1473,13 @@ fn run_persistent_tcp_server(
         }
 
         let t_q = std::time::Instant::now();
-        let res =
-            server.query_swarm_map(&query_str, role_override, top_k, max_hops, learn_default)?;
+        let res = runtime.server.query_swarm_map(
+            &query_str,
+            role_override,
+            top_k,
+            max_hops,
+            learn_default,
+        )?;
         let q_us = t_q.elapsed().as_micros();
         print_query_result(&res, q_us);
 
