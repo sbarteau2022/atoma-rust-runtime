@@ -2,8 +2,9 @@
 //! The index stores atom IDs only; all values are read from the current central silo.
 
 use crate::toroidal_attention::{
-    MapKvIdentity, decode_map_kv_payload, map_phase_coherence, normalized_power_weights,
-    pair_coherence, softmax_weights, weighted_values,
+    LinearMapValueAdapter, MapKvIdentity, decode_map_kv_payload, map_phase_coherence,
+    normalized_power_weights, pair_coherence, radial_pair_toroidal_coherence, softmax_weights,
+    weighted_values,
 };
 use crate::{MonsterHybridServer, swarm::ProcessState};
 use atoma_immune::geometry::bridge::f32_to_atom_address;
@@ -17,8 +18,10 @@ use std::time::Instant;
 pub enum RecallMode {
     Baseline,
     PairAngles,
+    RadialToroidal,
     MapT2,
     Direct,
+    AdaptedMapValue,
 }
 
 #[derive(Debug, Clone)]
@@ -26,7 +29,7 @@ pub struct RecallConfig {
     pub mode: RecallMode,
     pub layers: BTreeSet<usize>,
     pub gain: f64,
-    /// Bound on payloads considered by MapT2/Direct. Baseline/P2 use all causal keys.
+    /// Bound on payloads considered by MapT2/Direct. Baseline/P2/RadialToroidal/AdaptedMapValue use causal keys.
     pub candidate_limit: usize,
 }
 
@@ -72,6 +75,7 @@ pub struct CentralMapAttention<'a> {
     role: RoleId,
     sequence_id: u64,
     config: RecallConfig,
+    adapter: Option<LinearMapValueAdapter>,
     pub metrics: RecallMetrics,
     trace_layer: Option<usize>,
     pub attention_trace: Vec<AttentionSnapshot>,
@@ -104,10 +108,18 @@ impl<'a> CentralMapAttention<'a> {
             role,
             sequence_id,
             config,
+            adapter: None,
             metrics: RecallMetrics::default(),
             trace_layer: None,
             attention_trace: Vec::new(),
         })
+    }
+
+    /// Attach a validated `LinearMapValueAdapter` for `RecallMode::AdaptedMapValue`.
+    pub fn set_adapter(&mut self, adapter: LinearMapValueAdapter) -> Result<(), String> {
+        adapter.validate()?;
+        self.adapter = Some(adapter);
+        Ok(())
     }
 
     /// Record the pre-output-projection attention vector for one layer per token.
@@ -201,7 +213,10 @@ impl<'a> CentralMapAttention<'a> {
             }
             self.metrics.fetched_values += 1;
             let score = match mode {
-                RecallMode::Baseline | RecallMode::PairAngles => {
+                RecallMode::Baseline
+                | RecallMode::PairAngles
+                | RecallMode::RadialToroidal
+                | RecallMode::AdaptedMapValue => {
                     let key: Vec<f32> = raw[..dim * 4]
                         .as_chunks::<4>()
                         .0
@@ -211,6 +226,14 @@ impl<'a> CentralMapAttention<'a> {
                     if !key.iter().all(|v| v.is_finite()) {
                         return Err("non-finite key".into());
                     }
+                    if mode == RecallMode::AdaptedMapValue {
+                        let d = phase_distance(query_phase, atom.phase);
+                        if direct.as_ref().is_none_or(|(old, old_id, _)| {
+                            d < *old || (d == *old && id.0 < *old_id)
+                        }) {
+                            direct = Some((d, id.0, value.clone()));
+                        }
+                    }
                     if mode == RecallMode::Baseline {
                         self.metrics.dot_products += 1;
                         query
@@ -219,9 +242,12 @@ impl<'a> CentralMapAttention<'a> {
                             .map(|(&q, &k)| q as f64 * k as f64)
                             .sum::<f64>()
                             * input.dot_scale
-                    } else {
+                    } else if mode == RecallMode::PairAngles {
                         self.metrics.phase_scores += 1;
                         pair_coherence(query, &key)?
+                    } else {
+                        self.metrics.phase_scores += 1;
+                        radial_pair_toroidal_coherence(query, &key, input.dot_scale)?
                     }
                 }
                 RecallMode::MapT2 => {
@@ -253,7 +279,20 @@ impl<'a> CentralMapAttention<'a> {
                 .map(|(_, _, v)| v)
                 .ok_or("direct recall missed".into());
         }
-        let weights = if mode == RecallMode::Baseline {
+        if mode == RecallMode::AdaptedMapValue {
+            self.metrics.direct_reads += 1;
+            let direct_val = direct
+                .map(|(_, _, v)| v)
+                .ok_or("adapted recall missed direct candidate")?;
+            let rt_weights = softmax_weights(&scores);
+            let rt_val = weighted_values(&rt_weights, &values, dim);
+            let adapter = self
+                .adapter
+                .as_ref()
+                .ok_or("AdaptedMapValue requires a loaded LinearMapValueAdapter")?;
+            return adapter.predict_head(query, &direct_val, Some(&rt_val));
+        }
+        let weights = if matches!(mode, RecallMode::Baseline | RecallMode::RadialToroidal) {
             softmax_weights(&scores)
         } else {
             normalized_power_weights(&scores, self.config.gain)

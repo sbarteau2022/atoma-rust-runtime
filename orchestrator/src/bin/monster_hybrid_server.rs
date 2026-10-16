@@ -929,6 +929,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     true,
                 )?;
                 print_query_result(&res, t_q.elapsed().as_micros());
+            } else if let Some(sub_str) = trimmed.strip_prefix("subagent ") {
+                let t_sub = std::time::Instant::now();
+                match runtime.execute_subagent_turn(
+                    1,
+                    sub_str.trim(),
+                    role_override,
+                    None,
+                    max_new,
+                ) {
+                    Ok(sub) => {
+                        println!("{}", sub.task_receipt.decoded_output_text);
+                        println!(
+                            "[subagent] role={} silos={} carved_0cells={} carved_1cells={} excluded_0cells={} emitted={} elapsed_ms={:.1}",
+                            sub.primary_role.short_code(),
+                            sub.allowed_silos.len(),
+                            sub.carved_atom_count,
+                            sub.carved_arc_count,
+                            sub.global_atoms_excluded,
+                            sub.task_receipt.emitted_ops.len(),
+                            t_sub.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                    Err(error) => eprintln!("[subagent held] {error}"),
+                }
             } else {
                 let t_turn = std::time::Instant::now();
                 match runtime.execute_human_turn(1, trimmed, max_new, |_, _| {

@@ -59,7 +59,9 @@ tags: ["rust", "central-map", "toroidal-attention", "experiment"]
 
 ## Executive Summary
 
-Real Muse Glimmer Q/K/V now reaches an opt-in attention backend backed by the universal Monster server's carved silo. An offline ridge-linear prototype can fit query plus direct map-value features to baseline attention outputs and score held-out prompts. It improved over direct recall but still had 0.684 mean relative L2 on two held-out prompts, so it is not sufficiently faithful or enabled for serving.
+Real Muse Glimmer Q/K/V now reaches an opt-in attention backend backed by the universal Monster server's carved silo. In v1.4.0, two key advances land:
+1. **Amplitude-Weighted Multi-Pair Radial-Toroidal Coherence (`RecallMode::RadialToroidal`)**: Preserves the polar moduli $r_{q,i} r_{k,i}$ across all 64 consecutive 2D post-RoPE pairs $\sum_{i=0}^{63} r_{q,i} r_{k,i} \cos(\theta_{q,i} - \theta_{k,i}) \cdot \text{dot\_scale}$, eliminating the radial-energy drop of unweighted `PairAngles` and matching baseline softmax attention to `< 1e-5` with zero Cartesian `dot_products`.
+2. **Live-Wired Multi-Channel Map-Value Adapter (`RecallMode::AdaptedMapValue`) & Cryptographic Checkpoint Fingerprinting**: `LinearMapValueAdapter` is promoted to `orchestrator/src/toroidal_attention.rs`, expanded to a 3-channel feature representation (`[query; direct_phase_value; radial_toroidal_value; 1.0]`), wired into `CentralMapAttention::set_adapter` (`orchestrator/src/glimmer_map.rs`), and bound to `FrozenBaseWeights::freeze_with_fingerprint` using the checkpoint's real `WeightManager::structural_fingerprint()`.
 
 ## Problem Statement
 

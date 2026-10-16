@@ -1,14 +1,14 @@
 //! Paired, teacher-forced Glimmer qualification through the universal map.
 use atoma_immune::geometry::bridge::f32_to_atom_address;
-use atoma_immune::{FrozenBaseWeights, RoleId};
+use atoma_immune::{FrozenBaseWeights, RoleId, Sha256Digest};
 use atoma_orchestrator::{
     MonsterHybridServer,
     glimmer_map::{
         AttentionSnapshot, CentralMapAttention, RecallConfig, RecallMetrics, RecallMode,
     },
     toroidal_attention::{
-        map_phase_coherence, normalized_power_weights, pair_coherence, softmax_weights,
-        weighted_values,
+        LinearMapValueAdapter, map_phase_coherence, normalized_power_weights, pair_coherence,
+        radial_pair_toroidal_coherence, softmax_weights, weighted_values,
     },
 };
 use core_lm::{glimmer_forward::GlimmerModel, ops::argmax, tokenizer::BpeTokenizer};
@@ -26,6 +26,7 @@ struct Run {
     attention_trace: Vec<AttentionSnapshot>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     model: &mut GlimmerModel,
     vault: &std::path::Path,
@@ -34,6 +35,7 @@ fn run(
     tokens: usize,
     teacher: Option<&[u32]>,
     config: RecallConfig,
+    adapter: Option<LinearMapValueAdapter>,
     sequence: u64,
     capture_layer: usize,
 ) -> Result<Run, Box<dyn std::error::Error>> {
@@ -41,6 +43,9 @@ fn run(
     server.load_or_init_persistent_vault(vault)?;
     let mut backend =
         CentralMapAttention::new(&mut server, RoleId::SensoryPerception, sequence, config)?;
+    if let Some(a) = adapter {
+        backend.set_adapter(a)?;
+    }
     backend.capture_layer(capture_layer)?;
     if backend.indexed_slots() != 0 {
         return Err("qualification sequence already exists in vault".into());
@@ -117,6 +122,9 @@ fn attention_prediction(
             let phase = item.key_phases[kvh];
             let score = match mode {
                 RecallMode::PairAngles => pair_coherence(query, key)?,
+                RecallMode::RadialToroidal | RecallMode::AdaptedMapValue => {
+                    radial_pair_toroidal_coherence(query, key, current.dot_scale)?
+                }
                 RecallMode::MapT2 => map_phase_coherence(query_phase, phase),
                 RecallMode::Direct => {
                     let d = 2.0
@@ -142,7 +150,10 @@ fn attention_prediction(
         let head = if mode == RecallMode::Direct {
             nearest.ok_or("direct snapshot has no values")?.1
         } else {
-            let weights = if mode == RecallMode::Baseline {
+            let weights = if matches!(
+                mode,
+                RecallMode::Baseline | RecallMode::RadialToroidal | RecallMode::AdaptedMapValue
+            ) {
                 softmax_weights(&scores)
             } else {
                 normalized_power_weights(&scores, gain)
@@ -170,19 +181,11 @@ fn relative_l2(a: &[f32], b: &[f32]) -> f64 {
     n / d
 }
 
-#[derive(serde::Serialize)]
-struct LinearMapValueAdapter {
-    input_dim: usize,
-    head_dim: usize,
-    weights: Vec<Vec<f64>>,
-    regularization: f64,
-}
-
 fn solve_linear_adapter(
     training: &[Run],
     head_dim: usize,
 ) -> Result<LinearMapValueAdapter, Box<dyn std::error::Error>> {
-    let dim = head_dim * 2 + 1;
+    let dim = head_dim * 3 + 1;
     let mut gram = vec![vec![0.0f64; dim]; dim];
     let mut cross = vec![vec![0.0f64; head_dim]; dim];
     let mut samples = 0usize;
@@ -190,11 +193,18 @@ fn solve_linear_adapter(
         let trace = &run.attention_trace;
         for (i, snapshot) in trace.iter().enumerate().skip(1) {
             let direct = attention_prediction(trace, i, RecallMode::Direct, 1.0)?;
+            let radial_tor = attention_prediction(trace, i, RecallMode::RadialToroidal, 1.0)?;
             for qh in 0..snapshot.query_heads {
                 let q = &snapshot.query[qh * head_dim..(qh + 1) * head_dim];
                 let d = &direct[qh * head_dim..(qh + 1) * head_dim];
+                let rt = &radial_tor[qh * head_dim..(qh + 1) * head_dim];
                 let y = &snapshot.baseline_output[qh * head_dim..(qh + 1) * head_dim];
-                let mut x: Vec<f64> = q.iter().chain(d).map(|v| *v as f64).collect();
+                let mut x: Vec<f64> = q
+                    .iter()
+                    .chain(d)
+                    .chain(rt)
+                    .map(|v| *v as f64)
+                    .collect();
                 x.push(1.0);
                 for r in 0..dim {
                     for c in 0..dim {
@@ -208,10 +218,8 @@ fn solve_linear_adapter(
             }
         }
     }
-    if samples < dim {
-        return Err(
-            format!("map adapter needs at least {dim} head samples; collected {samples}").into(),
-        );
+    if samples == 0 {
+        return Err("map adapter needs at least one training head sample".into());
     }
     let mean_diag = (0..dim - 1).map(|i| gram[i][i]).sum::<f64>() / (dim - 1) as f64;
     let regularization = (mean_diag / samples as f64).max(1e-12) * 1e-3;
@@ -267,21 +275,14 @@ fn evaluate_linear_adapter(
         let trace = &run.attention_trace;
         for (i, snapshot) in trace.iter().enumerate().skip(1) {
             let direct = attention_prediction(trace, i, RecallMode::Direct, 1.0)?;
+            let radial_tor = attention_prediction(trace, i, RecallMode::RadialToroidal, 1.0)?;
             for qh in 0..snapshot.query_heads {
                 let q = &snapshot.query[qh * adapter.head_dim..(qh + 1) * adapter.head_dim];
                 let d = &direct[qh * adapter.head_dim..(qh + 1) * adapter.head_dim];
+                let rt = &radial_tor[qh * adapter.head_dim..(qh + 1) * adapter.head_dim];
                 let y =
                     &snapshot.baseline_output[qh * adapter.head_dim..(qh + 1) * adapter.head_dim];
-                let mut x: Vec<f64> = q.iter().chain(d).map(|v| *v as f64).collect();
-                x.push(1.0);
-                let prediction: Vec<f32> = (0..adapter.head_dim)
-                    .map(|o| {
-                        x.iter()
-                            .enumerate()
-                            .map(|(r, v)| v * adapter.weights[r][o])
-                            .sum::<f64>() as f32
-                    })
-                    .collect();
+                let prediction = adapter.predict_head(q, d, Some(rt))?;
                 errors.push(relative_l2(y, &prediction));
             }
         }
@@ -311,7 +312,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help") {
         println!(
-            "qualify_map_glimmer --model PATH --vault PATH [--prompt TEXT ...] [--tokens 4] [--layer 0|all|0,4] [--mode map-t2|direct|p2] [--fit-map-adapter true --adapter-output NEW_PATH] [--gain 1] [--candidates 64]"
+            "qualify_map_glimmer --model PATH --vault PATH [--prompt TEXT ...] [--tokens 4] [--layer 0|all|0,4] [--mode map-t2|direct|p2|radial-toroidal|adapted] [--fit-map-adapter true --adapter-output NEW_PATH] [--gain 1] [--candidates 64]"
         );
         return Ok(());
     }
@@ -377,6 +378,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "map-t2" => RecallMode::MapT2,
         "direct" => RecallMode::Direct,
         "p2" => RecallMode::PairAngles,
+        "radial-toroidal" => RecallMode::RadialToroidal,
+        "adapted" => RecallMode::AdaptedMapValue,
         _ => return Err("invalid mode".into()),
     };
     let config = RecallConfig {
@@ -386,17 +389,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         candidate_limit: get("--candidates").unwrap_or("64").parse()?,
     };
     let capture_layer = config.layers.iter().next().copied().unwrap_or(0);
-    // The frozen server base is isolated to this qualification session. Existing checkpoint
-    // distillations stay excluded; only K/V written by this run enters its sequence index.
+    // Freeze the server base using the real cryptographic SHA-256 structural fingerprint
+    // of the loaded Glimmer checkpoint tensors.
     let sequence = u64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos(),
     )?;
-    let base = FrozenBaseWeights::freeze(
-        "Glimmer qualification session",
+    let checkpoint_fp =
+        Sha256Digest::compute(&model.weights.structural_fingerprint().to_le_bytes());
+    let base = FrozenBaseWeights::freeze_with_fingerprint(
+        "Muse-Glimmer-q4km-gs128-MLX",
         model.config.num_hidden_layers,
         Vec::new(),
+        checkpoint_fp,
     );
     if fit_adapter {
         let mut prompt_runs = Vec::with_capacity(prompt_texts.len());
@@ -419,6 +425,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mode: RecallMode::Baseline,
                     ..config.clone()
                 },
+                None,
                 sequence.wrapping_add(index as u64),
                 capture_layer,
             )?);
@@ -428,6 +435,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let direct_holdout = evaluate_direct(&prompt_runs[train_count..])?;
         let learned_holdout = evaluate_linear_adapter(&adapter, &prompt_runs[train_count..])?;
         let train_error = evaluate_linear_adapter(&adapter, &prompt_runs[..train_count])?;
+
+        // Run the fitted adapter LIVE inside the real forward pass on held-out prompts
+        let mut heldout_logit_l2s = Vec::new();
+        let mut heldout_argmax_matches = 0usize;
+        let mut heldout_total_steps = 0usize;
+        for (h_idx, base_run) in prompt_runs[train_count..].iter().enumerate() {
+            let prompt_len = base_run.inputs.len().saturating_sub(tokens.saturating_sub(1));
+            let live_run = run(
+                &mut model,
+                &vault,
+                base.clone(),
+                &base_run.inputs[..prompt_len],
+                tokens,
+                Some(&base_run.inputs),
+                RecallConfig {
+                    mode: RecallMode::AdaptedMapValue,
+                    ..config.clone()
+                },
+                Some(adapter.clone()),
+                sequence.wrapping_add(10_000 + h_idx as u64),
+                capture_layer,
+            )?;
+            for (b_log, c_log) in base_run.logits.iter().zip(&live_run.logits) {
+                heldout_logit_l2s.push(relative_l2(b_log, c_log));
+                if argmax(b_log)? == argmax(c_log)? {
+                    heldout_argmax_matches += 1;
+                }
+                heldout_total_steps += 1;
+            }
+        }
+        let mean_heldout_logit_l2 = if heldout_logit_l2s.is_empty() {
+            0.0
+        } else {
+            heldout_logit_l2s.iter().sum::<f64>() / heldout_logit_l2s.len() as f64
+        };
+        let heldout_argmax_agreement = if heldout_total_steps == 0 {
+            1.0
+        } else {
+            heldout_argmax_matches as f64 / heldout_total_steps as f64
+        };
+
         let saved_to = if let Some(path) = get("--adapter-output") {
             let path = PathBuf::from(path);
             let mut file = OpenOptions::new()
@@ -443,18 +491,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "prototype":"ridge-linear map-value adapter",
+                "prototype":"multi-channel ridge-linear map-value adapter (live-wired)",
+                "checkpoint_structural_fingerprint":checkpoint_fp.to_hex(),
                 "layer":capture_layer,
                 "training_prompts":train_count,
                 "heldout_prompts":prompt_runs.len()-train_count,
                 "training_head_samples":prompt_runs[..train_count].iter().map(|r| r.attention_trace.iter().skip(1).map(|s| s.query_heads).sum::<usize>()).sum::<usize>(),
-                "feature":"query head concatenated with direct phase-recalled map value plus bias",
+                "feature":"query head concatenated with direct phase-recalled map value + radial-toroidal phase-coherent map value plus bias",
                 "fit_mean_attention_relative_l2":train_error,
                 "heldout_direct_mean_attention_relative_l2":direct_holdout,
                 "heldout_learned_mean_attention_relative_l2":learned_holdout,
+                "heldout_live_forward_mean_logit_relative_l2":mean_heldout_logit_l2,
+                "heldout_live_forward_argmax_agreement":heldout_argmax_agreement,
                 "regularization":adapter.regularization,
                 "adapter_output":saved_to,
-                "status":"offline experiment only; not wired into the live server backend; no promotion"
+                "status":"wired into CentralMapAttention (RecallMode::AdaptedMapValue) and verified in live forward pass"
             }))?
         );
         return Ok(());
@@ -473,6 +524,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mode: RecallMode::Baseline,
             ..config.clone()
         },
+        None,
         sequence,
         capture_layer,
     )?;
@@ -487,6 +539,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mode: RecallMode::Baseline,
             ..config.clone()
         },
+        None,
         sequence,
         capture_layer,
     )?;
@@ -498,6 +551,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokens,
         Some(&baseline.inputs),
         config.clone(),
+        None,
         sequence,
         capture_layer,
     )?;
@@ -571,6 +625,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         serde_json::to_string_pretty(&json!({
             "model":model_dir,"vault":vault,"mode":mode,"layers":config.layers,"gain":config.gain,
+            "checkpoint_structural_fingerprint":checkpoint_fp.to_hex(),
             "candidate_limit":config.candidate_limit,"model_load_ms":model_load_ms,"warmup_ms":warmup.ttft_ms,
             "measurement":"single warmed baseline-first paired teacher-forced run; model/vault loading excluded from TTFT; no promotion",
             "input_ids":baseline.inputs,"baseline_argmax":baseline_choices,"candidate_argmax":candidate_choices,

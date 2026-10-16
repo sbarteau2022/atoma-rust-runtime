@@ -276,3 +276,97 @@ fn glimmer_forward_routes_real_qkv_through_server_and_keeps_local_maps_empty() {
     drop(model);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn radial_toroidal_and_live_adapted_map_value_match_baseline_attention() {
+    use atoma_orchestrator::toroidal_attention::LinearMapValueAdapter;
+
+    let mut s = server();
+    let q = vec![
+        0.6f32, 0.8, -0.5, 0.5, 0.2, -0.9, 1.1, 0.3, // head 0
+        -0.4, 0.7, 0.9, -0.2, 0.5, 0.5, -0.8, 0.1, // head 1
+        0.3, -0.6, 0.4, 0.9, -0.7, 0.2, 0.5, -0.5, // head 2
+        1.0, 0.0, 0.0, 1.0, -0.5, 0.5, 0.2, 0.8, // head 3
+    ];
+    let k0 = vec![
+        0.5f32, 0.7, -0.4, 0.6, 0.1, -0.8, 0.9, 0.2, // kv 0
+        -0.3, 0.6, 0.8, -0.1, 0.4, 0.4, -0.7, 0.2, // kv 1
+    ];
+    let v0 = vec![
+        1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, // kv 0
+        2.0, 4.0, 6.0, 8.0, 1.0, 3.0, 5.0, 7.0, // kv 1
+    ];
+    let k1 = vec![
+        -0.5f32, 0.3, 0.7, -0.2, 0.4, 0.5, -0.3, 0.9, // kv 0
+        0.6, -0.5, -0.2, 0.8, -0.4, 0.3, 0.9, -0.1, // kv 1
+    ];
+    let v1 = vec![
+        8.0f32, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, // kv 0
+        7.0, 5.0, 3.0, 1.0, 8.0, 6.0, 4.0, 2.0, // kv 1
+    ];
+
+    let baseline_out = {
+        let mut b = CentralMapAttention::new(
+            &mut s,
+            RoleId::SensoryPerception,
+            90,
+            config(RecallMode::Baseline),
+        )
+        .unwrap();
+        b.attend(input(0, 0, &q, &k0, &v0)).unwrap();
+        b.attend(input(1, 0, &q, &k1, &v1)).unwrap()
+    };
+
+    let radial_out = {
+        let mut rt = CentralMapAttention::new(
+            &mut s,
+            RoleId::SensoryPerception,
+            91,
+            config(RecallMode::RadialToroidal),
+        )
+        .unwrap();
+        rt.attend(input(0, 0, &q, &k0, &v0)).unwrap();
+        let out = rt.attend(input(1, 0, &q, &k1, &v1)).unwrap();
+        assert_eq!(rt.metrics.dot_products, 0);
+        assert!(rt.metrics.phase_scores > 0);
+        out
+    };
+
+    for (a, b) in baseline_out.iter().zip(&radial_out) {
+        assert!((a - b).abs() < 1e-5, "radial toroidal {b} != baseline {a}");
+    }
+
+    // Build an identity projection on the radial-toroidal channel (3rd block of 8 dims)
+    let head_dim = 8usize;
+    let input_dim = head_dim * 3 + 1;
+    let mut weights = vec![vec![0.0f64; head_dim]; input_dim];
+    for d in 0..head_dim {
+        weights[head_dim * 2 + d][d] = 1.0;
+    }
+    let adapter = LinearMapValueAdapter {
+        input_dim,
+        head_dim,
+        weights,
+        regularization: 1e-6,
+    };
+
+    let adapted_out = {
+        let mut ad = CentralMapAttention::new(
+            &mut s,
+            RoleId::SensoryPerception,
+            92,
+            config(RecallMode::AdaptedMapValue),
+        )
+        .unwrap();
+        ad.set_adapter(adapter).unwrap();
+        ad.attend(input(0, 0, &q, &k0, &v0)).unwrap();
+        let out = ad.attend(input(1, 0, &q, &k1, &v1)).unwrap();
+        assert_eq!(ad.metrics.dot_products, 0);
+        out
+    };
+
+    for (a, b) in baseline_out.iter().zip(&adapted_out) {
+        assert!((a - b).abs() < 1e-5, "adapted output {b} != baseline {a}");
+    }
+}
+

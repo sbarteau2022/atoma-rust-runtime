@@ -851,6 +851,20 @@ pub struct AgenticTaskCompletionReceipt {
     pub compliance_verified: bool,
 }
 
+/// Receipt returned when an ephemeral sub-agent executes inside a structurally carved
+/// [`crate::silo::TaskCarvedView`] (`Qualification #4`: specialization by subtraction).
+#[derive(Debug, Clone)]
+pub struct SubAgentTaskReceipt {
+    pub primary_role: RoleId,
+    pub allowed_silos: Vec<RoleId>,
+    pub carved_atom_count: usize,
+    pub carved_arc_count: usize,
+    pub global_atoms_excluded: usize,
+    pub global_arcs_excluded: usize,
+    pub task_receipt: AgenticTaskCompletionReceipt,
+    pub compiled_back_arcs: usize,
+}
+
 /// The Novel Geodesic Active-Inference Transformer (`0` KV cache, `0` Python, `0` JSON).
 pub struct GeodesicActiveTransformer {
     pub transducer: BoundaryLexicalTransducer,
@@ -1619,6 +1633,122 @@ impl GeodesicActiveTransformer {
         })
     }
 
+    /// Execute an ephemeral sub-agent task inside a structurally carved [`crate::silo::TaskCarvedView`]
+    /// (`Qualification #4`: Specialization by Subtraction):
+    /// 1. Resolves the prompt's geodesic anchor and target specialist role (`primary_role` or
+    ///    nearest icosahedral well to the standing carrier coordinate).
+    /// 2. Carves a `TaskCarvedView` restricted to `primary_role` + its policy-permitted icosahedral
+    ///    neighbors (`OverlapPolicyMatrix`) and optional hyperbolic horizon `max_task_cosh`.
+    /// 3. Materializes an isolated sub-map containing **only** the carved `0-cells` and `1-cells`
+    ///    so out-of-basin trajectories are structurally unreachable.
+    /// 4. Optionally crystallizes verified steps back into `parent_map` upon completion.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_subagent_in_task_view(
+        &self,
+        episode_id: u64,
+        prompt_text: &str,
+        explicit_prefix: Option<&[MlirOpId]>,
+        max_new: usize,
+        primary_role: Option<RoleId>,
+        max_task_cosh: Option<Q32_31>,
+        crystallize_to_parent: bool,
+        parent_map: &mut CarvedSwarmMap,
+        policy: &OverlapPolicyMatrix,
+    ) -> Result<SubAgentTaskReceipt, String> {
+        let ingress_ops =
+            self.resolve_geodesic_prompt_prefix(parent_map, prompt_text, explicit_prefix);
+        let standing_op = ingress_ops.last().copied().unwrap_or(self.transducer.bos_id);
+        let (standing_lor, standing_phase) =
+            NativeReader::address(&self.transducer.catalog, standing_op).unwrap_or_else(|_| {
+                (
+                    LorentzVector::origin(),
+                    Phase {
+                        theta_f: Q32_31::ZERO,
+                        theta_s: Q32_31::ZERO,
+                    },
+                )
+            });
+
+        let resolved_role = primary_role.unwrap_or_else(|| {
+            let slack = Q32_31::from_f64(0.05).0;
+            if let Some((best_aid, _, _)) =
+                parent_map.candidate_arc_atoms_near(&standing_lor, standing_phase, slack)
+            {
+                for &role in &RoleId::CARVED_12 {
+                    if parent_map
+                        .silo(role)
+                        .is_some_and(|s| s.contains_atom(AtomId(best_aid)))
+                    {
+                        return role;
+                    }
+                }
+            }
+            RoleId::CARVED_12
+                .into_iter()
+                .min_by_key(|&role| {
+                    let well = parent_map.atlas.well(role);
+                    OpticalLens::lorentz_inner_product_wide(&standing_lor, &well.lorentz_well).0
+                })
+                .unwrap_or(RoleId::SensoryPerception)
+        });
+
+        let task_center = max_task_cosh.map(|max_c| (&standing_lor, max_c));
+        let carved_view = parent_map.carve_task_view_for_role(resolved_role, policy, task_center);
+        let carved_atom_count = carved_view.atom_count();
+        let carved_arc_count = carved_view.arc_count();
+        let global_atoms_excluded = parent_map
+            .global_atom_count()
+            .saturating_sub(carved_atom_count);
+        let global_arcs_excluded = parent_map
+            .reasoning_arcs
+            .len()
+            .saturating_sub(carved_arc_count);
+        let allowed_silos = carved_view.allowed_silos.clone();
+
+        let mut isolated_map = carved_view.to_isolated_swarm_map(parent_map, policy);
+        let mut task_receipt = self.execute_task_in_motion(
+            episode_id,
+            prompt_text,
+            Some(&ingress_ops),
+            max_new,
+            false,
+            &mut isolated_map,
+            policy,
+        )?;
+
+        let mut compiled_back_arcs = 0usize;
+        if crystallize_to_parent && !task_receipt.emitted_ops.is_empty() {
+            let mut pref = ingress_ops.clone();
+            let mut tentative_steps = Vec::with_capacity(task_receipt.emitted_ops.len());
+            for &op in &task_receipt.emitted_ops {
+                tentative_steps.push((pref.clone(), op, task_receipt.min_omega_readiness_q32));
+                pref.push(op);
+            }
+            let trace = EpisodeWorkingTrace {
+                episode_id,
+                initial_prefix: ingress_ops,
+                active_prefix: pref,
+                tentative_steps,
+                pruned_dead_ends: Vec::new(),
+                superposition_holds: task_receipt.superposition_interventions,
+            };
+            let cryst = self.crystallize_episode(parent_map, policy, &trace)?;
+            compiled_back_arcs = cryst.novel_arcs_minted;
+            task_receipt.crystallization = Some(cryst);
+        }
+
+        Ok(SubAgentTaskReceipt {
+            primary_role: resolved_role,
+            allowed_silos,
+            carved_atom_count,
+            carved_arc_count,
+            global_atoms_excluded,
+            global_arcs_excluded,
+            task_receipt,
+            compiled_back_arcs,
+        })
+    }
+
     /// Backtrack `rollback_steps` when an external verification check fails mid-task, prune the
     /// dead-end branch, and dynamically iterate via `SuperpositionHoldingEngine` to a new solution.
     pub fn backtrack_and_reiterate(
@@ -2061,5 +2191,77 @@ mod tests {
         assert!(!GeodesicActiveTransformer::has_coreference_cue(
             "What do wolves eat?"
         ));
+    }
+
+    #[test]
+    fn subagent_task_carved_view_isolates_silos_and_executes_in_motion() {
+        let atlas = Atlas13::approved_icosahedral();
+        let policy = OverlapPolicyMatrix::minimal_icosahedral(&atlas, Q32_31::from_f64(0.08));
+        let base = FrozenBaseWeights::freeze("subagent-carve-test", 52, vec![0.25; 32]);
+        let mut map = CarvedSwarmMap::new(atlas, base, Q32_31::from_f64(1.22));
+
+        let transformer = GeodesicActiveTransformer::new(202_048, None);
+        let prefix = vec![MlirOpId(200_000), MlirOpId(954), MlirOpId(7963)];
+        NativeReader::record_continuation(
+            &mut map,
+            &transformer.transducer.catalog,
+            &policy,
+            &prefix,
+            &[MlirOpId(13796), MlirOpId(26)],
+            &[],
+            transformer.origin_fingerprint,
+            Q32_31::ONE,
+        )
+        .unwrap();
+
+        // Also plant an unrelated out-of-basin atom at the antipodal well (MotorPraxis vs SensoryPerception)
+        let antipodal_well = map.atlas.well(RoleId::MotorPraxis);
+        let _out_of_silo_atom = map.keep_and_carve(
+            crate::refraction::RefractedPoint {
+                poincare_ball: antipodal_well.poincare_ball,
+                lorentz: antipodal_well.lorentz_well,
+                phase: antipodal_well.phase,
+                invariant: antipodal_well.invariant,
+                projection_loss: crate::refraction::ProjectionLossReport {
+                    input_state_bits: 81_920,
+                    output_tangent_bits: 256,
+                    discarded_dimensions: 5117,
+                    retained_energy_ratio_q32: Q32_31::HALF,
+                    discarded_energy_ratio_q32: Q32_31::HALF,
+                    teacher_entropy_bits_q32: Q32_31::ONE,
+                },
+                refraction_loss: crate::refraction::RefractionLossReport {
+                    quantization_ulp_bound: 1,
+                    hyperboloid_residual_q32: Q32_31::ZERO,
+                    refractive_index_q32: Q32_31::from_f64(2.3416),
+                },
+            },
+            b"antipodal_only".to_vec(),
+            &policy,
+        );
+
+        let receipt = transformer
+            .execute_subagent_in_task_view(
+                77,
+                "The capital of France is",
+                Some(&prefix),
+                2,
+                None,
+                None,
+                true,
+                &mut map,
+                &policy,
+            )
+            .unwrap();
+
+        // 1 primary role + 5 icosahedral neighbors = 6 silos (antipode excluded)
+        assert_eq!(receipt.allowed_silos.len(), 6);
+        assert!(receipt.carved_atom_count > 0);
+        assert!(receipt.carved_arc_count >= 2);
+        assert!(receipt.global_atoms_excluded >= 1);
+        assert_eq!(
+            receipt.task_receipt.emitted_ops,
+            vec![MlirOpId(13796), MlirOpId(26)]
+        );
     }
 }

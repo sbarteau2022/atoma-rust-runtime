@@ -30,9 +30,9 @@ use atoma_immune::{
     MlirSsaValidationReceipt, ModelHotSwapReceipt, NativeReader, OpenWeightsDistillationEngine,
     OpticalLens, OverlapPolicyMatrix, ProjectedTangent, QuantizedDistillationReceipt,
     QuantizedLayerTapDescriptor, ReasoningChainDistillationReceipt, RefractedPoint, RoleId,
-    SpanFoldingReceipt, SuperpositionState, SurgicalErasureReceipt, SwarmKnowledgeAndHomeostasis,
-    TangentProjector, TeacherTapRecord, WeightDistillationReceipt,
-    fold_high_certainty_trajectory_spans,
+    SpanFoldingReceipt, SubAgentTaskReceipt, SuperpositionState, SurgicalErasureReceipt,
+    SwarmKnowledgeAndHomeostasis, TangentProjector, TaskCarvedView, TeacherTapRecord,
+    WeightDistillationReceipt, fold_high_certainty_trajectory_spans,
 };
 use routing::{DeliveredHandoff, HandoffRequest};
 use std::sync::Arc;
@@ -180,6 +180,60 @@ impl MonsterHybridServer {
             }
         }
         if receipt.superposition_interventions > 0 || receipt.crystallization.is_some() {
+            self.mark_map_updated();
+            self.persist_global_map_live_turn()?;
+        }
+        Ok(receipt)
+    }
+
+    /// Carve a read-only [`TaskCarvedView`] for an ephemeral sub-agent anchored on `primary_role`
+    /// and its policy-permitted icosahedral neighbors (`OverlapPolicyMatrix`) plus optional
+    /// hyperbolic task horizon `task_center` (`Qualification #4`).
+    pub fn carve_subagent_task_view(
+        &self,
+        primary_role: RoleId,
+        task_center: Option<(&atoma_immune::geometry::lorentz::LorentzVector, Q32_31)>,
+    ) -> TaskCarvedView {
+        self.swarm_map
+            .carve_task_view_for_role(primary_role, &self.immune.policy, task_center)
+    }
+
+    /// Execute an ephemeral sub-agent task inside a structurally carved [`TaskCarvedView`]
+    /// (`Qualification #4`: specialization by subtraction) and optionally crystallize verified
+    /// trajectories back into `self.swarm_map` and `.atoma_map.wal`.
+    pub fn execute_subagent_task(
+        &mut self,
+        episode_id: u64,
+        prompt_text: &str,
+        explicit_prefix: Option<&[MlirOpId]>,
+        primary_role: Option<RoleId>,
+        max_task_cosh: Option<Q32_31>,
+        max_new_steps: usize,
+        crystallize_to_parent: bool,
+    ) -> Result<SubAgentTaskReceipt, String> {
+        let _ = self.sync_live_wal_if_grown();
+        self.active_transformer.wal_path = self.persistent_vault_path.as_ref().map(|p| {
+            let mut s = p.as_os_str().to_os_string();
+            s.push(".wal");
+            std::path::PathBuf::from(s)
+        });
+        let receipt = self.active_transformer.execute_subagent_in_task_view(
+            episode_id,
+            prompt_text,
+            explicit_prefix,
+            max_new_steps,
+            primary_role,
+            max_task_cosh,
+            crystallize_to_parent,
+            &mut self.swarm_map,
+            &self.immune.policy,
+        )?;
+        if let Some(ref wal_path) = self.active_transformer.wal_path {
+            if let Ok(meta) = std::fs::metadata(wal_path) {
+                self.wal_replayed_offset = meta.len();
+            }
+        }
+        if receipt.compiled_back_arcs > 0 || receipt.task_receipt.superposition_interventions > 0 {
             self.mark_map_updated();
             self.persist_global_map_live_turn()?;
         }

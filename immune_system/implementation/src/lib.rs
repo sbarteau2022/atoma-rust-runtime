@@ -46,7 +46,8 @@ pub use continuous_active_mind::{
     ATOMA_LEX_MAGIC, ATOMA_WAL_MAGIC, ATOMA_WIRE_MAGIC, AgenticTaskCompletionReceipt,
     BoundaryLexicalTransducer, CrystallizationReceipt, DEFAULT_ACTIVE_MIND_VAULT,
     DEFAULT_BOUNDARY_LEXICON_PATH, EpisodeWorkingTrace, GeodesicActiveTransformer, GeodesicCursor,
-    NativeWireRequest, NativeWireResponse, SpanFoldingReceipt, fold_high_certainty_trajectory_spans,
+    NativeWireRequest, NativeWireResponse, SpanFoldingReceipt, SubAgentTaskReceipt,
+    fold_high_certainty_trajectory_spans,
 };
 
 pub use map_native::{

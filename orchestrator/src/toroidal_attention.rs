@@ -183,6 +183,100 @@ pub fn pair_coherence(query: &[f32], key: &[f32]) -> Result<f64, String> {
     Ok((1.0 + real / real.hypot(imag)).clamp(0.0, 2.0))
 }
 
+/// Amplitude-weighted multi-pair toroidal phase coherence on `(R_+ × S^1)^(D/2)`:
+/// Decomposes each consecutive 2D RoPE pair into polar modulus `r = hypot(x0, x1)` and
+/// phase angle `θ = atan2(x1, x0)`, summing `r_q * r_k * cos(θ_q - θ_k) * dot_scale`.
+pub fn radial_pair_toroidal_coherence(
+    query: &[f32],
+    key: &[f32],
+    dot_scale: f64,
+) -> Result<f64, String> {
+    if query.len() != key.len() || query.len() < 2 || !query.len().is_multiple_of(2) {
+        return Err("radial toroidal coherence requires equal even query/key dimensions".into());
+    }
+    if !dot_scale.is_finite() || dot_scale <= 0.0 {
+        return Err("dot_scale must be finite and positive".into());
+    }
+    let mut total = 0.0f64;
+    for (q, k) in query
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(key.as_chunks::<2>().0.iter())
+    {
+        let rq = (q[0] as f64).hypot(q[1] as f64);
+        let rk = (k[0] as f64).hypot(k[1] as f64);
+        if rq > 0.0 && rk > 0.0 {
+            let delta = (q[1] as f64).atan2(q[0] as f64) - (k[1] as f64).atan2(k[0] as f64);
+            total += rq * rk * delta.cos();
+        }
+    }
+    Ok(total * dot_scale)
+}
+
+/// Learned ridge-linear map-value adapter projecting `[query; direct_value; optional_radial_toroidal_value; 1.0]`
+/// into the model's pre-`o_proj` attention head space.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LinearMapValueAdapter {
+    pub input_dim: usize,
+    pub head_dim: usize,
+    pub weights: Vec<Vec<f64>>,
+    pub regularization: f64,
+}
+
+impl LinearMapValueAdapter {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.head_dim == 0
+            || (self.input_dim != self.head_dim * 2 + 1
+                && self.input_dim != self.head_dim * 3 + 1)
+            || self.weights.len() != self.input_dim
+            || self
+                .weights
+                .iter()
+                .any(|row| row.len() != self.head_dim || !row.iter().all(|v| v.is_finite()))
+        {
+            return Err("invalid LinearMapValueAdapter dimensions or non-finite weights".into());
+        }
+        Ok(())
+    }
+
+    pub fn predict_head(
+        &self,
+        query: &[f32],
+        direct_value: &[f32],
+        radial_toroidal_value: Option<&[f32]>,
+    ) -> Result<Vec<f32>, String> {
+        self.validate()?;
+        if query.len() != self.head_dim || direct_value.len() != self.head_dim {
+            return Err("adapter query/direct_value head_dim mismatch".into());
+        }
+        let mut x = Vec::with_capacity(self.input_dim);
+        x.extend(query.iter().map(|&v| v as f64));
+        x.extend(direct_value.iter().map(|&v| v as f64));
+        if self.input_dim == self.head_dim * 3 + 1 {
+            let rt = radial_toroidal_value
+                .ok_or("3-channel LinearMapValueAdapter requires radial_toroidal_value")?;
+            if rt.len() != self.head_dim {
+                return Err("adapter radial_toroidal_value head_dim mismatch".into());
+            }
+            x.extend(rt.iter().map(|&v| v as f64));
+        }
+        x.push(1.0);
+        let out: Vec<f32> = (0..self.head_dim)
+            .map(|o| {
+                x.iter()
+                    .enumerate()
+                    .map(|(r, &v)| v * self.weights[r][o])
+                    .sum::<f64>() as f32
+            })
+            .collect();
+        if !out.iter().all(|v| v.is_finite()) {
+            return Err("non-finite adapter output".into());
+        }
+        Ok(out)
+    }
+}
+
 pub fn map_phase_coherence(query: Phase, key: Phase) -> f64 {
     let df = query.theta_f.to_f64() - key.theta_f.to_f64();
     let ds = query.theta_s.to_f64() - key.theta_s.to_f64();

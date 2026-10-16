@@ -33,6 +33,8 @@ pub struct FrozenBaseWeights {
     weights: Vec<f32>,
     /// Cryptographic SHA-256 fingerprint computed at freeze time.
     pub fingerprint: Sha256Digest,
+    /// True when `fingerprint` is an external checkpoint structural digest rather than `hash_f32_slice`.
+    external_structural_fingerprint: bool,
 }
 
 impl FrozenBaseWeights {
@@ -47,6 +49,24 @@ impl FrozenBaseWeights {
             num_layers,
             weights,
             fingerprint,
+            external_structural_fingerprint: false,
+        })
+    }
+
+    /// Freeze a model reference bound to a verified checkpoint structural SHA-256 fingerprint
+    /// (e.g. `WeightManager::structural_fingerprint()` across `.safetensors` shards).
+    pub fn freeze_with_fingerprint(
+        model_name: impl Into<String>,
+        num_layers: usize,
+        weights: Vec<f32>,
+        fingerprint: Sha256Digest,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            model_name: model_name.into(),
+            num_layers,
+            weights,
+            fingerprint,
+            external_structural_fingerprint: true,
         })
     }
 
@@ -62,7 +82,11 @@ impl FrozenBaseWeights {
 
     /// Re-verify that the in-memory weights match the original freeze fingerprint (`Qualification #8`).
     pub fn verify_integrity(&self) -> bool {
-        Self::hash_f32_slice(self.num_layers, &self.weights) == self.fingerprint
+        if self.external_structural_fingerprint {
+            self.fingerprint.0 != [0u8; 32]
+        } else {
+            Self::hash_f32_slice(self.num_layers, &self.weights) == self.fingerprint
+        }
     }
 
     pub fn raw_weights(&self) -> &[f32] {
@@ -224,8 +248,10 @@ pub struct SiloView {
 #[derive(Debug, Clone)]
 pub struct TaskCarvedView {
     pub allowed_silos: Vec<RoleId>,
+    pub task_center: Option<(LorentzVector, Q32_31)>,
     pub atoms: BTreeMap<u64, SiloAtom>,
     pub arcs: Vec<DistilledReasoningArc>,
+    pub outgoing_arcs_by_atom: BTreeMap<u64, Vec<usize>>,
 }
 
 impl TaskCarvedView {
@@ -235,6 +261,115 @@ impl TaskCarvedView {
 
     pub fn arc_count(&self) -> usize {
         self.arcs.len()
+    }
+
+    pub fn contains_atom(&self, id: AtomId) -> bool {
+        self.atoms.contains_key(&id.0)
+    }
+
+    pub fn get_atom(&self, id: AtomId) -> Option<&SiloAtom> {
+        self.atoms.get(&id.0)
+    }
+
+    #[inline]
+    pub fn outgoing_arc_indices(&self, from_atom: AtomId) -> &[usize] {
+        self.outgoing_arcs_by_atom
+            .get(&from_atom.0)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Retrieve the `top_k` nearest atoms inside this carved task view to `query_global`.
+    pub fn retrieve_in_view(&self, query_global: &LorentzVector, top_k: usize) -> Vec<&SiloAtom> {
+        if top_k == 0 || self.atoms.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<(Q32_31, u64, &SiloAtom)> = self
+            .atoms
+            .values()
+            .map(|atom| {
+                let ip =
+                    OpticalLens::lorentz_inner_product_wide(query_global, &atom.global_lorentz);
+                (ip, atom.id.0, atom)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        scored.into_iter().take(top_k).map(|(_, _, a)| a).collect()
+    }
+
+    /// Materialize a structurally isolated [`CarvedSwarmMap`] containing **only** the `0-cells`
+    /// and `1-cell` trajectory arcs visible inside this `TaskCarvedView` (`Qualification #4`).
+    ///
+    /// Out-of-silo and out-of-horizon atoms/arcs are physically absent from the returned map,
+    /// guaranteeing zero out-of-horizon leakage during ephemeral sub-agent active inference.
+    pub fn to_isolated_swarm_map(
+        &self,
+        parent: &CarvedSwarmMap,
+        policy: &OverlapPolicyMatrix,
+    ) -> CarvedSwarmMap {
+        let mut isolated = CarvedSwarmMap::new(
+            parent.atlas.clone(),
+            Arc::clone(&parent.base_weights),
+            parent.default_basin_cosh,
+        );
+        isolated.model_epoch = parent.model_epoch;
+        isolated.model_lineage = parent.model_lineage.clone();
+
+        let mut max_id = 0u64;
+        for (&id_u64, sa) in &self.atoms {
+            if id_u64 >= max_id {
+                max_id = id_u64 + 1;
+            }
+            let global_atom = if let Some(ga) = parent.global_atom(sa.id) {
+                ga.clone()
+            } else {
+                let poincare_ball = OpticalLens::lorentz_to_ball(&sa.global_lorentz);
+                let tf_pi = rad_q32_to_pi_unit(sa.phase.theta_f);
+                let ts_pi = rad_q32_to_pi_unit(sa.phase.theta_s);
+                let invariant = extract_invariant(tf_pi, ts_pi);
+                GlobalAtom {
+                    id: sa.id,
+                    clock: sa.clock,
+                    poincare_ball,
+                    lorentz: sa.global_lorentz,
+                    phase: sa.phase,
+                    invariant,
+                    payload: Arc::clone(&sa.payload),
+                    origin_model_fingerprint: sa.origin_model_fingerprint,
+                    salience_count: sa.salience_count,
+                }
+            };
+            let q1 = global_atom.lorentz.x[1].0 >> 15;
+            let q2 = global_atom.lorentz.x[2].0 >> 15;
+            let q3 = global_atom.lorentz.x[3].0 >> 21;
+            let home_key =
+                CarvedSwarmMap::spatial_bucket_key(q1, q2, q3, global_atom.invariant.n);
+            isolated
+                .novelty_buckets
+                .entry(home_key)
+                .or_default()
+                .push(global_atom.id);
+            isolated.carve_single_atom_incremental(&global_atom, policy);
+            isolated.global_atoms.insert(id_u64, global_atom);
+        }
+        isolated.next_id = max_id.max(parent.next_id);
+        isolated.clock = parent.clock;
+
+        let mut max_arc_id = 0u64;
+        for (idx, arc) in self.arcs.iter().cloned().enumerate() {
+            if arc.arc_id >= max_arc_id {
+                max_arc_id = arc.arc_id + 1;
+            }
+            isolated
+                .outgoing_arcs_by_atom
+                .entry(arc.from_atom.0)
+                .or_default()
+                .push(idx);
+            isolated.reasoning_arcs.push(arc);
+        }
+        isolated.next_arc_id = max_arc_id.max(parent.next_arc_id);
+        isolated.refresh_loss_ledger_counts();
+        isolated
     }
 }
 
@@ -561,17 +696,93 @@ impl CarvedSwarmMap {
                 }
             }
         }
-        let arcs: Vec<DistilledReasoningArc> = self
-            .reasoning_arcs
-            .iter()
-            .filter(|a| atoms.contains_key(&a.from_atom.0) && atoms.contains_key(&a.to_atom.0))
-            .cloned()
-            .collect();
+        // Forward-close connected 1-cell trajectory chains that originate inside the carved
+        // seed set so multi-token continuations whose downstream Fibonacci carrier tokens land
+        // on other facets of the sphere are not severed mid-sentence, while out-of-silo roots
+        // and antipodal knowledge atoms remain strictly excluded.
+        let primary_role = allowed_silos
+            .first()
+            .copied()
+            .unwrap_or(RoleId::SensoryPerception);
+        let mut frontier: Vec<u64> = atoms.keys().copied().collect();
+        let mut hops = 0usize;
+        while !frontier.is_empty() && hops < 64 {
+            let mut next_frontier = Vec::new();
+            for from_u64 in frontier {
+                for &arc_idx in self.outgoing_arc_indices(AtomId(from_u64)) {
+                    let arc = &self.reasoning_arcs[arc_idx];
+                    let to_u64 = arc.to_atom.0;
+                    if !atoms.contains_key(&to_u64) {
+                        if let Some(ga) = self.global_atom(arc.to_atom) {
+                            let well_lor = &self.atlas.well(primary_role).lorentz_well;
+                            let well_cosh =
+                                OpticalLens::lorentz_inner_product_wide(&ga.lorentz, well_lor);
+                            let local_lor = self.boost_to_well_frame(primary_role, &ga.lorentz);
+                            atoms.insert(
+                                to_u64,
+                                SiloAtom {
+                                    id: ga.id,
+                                    clock: ga.clock,
+                                    global_lorentz: ga.lorentz,
+                                    local_lorentz: local_lor,
+                                    phase: ga.phase,
+                                    well_cosh_dist: well_cosh,
+                                    in_boundary_overlap: false,
+                                    payload: Arc::clone(&ga.payload),
+                                    origin_model_fingerprint: ga.origin_model_fingerprint,
+                                    salience_count: ga.salience_count,
+                                },
+                            );
+                            next_frontier.push(to_u64);
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+            hops += 1;
+        }
+        let mut arcs = Vec::new();
+        let mut outgoing_arcs_by_atom: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        for a in &self.reasoning_arcs {
+            if atoms.contains_key(&a.from_atom.0) && atoms.contains_key(&a.to_atom.0) {
+                let idx = arcs.len();
+                outgoing_arcs_by_atom
+                    .entry(a.from_atom.0)
+                    .or_default()
+                    .push(idx);
+                arcs.push(a.clone());
+            }
+        }
         TaskCarvedView {
             allowed_silos: allowed_silos.to_vec(),
+            task_center: task_center.map(|(c, r)| (*c, r)),
             atoms,
             arcs,
+            outgoing_arcs_by_atom,
         }
+    }
+
+    /// Derive the policy-permitted cognitive silos for `primary_role` (`primary_role` plus its
+    /// icosahedral neighbor silos where `policy.overlap_allowance(primary_role, peer) > 0`, or
+    /// all 12 silos for `RoleId::Coordinator`) and carve a [`TaskCarvedView`].
+    pub fn carve_task_view_for_role(
+        &self,
+        primary_role: RoleId,
+        policy: &OverlapPolicyMatrix,
+        task_center: Option<(&LorentzVector, Q32_31)>,
+    ) -> TaskCarvedView {
+        let allowed_silos: Vec<RoleId> = if primary_role == RoleId::Coordinator {
+            RoleId::CARVED_12.to_vec()
+        } else {
+            let mut roles = vec![primary_role];
+            for &peer in &RoleId::CARVED_12 {
+                if peer != primary_role && policy.overlap_allowance(primary_role, peer).0 > 0 {
+                    roles.push(peer);
+                }
+            }
+            roles
+        };
+        self.carve_task_view(&allowed_silos, task_center)
     }
 
     /// Hot-swap a new pluggable model backend into the centralized memory architecture

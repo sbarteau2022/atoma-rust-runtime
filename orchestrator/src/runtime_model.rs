@@ -14,7 +14,8 @@ use std::path::Path;
 use atoma_immune::geometry::fixed::Q32_31;
 use atoma_immune::{
     AgenticTaskCompletionReceipt, FrozenBaseWeights, GeodesicActiveTransformer, GeodesicCursor,
-    MlirOpId, NativeReader, PREREGISTERED_KILL_FINGERPRINT, PreregisteredEvaluation,
+    MlirOpId, NativeReader, PREREGISTERED_KILL_FINGERPRINT, PreregisteredEvaluation, RoleId,
+    SubAgentTaskReceipt, TaskCarvedView,
 };
 
 use crate::MonsterHybridServer;
@@ -368,6 +369,72 @@ impl MainModelCoordinatorRuntime {
         Ok(result)
     }
 
+    /// Carve a read-only [`TaskCarvedView`] for a session's specialist role and optional
+    /// hyperbolic horizon (`Qualification #4`).
+    pub fn carve_session_task_view(
+        &self,
+        primary_role: RoleId,
+        max_task_cosh: Option<Q32_31>,
+        session_id: Option<u64>,
+    ) -> TaskCarvedView {
+        let center_lor = session_id
+            .and_then(|sid| self.sessions.get(&sid))
+            .and_then(|s| s.cursor.as_ref().map(|c| c.lorentz));
+        let task_center = match (center_lor.as_ref(), max_task_cosh) {
+            (Some(c), Some(r)) => Some((c, r)),
+            _ => None,
+        };
+        self.server.carve_subagent_task_view(primary_role, task_center)
+    }
+
+    /// Execute an ephemeral sub-agent turn inside a structurally carved [`TaskCarvedView`]
+    /// (`Qualification #4`: specialization by subtraction) while maintaining the caller's
+    /// session history and coreference state.
+    pub fn execute_subagent_turn(
+        &mut self,
+        session_id: u64,
+        prompt: &str,
+        primary_role: Option<RoleId>,
+        max_task_cosh: Option<Q32_31>,
+        max_new: usize,
+    ) -> Result<SubAgentTaskReceipt, String> {
+        self.server.query_swarm_map(prompt, primary_role, 1, 0, true)?;
+        self.server.persist_global_map_live_turn()?;
+        let _ingress = self.ingest_human_prompt_at_edge(session_id, prompt);
+        let session_prefix = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.carrier_history.clone());
+
+        let receipt = self.server.execute_subagent_task(
+            session_id,
+            prompt,
+            session_prefix.as_deref(),
+            primary_role,
+            max_task_cosh,
+            max_new,
+            true,
+        )?;
+
+        if let Some(subj) = GeodesicActiveTransformer::extract_primary_subject(prompt) {
+            if let Some(session) = self.sessions.get_mut(&session_id) {
+                session.last_subject = Some(subj);
+            }
+        }
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session
+                .carrier_history
+                .extend(receipt.task_receipt.emitted_ops.iter().copied());
+            session.cursor = GeodesicCursor::from_prefix(
+                &self.server.mlir_catalog,
+                &session.carrier_history,
+            )
+            .ok();
+        }
+        self.server.persist_global_map_live_turn()?;
+        Ok(receipt)
+    }
+
     /// Evaluate supplied, measured held-out results. This never fabricates a pass from generation.
     pub fn run_kill_criteria_benchmark(
         &mut self,
@@ -666,5 +733,56 @@ mod tests {
         server.persist_global_map().unwrap();
         assert!(path.is_file());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn runtime_executes_subagent_turn_in_carved_task_view() {
+        let weights = FrozenBaseWeights::freeze("runtime-subagent-test", 52, vec![0.5; 32]);
+        let server = MonsterHybridServer::boot_default(weights).unwrap();
+        let mut runtime = MainModelCoordinatorRuntime {
+            server,
+            sessions: BTreeMap::new(),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "runtime-subagent-map-{}-{}.atoma_map",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        runtime.server.load_or_init_persistent_vault(&path).unwrap();
+        let prefix = runtime
+            .server
+            .active_transformer
+            .transducer
+            .transduce_ingress_text("The capital of France is", true);
+        let cont_ops = runtime
+            .server
+            .active_transformer
+            .transducer
+            .transduce_ingress_text(" Paris", false);
+        NativeReader::record_continuation(
+            &mut runtime.server.swarm_map,
+            &runtime.server.mlir_catalog,
+            &runtime.server.immune.policy,
+            &prefix,
+            &cont_ops,
+            &[],
+            runtime.server.active_transformer.origin_fingerprint,
+            Q32_31::ONE,
+        )
+        .unwrap();
+
+        let sub = runtime
+            .execute_subagent_turn(1, "The capital of France is", None, None, cont_ops.len())
+            .unwrap();
+        assert_eq!(sub.allowed_silos.len(), 6);
+        assert!(sub.carved_atom_count > 0);
+        assert_eq!(sub.task_receipt.decoded_output_text, " Paris");
+        let _ = std::fs::remove_file(&path);
+        let mut wal = path.into_os_string();
+        wal.push(".wal");
+        let _ = std::fs::remove_file(wal);
     }
 }
