@@ -43,10 +43,10 @@ pub use skill_evolution::{
 };
 
 pub use continuous_active_mind::{
-    ATOMA_WAL_MAGIC, ATOMA_WIRE_MAGIC, AgenticTaskCompletionReceipt, BoundaryLexicalTransducer,
-    CrystallizationReceipt, DEFAULT_ACTIVE_MIND_VAULT, EpisodeWorkingTrace,
-    GeodesicActiveTransformer, GeodesicCursor, NativeWireRequest, NativeWireResponse,
-    SpanFoldingReceipt, fold_high_certainty_trajectory_spans,
+    ATOMA_LEX_MAGIC, ATOMA_WAL_MAGIC, ATOMA_WIRE_MAGIC, AgenticTaskCompletionReceipt,
+    BoundaryLexicalTransducer, CrystallizationReceipt, DEFAULT_ACTIVE_MIND_VAULT,
+    DEFAULT_BOUNDARY_LEXICON_PATH, EpisodeWorkingTrace, GeodesicActiveTransformer, GeodesicCursor,
+    NativeWireRequest, NativeWireResponse, SpanFoldingReceipt, fold_high_certainty_trajectory_spans,
 };
 
 pub use map_native::{
@@ -98,7 +98,7 @@ pub use refraction::{
 pub use silo::{
     AdaptedKvRecord, AdapterLossReport, CarveLossReport, CarvedSwarmMap, CarvedWeightView,
     DepositCompilationReceipt, DepositedAtomRecord, EphemeralMapDeposit, FrozenBaseWeights,
-    GlobalAtom, ModelAdapterLens, ModelHotSwapReceipt, SiloAtom, SiloView,
+    GlobalAtom, ModelAdapterLens, ModelHotSwapReceipt, SiloAtom, SiloView, TaskCarvedView,
 };
 pub use superposition::{
     ActiveInferenceConfig, ActiveInferenceContinuation, ActiveInferenceStepReceipt,

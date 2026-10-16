@@ -18,6 +18,16 @@ import sys
 import time
 from pathlib import Path
 
+# Ensure mlx_env virtual environment packages are accessible regardless of which python3 invoked this
+for _p in [
+    "/Users/stewartbarteau/mlx_env/src/mlx-lm-mtp",
+    "/Users/stewartbarteau/mlx_env/lib/python3.14/site-packages",
+    "/Users/stewartbarteau/mlx_env/lib/python3.12/site-packages",
+    "/Users/stewartbarteau/mlx_env/lib/python3.11/site-packages",
+]:
+    if Path(_p).exists() and _p not in sys.path:
+        sys.path.insert(0, _p)
+
 MODEL = Path("/Users/stewartbarteau/models/Muse-Glimmer-q4km-gs128-MLX")
 ROOT = Path("/Users/stewartbarteau/Desktop/monster-hybrid-server")
 IMPL = ROOT / "immune_system" / "implementation"
@@ -186,6 +196,35 @@ def build_prompts() -> list[str]:
         add(f"The square of {n} is")
         add(f"{n} times {n + 1} is")
         add(f"The factors of {n * 6} are")
+
+    # Pass 2: Extended multi-domain reasoning, science, systems engineering, and follow-up corpus
+    # (appended strictly after index 3847 so Pass 1 indices remain 100% identical to Glimmer)
+    for place in PLACES:
+        add(f"A major industry in {place} is")
+        add(f"The geography of {place} includes")
+        add(f"Historically, {place} is known for")
+        add(f"The climate of {place} is characterized by")
+    for element in ELEMENTS:
+        add(f"In nature, {element} is commonly found in")
+        add(f"When {element} reacts with oxygen, it forms")
+        add(f"An important industrial application of {element} is")
+        add(f"The discovery of {element} is attributed to")
+    for animal in ANIMALS:
+        add(f"In its ecosystem, {animal} plays the role of")
+        add(f"To survive harsh conditions, {animal} adapts by")
+        add(f"Predators of {animal} include")
+    for topic in TOPICS:
+        add(f"The fundamental mechanism behind {topic} is")
+        add(f"In systems engineering, {topic} matters because")
+        add(f"A real-world example of {topic} is")
+        add(f"If {topic} fails, the consequence is")
+        add(f"To optimize {topic}, an engineer will")
+    for task in TASKS:
+        add(f"The tools required to {task} are")
+        add(f"You know you have properly managed to {task} when")
+    for work in WORKS:
+        add(f"A major theme explored in {work} is")
+        add(f"The historical influence of {work} comes from")
     return prompts
 
 
@@ -444,4 +483,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import importlib.util
+    import os
+
+    mlx_py = Path("/Users/stewartbarteau/mlx_env/bin/python3")
+    if importlib.util.find_spec("mlx_lm") is None and mlx_py.exists():
+        if Path(sys.executable).resolve() != mlx_py.resolve():
+            os.execv(str(mlx_py), [str(mlx_py), *sys.argv])
     main()
+

@@ -11,12 +11,19 @@ use atoma_immune::{
     RoleSignalQ32, RunbookTelemetryQ32, TeacherTapRecord, predict_token_envelope,
 };
 use atoma_orchestrator::MonsterHybridServer;
+use atoma_orchestrator::runtime_model::MainModelCoordinatorRuntime;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("==========================================================================");
     println!(" MONSTER HYBRID SERVER :: CARVED SWARM & FIRST-PRINCIPLES IMMUNE SYSTEM");
     println!(" Chain: Distill -> Refract -> Carve -> Silo -> Agent -> Govern -> Immune");
     println!("==========================================================================\n");
+
+    let args: Vec<String> = std::env::args().collect();
+    let wants_query_or_serve = args
+        .iter()
+        .any(|a| a == "--query" || a == "--serve-stdin" || a == "--serve");
+    let run_boot_demo = !wants_query_or_serve || args.iter().any(|a| a == "--self-test");
 
     // 1. Freeze shared 52-layer base weights (Qualification #8: Base is never modified)
     let synthetic_weights: Vec<f32> = (0..16_384).map(|i| ((i as f32) * 0.007).cos()).collect();
@@ -29,20 +36,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Boot Three-Layer Server (Layer 3 Immune + Layer 2 Governor + Layer 1 Atlas13 Carved Swarm)
     let mut server = MonsterHybridServer::boot_default(frozen_base)?;
     println!(
-        "[verified] Spawned 1 + 12 supervised processes under Layer 2 Governor (audit head={})",
-        server.immune.head_digest()
+        "[verified] Spawned 1 + 12 supervised processes under Layer 2 Governor (audit head={}, boundary_lexicon_pieces={})",
+        server.immune.head_digest(),
+        server.active_transformer.transducer.vocab_len()
     );
 
-    // Verify icosahedral equiangularity |cos θ| = 1/√5 ≈ 0.4472136
-    let cos_01 = server
-        .swarm_map
-        .atlas
-        .axis_cosine(DualityAxis::PerceiveAct, DualityAxis::BodySymbol);
-    println!(
-        "[verified] Icosahedral frame equiangularity: |cos(A0, A1)| = {:.9} (1/sqrt(5) = {:.9})",
-        cos_01.abs().to_f64(),
-        INV_SQRT5_Q32.to_f64()
-    );
+    if run_boot_demo {
+        // Verify icosahedral equiangularity |cos θ| = 1/√5 ≈ 0.4472136
+        let cos_01 = server
+            .swarm_map
+            .atlas
+            .axis_cosine(DualityAxis::PerceiveAct, DualityAxis::BodySymbol);
+        println!(
+            "[verified] Icosahedral frame equiangularity: |cos(A0, A1)| = {:.9} (1/sqrt(5) = {:.9})",
+            cos_01.abs().to_f64(),
+            INV_SQRT5_Q32.to_f64()
+        );
 
     // 3. Ingest a private memory into L1 (Sensory Perception)
     let tap_l1 = TeacherTapRecord {
@@ -694,26 +703,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Replay `live_step_b` again: must be deduplicated in O(1) with 0 new atoms/arcs!
     let r_b_dup = server.observe_and_distill_live_step(&live_step_b)?;
     let r_noise = server.observe_and_distill_live_step(&live_noise)?;
-    println!(
-        "[verified] Live Server Novelty-Only Distillation: stepA_novel={} stepB(novel_atom={}, novel_arc={}) replayB(novel_atom={}, novel_arc={}) noise_sieved={}",
-        r_a.atom_was_novel,
-        r_b.atom_was_novel,
-        r_b.arc_was_novel,
-        r_b_dup.atom_was_novel,
-        r_b_dup.arc_was_novel,
-        r_noise.rejected_as_high_entropy_noise
-    );
+        println!(
+            "[verified] Live Server Novelty-Only Distillation: stepA_novel={} stepB(novel_atom={}, novel_arc={}) replayB(novel_atom={}, novel_arc={}) noise_sieved={}",
+            r_a.atom_was_novel,
+            r_b.atom_was_novel,
+            r_b.arc_was_novel,
+            r_b_dup.atom_was_novel,
+            r_b_dup.arc_was_novel,
+            r_noise.rejected_as_high_entropy_noise
+        );
+    }
 
     // Optional CLI flags:
     //   `--distill-model-dir <dir>` or `--distill-safetensors <file>` or `--distill-full <dir_or_file>`
     //   `[--top-k <N>]` (default: 6)
     //   `[--max-layers <M>]` (default: 100000 = ALL quantized tensors across all shards!)
-    //   `[--vault <path.atoma_map>]` (default: design/global_swarm_map.atoma_map)
-    let args: Vec<String> = std::env::args().collect();
-    let default_vault = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    //   `[--vault <path.atoma_map>]` (default: design/global_active_mind.atoma_map if present, else design/global_swarm_map.atoma_map)
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .unwrap()
-        .join("design/global_swarm_map.atoma_map");
+        .unwrap();
+    let active_mind_vault = repo_root.join("design/global_active_mind.atoma_map");
+    let default_vault = if active_mind_vault.exists() {
+        active_mind_vault
+    } else {
+        repo_root.join("design/global_swarm_map.atoma_map")
+    };
     let vault_path = args
         .iter()
         .position(|a| a == "--vault")
@@ -769,12 +783,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Load persistent vault (`design/global_swarm_map.atoma_map`) automatically when `--query`,
-    // `--serve-stdin`, or `--serve` is requested and the vault was not already loaded above.
-    let wants_query_or_serve = args
-        .iter()
-        .any(|a| a == "--query" || a == "--serve-stdin" || a == "--serve");
-    if wants_query_or_serve && server.persistent_vault_path.is_none() && vault_path.exists() {
+    // Load persistent vault automatically when `--query`, `--serve-stdin`, or `--serve` is requested
+    // and the vault was not already loaded above.
+    if wants_query_or_serve && server.persistent_vault_path.is_none() {
         let t_load = std::time::Instant::now();
         let (loaded_atoms, loaded_arcs, sha_opt) =
             server.load_or_init_persistent_vault(&vault_path)?;
@@ -811,16 +822,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(6);
     let learn_query = args.iter().any(|a| a == "--learn-query");
+    let max_new = args
+        .iter()
+        .position(|a| a == "--max-new")
+        .and_then(|idx| args.get(idx + 1))
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(32);
 
     // 1. One-shot or multi-query CLI flag: `--query "<text>"`
-    // Load vault first if --query is present
-    if args.iter().any(|a| a == "--query") {
-        if vault_path.exists() {
-            eprintln!("[info] Loading vault from {}...", vault_path.display());
-            server.load_or_init_persistent_vault(&vault_path)?;
-            eprintln!("[info] Vault loaded.");
-        }
-    }
     for (idx, arg) in args.iter().enumerate() {
         if arg == "--query" {
             if let Some(q_text) = args.get(idx + 1) {
@@ -841,10 +850,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Persistent Interactive REPL / Pipe Daemon Mode: `--serve-stdin`
     if args.iter().any(|a| a == "--serve-stdin") {
         use std::io::BufRead;
+        let mut runtime = MainModelCoordinatorRuntime {
+            server,
+            sessions: Default::default(),
+        };
         println!(
-            "[verified] Persistent Stdin Retrieval Server Ready (global_0cells={}, global_1cell_arcs={}, commands: `<query>`, `learn <query>`, `status`, `quit`)",
-            server.swarm_map.global_atom_count(),
-            server.swarm_map.reasoning_arcs.len()
+            "[verified] GeodesicActiveTransformer stdin ready (bare prompts generate from the global map; `query <text>` retrieves only, `learn <text>` intakes only, `save` snapshots vault, `/reset`, `status`, `quit`; max_new={}, global_0cells={}, global_1cell_arcs={})",
+            max_new,
+            runtime.server.swarm_map.global_atom_count(),
+            runtime.server.swarm_map.reasoning_arcs.len()
         );
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
@@ -853,8 +867,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if trimmed.is_empty() {
                 continue;
             }
-            if trimmed == "quit" || trimmed == "exit" {
+            if matches!(trimmed, "quit" | "exit" | "/quit" | "/exit") {
                 break;
+            }
+            if trimmed == "/reset" {
+                runtime.sessions.remove(&1);
+                println!("[session reset; global map retained]");
+                continue;
+            }
+            if trimmed == "save" {
+                let t_s = std::time::Instant::now();
+                runtime.server.persist_global_map()?;
+                println!(
+                    "[verified] Vault snapshotted in {:.1}ms",
+                    t_s.elapsed().as_secs_f64() * 1000.0
+                );
+                continue;
             }
             if trimmed == "status" {
                 let silo_counts: Vec<String> = RoleId::CARVED_12
@@ -863,31 +891,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         format!(
                             "{}:{}",
                             r.short_code(),
-                            server.swarm_map.silo(r).map(|s| s.atom_count()).unwrap_or(0)
+                            runtime
+                                .server
+                                .swarm_map
+                                .silo(r)
+                                .map(|s| s.atom_count())
+                                .unwrap_or(0)
                         )
                     })
                     .collect();
                 println!(
                     "[verified] Vault Status: global_0cells={} global_1cell_arcs={} ingested_tensors={} silos=[{}]",
-                    server.swarm_map.global_atom_count(),
-                    server.swarm_map.reasoning_arcs.len(),
-                    server.swarm_map.ingested_tensor_digests.len(),
+                    runtime.server.swarm_map.global_atom_count(),
+                    runtime.server.swarm_map.reasoning_arcs.len(),
+                    runtime.server.swarm_map.ingested_tensor_digests.len(),
                     silo_counts.join(", ")
                 );
                 continue;
             }
-            let (q_str, learn) = if let Some(rest) = trimmed.strip_prefix("learn ") {
-                (rest.trim(), true)
-            } else if let Some(rest) = trimmed.strip_prefix("query ") {
-                (rest.trim(), learn_query)
+            if let Some(q_str) = trimmed.strip_prefix("query ") {
+                let t_q = std::time::Instant::now();
+                let res = runtime.server.query_swarm_map(
+                    q_str.trim(),
+                    role_override,
+                    top_k_retrieve,
+                    max_hops,
+                    learn_query,
+                )?;
+                print_query_result(&res, t_q.elapsed().as_micros());
+            } else if let Some(q_str) = trimmed.strip_prefix("learn ") {
+                let t_q = std::time::Instant::now();
+                let res = runtime.server.query_swarm_map(
+                    q_str.trim(),
+                    role_override,
+                    top_k_retrieve,
+                    max_hops,
+                    true,
+                )?;
+                print_query_result(&res, t_q.elapsed().as_micros());
             } else {
-                (trimmed, learn_query)
-            };
-            let t_q = std::time::Instant::now();
-            let res = server.query_swarm_map(q_str, role_override, top_k_retrieve, max_hops, learn)?;
-            let q_us = t_q.elapsed().as_micros();
-            print_query_result(&res, q_us);
+                let t_turn = std::time::Instant::now();
+                match runtime.execute_human_turn(1, trimmed, max_new, |_, _| {
+                    Err("no external teacher is configured and map inference returned no output".to_string())
+                }) {
+                    Ok(turn) => {
+                        println!("{}", turn.response_text);
+                        println!(
+                            "[turn] tier={:?} emitted={} tier2_holds={} new_arcs={} elapsed_ms={:.1}",
+                            turn.tier,
+                            turn.emitted_ops.len(),
+                            turn.tier2_superposition_interventions,
+                            turn.crystallized_arcs,
+                            t_turn.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                    Err(error) => eprintln!("[generation held] {error}"),
+                }
+            }
         }
+        if runtime.sessions.contains_key(&1) {
+            println!("[session] turn history retained in compact runtime state (96B GeodesicCursor + .wal journal)");
+        }
+        return Ok(());
     }
 
     // 3. Persistent TCP / HTTP Daemon Mode: `--serve <host:port>` (e.g. `--serve 127.0.0.1:8080`)

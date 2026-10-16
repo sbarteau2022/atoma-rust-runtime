@@ -55,7 +55,7 @@ fn hidden_to_mlir_id(
     // Prefer non-self-looping candidates when multiple operator branches are in superposition
     let winner = agg
         .iter()
-        .filter(|(&cand, _)| agg.len() == 1 || cand != current_id)
+        .filter(|&(&cand, _)| agg.len() == 1 || cand != current_id)
         .max_by(|a, b| a.1.total_cmp(b.1))
         .or_else(|| agg.iter().max_by(|a, b| a.1.total_cmp(b.1)))
         .unwrap();

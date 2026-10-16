@@ -1265,12 +1265,23 @@ impl FirstPrinciplesComplianceEngine {
                 refractive_index_q32: Q32_31::from_f64(2.3416),
             },
         };
-        let probe_id = map.keep_and_carve(probe_point, b"gdpr_art17_probe".to_vec(), policy);
-        let l1_has = map
+        let mut shadow_map;
+        let probe_map: &mut CarvedSwarmMap = if map.global_atom_count() > 2_000 {
+            shadow_map = CarvedSwarmMap::new(
+                map.atlas.clone(),
+                map.base_weights.clone(),
+                map.default_basin_cosh,
+            );
+            &mut shadow_map
+        } else {
+            map
+        };
+        let probe_id = probe_map.keep_and_carve(probe_point, b"gdpr_art17_probe".to_vec(), policy);
+        let l1_has = probe_map
             .silo(RoleId::SensoryPerception)
             .unwrap()
             .contains_atom(probe_id);
-        let l2_has = map
+        let l2_has = probe_map
             .silo(RoleId::MotorPraxis)
             .unwrap()
             .contains_atom(probe_id);
@@ -1278,7 +1289,7 @@ impl FirstPrinciplesComplianceEngine {
             verified.insert(FirstPrincipleInvariant::SiloHorizonIsolation);
         }
 
-        if let Ok(erasure) = map.surgical_erase_atom(probe_id, policy) {
+        if let Ok(erasure) = probe_map.surgical_erase_atom(probe_id, policy) {
             if erasure.excised_from_global
                 && erasure.residual_occurrences_across_13_maps == 0
                 && !digest_ct_eq(

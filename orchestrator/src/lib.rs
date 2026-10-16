@@ -20,20 +20,19 @@ use atoma_immune::cache::geometric::{AtomId, Phase};
 use atoma_immune::geometry::fixed::Q32_31;
 use atoma_immune::{
     ActiveInferenceConfig, ActiveInferenceContinuation, ActiveInferenceStepReceipt,
-    AgenticTaskCompletionReceipt, Atlas13, AtomicIrAlphabet, BoundaryLexicalTransducer,
-    CarveLossReport, CarvedSwarmMap, CompliancePermit, ComplianceViolation,
-    CrystallizationReceipt, DepositCompilationReceipt, EphemeralMapDeposit,
+    AgenticTaskCompletionReceipt, Atlas13, AtomicIrAlphabet, CarveLossReport, CarvedSwarmMap,
+    CompliancePermit, ComplianceViolation, DepositCompilationReceipt, EphemeralMapDeposit,
     FirstPrinciplesComplianceEngine, FirstPrinciplesComplianceReport, FrozenBaseWeights,
     FrozenShard, FullModelDistillationReceipt, GeodesicActiveTransformer, GeodesicDecodeReceipt,
     GeodesicMlirDecoder, HolonomyLoopReceipt, HyperbolicHolonomyEngine, IDENTITY_FRAME_Q32,
     ImmuneSystem, LiveNoveltyDistillationReceipt, MapNativeInferenceEngine,
     MetaCognitiveRunbookController, MlirAtomCatalog, MlirOpId, MlirSsaBlock,
-    MlirSsaValidationReceipt, ModelHotSwapReceipt, NativeReader, NativeWireRequest,
-    NativeWireResponse, OpenWeightsDistillationEngine, OpticalLens, OverlapPolicyMatrix,
-    ProjectedTangent, QuantizedDistillationReceipt, QuantizedLayerTapDescriptor,
-    ReasoningChainDistillationReceipt, RefractedPoint, RoleId, SpanFoldingReceipt,
-    SuperpositionState, SurgicalErasureReceipt, SwarmKnowledgeAndHomeostasis, TangentProjector,
-    TeacherTapRecord, WeightDistillationReceipt, fold_high_certainty_trajectory_spans,
+    MlirSsaValidationReceipt, ModelHotSwapReceipt, NativeReader, OpenWeightsDistillationEngine,
+    OpticalLens, OverlapPolicyMatrix, ProjectedTangent, QuantizedDistillationReceipt,
+    QuantizedLayerTapDescriptor, ReasoningChainDistillationReceipt, RefractedPoint, RoleId,
+    SpanFoldingReceipt, SuperpositionState, SurgicalErasureReceipt, SwarmKnowledgeAndHomeostasis,
+    TangentProjector, TeacherTapRecord, WeightDistillationReceipt,
+    fold_high_certainty_trajectory_spans,
 };
 use routing::{DeliveredHandoff, HandoffRequest};
 use std::sync::Arc;
@@ -98,6 +97,8 @@ pub struct MonsterHybridServer {
     pub last_live_atom: Option<(AtomId, RoleId)>,
     /// Optional path to the persistent `.atoma_map` binary vault on disk.
     pub persistent_vault_path: Option<std::path::PathBuf>,
+    /// Byte offset up to which `.atoma_map.wal` has already been replayed into `self.swarm_map`.
+    pub wal_replayed_offset: u64,
     /// Monotonic centralized-map generation used to invalidate worker-local atom caches.
     pub map_generation: u64,
 }
@@ -122,7 +123,8 @@ impl MonsterHybridServer {
         );
 
         governor.spawn_swarm(&swarm_map, &mut immune)?;
-        let active_transformer = GeodesicActiveTransformer::new(248_320, None);
+        let mut active_transformer = GeodesicActiveTransformer::new(202_048, None);
+        let _ = active_transformer.transducer.load_or_bootstrap_default();
 
         Ok(Self {
             immune,
@@ -131,8 +133,8 @@ impl MonsterHybridServer {
             projector: TangentProjector::default(),
             meta_controller: MetaCognitiveRunbookController::default(),
             active_inference_config: ActiveInferenceConfig::default(),
-            atomic_ir: AtomicIrAlphabet::new_canonical(248_320),
-            mlir_catalog: MlirAtomCatalog::new_canonical(248_320),
+            atomic_ir: AtomicIrAlphabet::new_canonical(202_048),
+            mlir_catalog: MlirAtomCatalog::new_canonical(202_048),
             knowledge_homeostasis: SwarmKnowledgeAndHomeostasis::new(),
             holonomy_engine: HyperbolicHolonomyEngine::default(),
             distillation_engine: OpenWeightsDistillationEngine::default(),
@@ -140,6 +142,7 @@ impl MonsterHybridServer {
             active_transformer,
             last_live_atom: None,
             persistent_vault_path: None,
+            wal_replayed_offset: 0,
             map_generation: 0,
         })
     }
@@ -156,6 +159,7 @@ impl MonsterHybridServer {
         max_new_steps: usize,
         auto_crystallize_on_success: bool,
     ) -> Result<AgenticTaskCompletionReceipt, String> {
+        let _ = self.sync_live_wal_if_grown();
         self.active_transformer.wal_path = self.persistent_vault_path.as_ref().map(|p| {
             let mut s = p.as_os_str().to_os_string();
             s.push(".wal");
@@ -170,8 +174,14 @@ impl MonsterHybridServer {
             &mut self.swarm_map,
             &self.immune.policy,
         )?;
+        if let Some(ref wal_path) = self.active_transformer.wal_path {
+            if let Ok(meta) = std::fs::metadata(wal_path) {
+                self.wal_replayed_offset = meta.len();
+            }
+        }
         if receipt.superposition_interventions > 0 || receipt.crystallization.is_some() {
             self.mark_map_updated();
+            self.persist_global_map_live_turn()?;
         }
         Ok(receipt)
     }
@@ -207,7 +217,9 @@ impl MonsterHybridServer {
             .merge_vault_from(other_vault_path, &self.immune.policy, recarve)?;
         self.mark_map_updated();
         if let Some(ref vp) = self.persistent_vault_path {
-            let _ = self.swarm_map.save_to_binary_vault(vp);
+            self.swarm_map
+                .save_to_binary_vault(vp)
+                .map_err(|e| format!("persist merged global map {}: {e}", vp.display()))?;
         }
         Ok(res)
     }
@@ -478,9 +490,9 @@ impl MonsterHybridServer {
             self.last_live_atom = Some((aid, r));
         }
         if (receipt.atom_was_novel || receipt.arc_was_novel)
-            && let Some(ref vp) = self.persistent_vault_path
+            && self.persistent_vault_path.is_some()
         {
-            let _ = self.swarm_map.save_to_binary_vault(vp);
+            self.persist_global_map_live_turn()?;
         }
         if receipt.atom_was_novel || receipt.arc_was_novel {
             self.mark_map_updated();
@@ -745,9 +757,7 @@ impl MonsterHybridServer {
         )?;
         if receipt.bridge_arc_distilled {
             self.mark_map_updated();
-            if let Some(ref vp) = self.persistent_vault_path {
-                let _ = self.swarm_map.save_to_binary_vault(vp);
-            }
+            let _ = self.persist_global_map_live_turn();
         }
         Ok(receipt)
     }
@@ -773,9 +783,7 @@ impl MonsterHybridServer {
         )?;
         if cont.bridge_arcs_distilled > 0 {
             self.mark_map_updated();
-            if let Some(ref vp) = self.persistent_vault_path {
-                let _ = self.swarm_map.save_to_binary_vault(vp);
-            }
+            self.persist_global_map_live_turn()?;
         }
         Ok(cont)
     }
@@ -788,12 +796,30 @@ impl MonsterHybridServer {
     ) -> Result<(usize, usize, Option<atoma_immune::Sha256Digest>), String> {
         self.persistent_vault_path = Some(vault_path.to_path_buf());
         if vault_path.exists() {
-            let (atoms, arcs, sha) = self
+            let (_atoms, _arcs, sha) = self
                 .swarm_map
                 .load_from_binary_vault(vault_path, &self.immune.policy)?;
+            let wal_path = Self::wal_path_for(vault_path);
+            if wal_path.exists() {
+                let (_steps, new_offset) = self.active_transformer.replay_wal_from_offset(
+                    &wal_path,
+                    0,
+                    &mut self.swarm_map,
+                    &self.immune.policy,
+                )?;
+                self.wal_replayed_offset = new_offset;
+                self.persist_global_map_live_turn()?;
+            } else {
+                self.wal_replayed_offset = 0;
+            }
             self.map_generation = self.map_generation.wrapping_add(1);
-            Ok((atoms, arcs, Some(sha)))
+            Ok((
+                self.swarm_map.global_atom_count(),
+                self.swarm_map.reasoning_arcs.len(),
+                Some(sha),
+            ))
         } else {
+            self.wal_replayed_offset = 0;
             Ok((
                 self.swarm_map.global_atom_count(),
                 self.swarm_map.reasoning_arcs.len(),
@@ -802,9 +828,68 @@ impl MonsterHybridServer {
         }
     }
 
+    /// Incrementally tail any new `.atoma_map.wal` frames appended by a background teacher
+    /// harvester (`collect_qwen_trajectories.py`, `live_teacher_harvester.py`, etc.) into the
+    /// in-memory `self.swarm_map` in `< 1 ms` without restarting the server.
+    pub fn sync_live_wal_if_grown(&mut self) -> Result<usize, String> {
+        let Some(ref vault_path) = self.persistent_vault_path else {
+            return Ok(0);
+        };
+        let wal_path = Self::wal_path_for(vault_path);
+        if !wal_path.exists() {
+            return Ok(0);
+        }
+        let (replayed, new_offset) = self.active_transformer.replay_wal_from_offset(
+            &wal_path,
+            self.wal_replayed_offset,
+            &mut self.swarm_map,
+            &self.immune.policy,
+        )?;
+        self.wal_replayed_offset = new_offset;
+        if replayed > 0 {
+            self.mark_map_updated();
+        }
+        Ok(replayed)
+    }
+
     /// Marks centralized atoms as changed after an external mutation path.
     pub fn mark_map_updated(&mut self) {
         self.map_generation = self.map_generation.wrapping_add(1);
+    }
+
+    /// Durably snapshot the shared map after live intake or learning. Errors are surfaced so a
+    /// caller cannot mistake an in-memory-only update for persistent storage.
+    pub fn persist_global_map(&self) -> Result<(), String> {
+        let path = self.persistent_vault_path.as_ref().ok_or_else(|| {
+            "global map persistence is not configured; load a persistent vault first".to_string()
+        })?;
+        self.swarm_map
+            .save_to_binary_vault(path)
+            .map(|_| ())
+            .map_err(|e| format!("persist global map {}: {e}", path.display()))
+    }
+
+    /// WAL-first live-turn persistence: enforces that a persistent vault is configured, snapshots
+    /// immediately when the vault file does not yet exist or is a small test map (`< 10_000` atoms),
+    /// and relies on the `< 50 µs` `.atoma_map.wal` delta journal during live turns on the full
+    /// active mind (`> 200k` atoms) until explicit snapshot/shutdown.
+    pub fn persist_global_map_live_turn(&self) -> Result<(), String> {
+        let path = self.persistent_vault_path.as_ref().ok_or_else(|| {
+            "global map persistence is not configured; load a persistent vault first".to_string()
+        })?;
+        if !path.exists() || self.swarm_map.global_atom_count() < 10_000 {
+            self.swarm_map
+                .save_to_binary_vault(path)
+                .map(|_| ())
+                .map_err(|e| format!("persist global map {}: {e}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn wal_path_for(vault_path: &std::path::Path) -> std::path::PathBuf {
+        let mut name = vault_path.as_os_str().to_os_string();
+        name.push(".wal");
+        std::path::PathBuf::from(name)
     }
 
     /// Execute a full Geodesic Query against the in-memory `CarvedSwarmMap`:
@@ -951,31 +1036,29 @@ impl MonsterHybridServer {
         }
 
         // 2. Find the nearest 1-cell reasoning-chain anchor atom to `query_lorentz` and traverse `max_reasoning_hops`
-        let start_anchor = hits
-            .iter()
-            .find(|h| {
-                self.swarm_map
-                    .reasoning_arcs
-                    .iter()
-                    .any(|a| a.from_atom == h.atom_id)
-            })
-            .map(|h| h.atom_id)
-            .or_else(|| {
-                self.swarm_map
-                    .reasoning_arcs
-                    .iter()
-                    .filter_map(|arc| {
-                        self.swarm_map.global_atom(arc.from_atom).map(|ga| {
-                            let ip = OpticalLens::lorentz_inner_product_wide(
-                                &query_lorentz,
-                                &ga.lorentz,
-                            );
-                            (ip, arc.from_atom)
+        let start_anchor = if max_reasoning_hops == 0 {
+            None
+        } else {
+            hits.iter()
+                .find(|h| !self.swarm_map.outgoing_arc_indices(h.atom_id).is_empty())
+                .map(|h| h.atom_id)
+                .or_else(|| {
+                    self.swarm_map
+                        .arc_bearing_atom_ids()
+                        .filter_map(|raw_id| {
+                            let id = AtomId(raw_id);
+                            self.swarm_map.global_atom(id).map(|ga| {
+                                let ip = OpticalLens::lorentz_inner_product_wide(
+                                    &query_lorentz,
+                                    &ga.lorentz,
+                                );
+                                (ip, id)
+                            })
                         })
-                    })
-                    .min_by_key(|(ip, _)| ip.0)
-                    .map(|(_, id)| id)
-            });
+                        .min_by_key(|(ip, _)| ip.0)
+                        .map(|(_, id)| id)
+                })
+        };
 
         let mut reasoning_hops = Vec::new();
         let mut visited_roles = vec![target_role];
@@ -984,7 +1067,7 @@ impl MonsterHybridServer {
         if let Some(anchor_id) = start_anchor {
             let arcs = self
                 .swarm_map
-                .query_reasoning_trajectory(anchor_id, max_reasoning_hops.max(1));
+                .query_reasoning_trajectory(anchor_id, max_reasoning_hops);
             for arc in arcs {
                 let mnemonic = self
                     .mlir_catalog

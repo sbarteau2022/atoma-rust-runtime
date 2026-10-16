@@ -219,6 +219,25 @@ pub struct SiloView {
     typed_kv: BTreeMap<(u32, u32, u64), TypedKvSequenceIndex>,
 }
 
+/// A read-only, zero-copy sub-map carved on demand for an ephemeral sub-agent by intersecting
+/// a task's permitted cognitive silos (`allowed_silos`) and optional hyperbolic task horizon.
+#[derive(Debug, Clone)]
+pub struct TaskCarvedView {
+    pub allowed_silos: Vec<RoleId>,
+    pub atoms: BTreeMap<u64, SiloAtom>,
+    pub arcs: Vec<DistilledReasoningArc>,
+}
+
+impl TaskCarvedView {
+    pub fn atom_count(&self) -> usize {
+        self.atoms.len()
+    }
+
+    pub fn arc_count(&self) -> usize {
+        self.arcs.len()
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct TypedKvSequenceIndex {
     positions: BTreeMap<usize, (AtomId, u16)>,
@@ -514,6 +533,45 @@ impl CarvedSwarmMap {
     pub fn silo(&self, role: RoleId) -> Option<&SiloView> {
         let idx = role.carved_index()?;
         Some(&self.silos[idx])
+    }
+
+    /// Carve a read-only, zero-copy [`TaskCarvedView`] for an ephemeral sub-agent by intersecting:
+    /// 1. The permitted cognitive silos (`allowed_silos`, a subset of the 12 icosahedral basins),
+    /// 2. An optional task-centered hyperbolic horizon (`cosh(d_H3(x, center)) <= max_task_cosh`),
+    /// 3. Only those `1-cell` trajectory arcs whose endpoints both lie inside the carved atom set.
+    ///
+    /// This achieves specialization by subtraction (geometric coordinate horizon carving) with
+    /// **zero training, zero LoRA adapters, and zero prompt wrappers**.
+    pub fn carve_task_view(
+        &self,
+        allowed_silos: &[RoleId],
+        task_center: Option<(&LorentzVector, Q32_31)>,
+    ) -> TaskCarvedView {
+        let mut atoms = BTreeMap::new();
+        for &role in allowed_silos {
+            if let Some(silo) = self.silo(role) {
+                for sa in silo.atoms() {
+                    if let Some((center, max_cosh)) = task_center {
+                        let d = OpticalLens::lorentz_inner_product_wide(&sa.global_lorentz, center);
+                        if d.0 > max_cosh.0 {
+                            continue;
+                        }
+                    }
+                    atoms.entry(sa.id.0).or_insert_with(|| sa.clone());
+                }
+            }
+        }
+        let arcs: Vec<DistilledReasoningArc> = self
+            .reasoning_arcs
+            .iter()
+            .filter(|a| atoms.contains_key(&a.from_atom.0) && atoms.contains_key(&a.to_atom.0))
+            .cloned()
+            .collect();
+        TaskCarvedView {
+            allowed_silos: allowed_silos.to_vec(),
+            atoms,
+            arcs,
+        }
     }
 
     /// Hot-swap a new pluggable model backend into the centralized memory architecture

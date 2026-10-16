@@ -19,3 +19,18 @@ glimmer = ["dep:core_lm"]
 name = "qualify_map_glimmer"
 path = "src/bin/qualify_map_glimmer.rs"
 required-features = ["glimmer"]
+
+[[bin]]
+name = "generate_mlir_native"
+path = "src/bin/generate_mlir_native.rs"
+required-features = ["glimmer"]
+
+[[bin]]
+name = "generate_map_native"
+path = "src/bin/generate_map_native.rs"
+required-features = ["glimmer"]
+
+[[bin]]
+name = "map_native_glimmer"
+path = "src/bin/map_native_glimmer.rs"
+required-features = ["glimmer"]

@@ -22,6 +22,21 @@ cargo run --bin generate_glimmer -- "The capital of France is" 50
 
 Requires the Muse Glimmer checkpoint at `~/models/Muse-Glimmer-q4km-gs128-MLX` (path is hardcoded in `src/bin/generate_glimmer.rs`).
 
+The custom map-native `GeodesicActiveTransformer` can be run without loading Glimmer or Qwen:
+
+```sh
+cd orchestrator
+cargo run --release --bin monster_hybrid_server -- \
+  --vault ../design/global_active_mind.atoma_map \
+  --serve-stdin --max-new 32
+```
+
+Bare stdin lines invoke the custom `GeodesicActiveTransformer` (not Glimmer or Qwen), with a
+per-process session history and the shared map persisted across restarts. `query <text>` does
+retrieval only; `learn <text>` intakes a prompt into the persistent map; `/reset` clears only the
+live session. This architecture generates from mapped trajectories and has no frozen LLM weights;
+quality and the user-reported throughput figures remain unverified qualification claims.
+
 ## Architecture
 
 - **Geometric memory** (`core_lm/src/cache/geometric.rs`) — atoms addressed on a hyperbolic manifold (Lorentz model, Q32.31), replacing the KV cache. Retrieval is a candidate pre-filter; final attention scoring is exact dot-products.
@@ -37,6 +52,9 @@ Requires the Muse Glimmer checkpoint at `~/models/Muse-Glimmer-q4km-gs128-MLX` (
 - `harness/` — qualification tooling
 - `orchestrator/` — Rust control plane, authenticated HTTP/TLS edge, metrics, health checks, snapshots, and worker-cache generation gates
 - `orchestrator/src/runtime_model.rs` — unified vault controller, UTF-8/MLIR edge, compact Wigner sessions, active-inference cascade, measured kill gate, and feature-gated Glimmer teacher forward pass
+- `immune_system/implementation/src/continuous_active_mind.rs` — custom `GeodesicActiveTransformer` that generates by active inference over the global map, without Glimmer/Qwen weights
+- Live runtime turns novelty-distill each prompt into the configured global `.atoma_map`, snapshot the shared map after intake/inference, and replay the adjacent `.wal` journal at startup; persistence errors fail the turn instead of silently leaving updates memory-only
+- `orchestrator/target/release/monster_hybrid_server --vault <path> --serve-stdin` now treats bare stdin lines as continuous live intake; `query <text>` is retrieval-only, `learn <text>` explicitly forces learning, and updates persist to the selected vault
 - `core_lm/src/attention_backend.rs` and `orchestrator/src/glimmer_map.rs` — opt-in boundary that routes real Glimmer layer attention through the universal server map; enable with the orchestrator `glimmer` feature
 - `orchestrator/src/bin/qualify_map_glimmer.rs` — warmed, paired Glimmer comparison for baseline softmax, P2 pair angles, map-T² weighting, and direct value recall
 - The qualifier captures a selected layer's real Q/K/V and baseline attention output, then evaluates a gain grid on an early/held-out split; typed map atoms carry the key-derived T² phase rather than a placeholder phase

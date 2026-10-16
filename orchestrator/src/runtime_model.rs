@@ -13,8 +13,8 @@ use std::path::Path;
 
 use atoma_immune::geometry::fixed::Q32_31;
 use atoma_immune::{
-    AgenticTaskCompletionReceipt, FrozenBaseWeights, GeodesicCursor, MlirOpId, NativeReader,
-    PreregisteredEvaluation, PREREGISTERED_KILL_FINGERPRINT,
+    AgenticTaskCompletionReceipt, FrozenBaseWeights, GeodesicActiveTransformer, GeodesicCursor,
+    MlirOpId, NativeReader, PREREGISTERED_KILL_FINGERPRINT, PreregisteredEvaluation,
 };
 
 use crate::MonsterHybridServer;
@@ -35,6 +35,7 @@ pub struct SessionHandle {
     pub turn_index: u32,
     pub cursor: Option<GeodesicCursor>,
     pub carrier_history: Vec<MlirOpId>,
+    pub last_subject: Option<String>,
 }
 
 impl SessionHandle {
@@ -44,6 +45,7 @@ impl SessionHandle {
             turn_index: 0,
             cursor: None,
             carrier_history: Vec::new(),
+            last_subject: None,
         }
     }
 }
@@ -155,7 +157,13 @@ impl MainModelCoordinatorRuntime {
     where
         F: FnMut(&[MlirOpId], usize) -> Result<Vec<MlirOpId>, String>,
     {
-        self.execute_human_turn_with_ids(session_id, prompt, max_new, None, qualified_teacher)
+        self.execute_human_turn_with_ids(
+            session_id,
+            prompt,
+            max_new,
+            None,
+            qualified_teacher,
+        )
     }
 
     fn execute_human_turn_with_ids<F>(
@@ -169,6 +177,16 @@ impl MainModelCoordinatorRuntime {
     where
         F: FnMut(&[MlirOpId], usize) -> Result<Vec<MlirOpId>, String>,
     {
+        // Intake is a live map operation, not just session bookkeeping: query_swarm_map encodes
+        // the prompt into a deterministic map-native state and novelty-only distills it.
+        self.server.query_swarm_map(prompt, None, 1, 0, true)?;
+        self.server.persist_global_map_live_turn()?;
+
+        let prior_subject = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.last_subject.clone());
+
         let ingress = if let Some(ids) = prompt_token_ids.filter(|ids| !ids.is_empty()) {
             let carriers: Vec<MlirOpId> = ids.iter().copied().map(MlirOpId).collect();
             let session = self
@@ -184,10 +202,64 @@ impl MainModelCoordinatorRuntime {
         } else {
             self.ingest_human_prompt_at_edge(session_id, prompt)
         };
+        let session_prefix = self
+            .sessions
+            .get(&session_id)
+            .map(|session| session.carrier_history.clone())
+            .unwrap_or_else(|| ingress.clone());
+
+        // Resolve multi-turn follow-up coreference if the current turn does not directly match
+        // a trajectory chain on its own and the session holds a prior turn subject.
+        let mut effective_prompt = prompt.to_string();
+        let mut used_prior_subject = false;
+        let resolved_direct = self
+            .server
+            .active_transformer
+            .resolve_geodesic_prompt_prefix(
+                &self.server.swarm_map,
+                prompt,
+                Some(&session_prefix),
+            );
+        if !self
+            .server
+            .active_transformer
+            .has_exact_trajectory_chain(&self.server.swarm_map, &resolved_direct)
+            && GeodesicActiveTransformer::has_coreference_cue(prompt)
+        {
+            if let Some(ref subj) = prior_subject {
+                let candidate_followup = format!(
+                    "{} of {}",
+                    prompt.trim().trim_end_matches('?'),
+                    subj
+                );
+                let resolved_followup = self
+                    .server
+                    .active_transformer
+                    .resolve_geodesic_prompt_prefix(
+                        &self.server.swarm_map,
+                        &candidate_followup,
+                        None,
+                    );
+                if self
+                    .server
+                    .active_transformer
+                    .has_exact_trajectory_chain(&self.server.swarm_map, &resolved_followup)
+                {
+                    effective_prompt = candidate_followup;
+                    used_prior_subject = true;
+                }
+            }
+        }
+
+        let explicit_pref = if used_prior_subject {
+            None
+        } else {
+            Some(session_prefix.as_slice())
+        };
         let receipt = self.server.execute_active_transformer_task(
             session_id,
-            prompt,
-            Some(&ingress),
+            &effective_prompt,
+            explicit_pref,
             max_new,
             true,
         )?;
@@ -201,9 +273,6 @@ impl MainModelCoordinatorRuntime {
 
         if final_receipt.emitted_ops.is_empty() {
             let teacher_ops = qualified_teacher(&ingress, max_new)?;
-            // Write only the teacher's returned path through the native, novelty-only map
-            // recorder. Empty hidden states are intentional: this API does not pretend that
-            // a teacher callback has supplied activations.
             let writes = NativeReader::record_continuation(
                 &mut self.server.swarm_map,
                 &self.server.mlir_catalog,
@@ -218,6 +287,7 @@ impl MainModelCoordinatorRuntime {
             if teacher_crystallized > 0 {
                 self.server.mark_map_updated();
             }
+            self.server.persist_global_map_live_turn()?;
             final_receipt.emitted_ops = teacher_ops;
             let (tokens, text) = self
                 .server
@@ -229,15 +299,24 @@ impl MainModelCoordinatorRuntime {
             tier = InferenceTier::Tier3QualifiedTeacher;
         }
 
+        let extracted_subj = if used_prior_subject {
+            prior_subject
+        } else {
+            GeodesicActiveTransformer::extract_primary_subject(prompt)
+        };
         let session = self
             .sessions
             .get_mut(&session_id)
             .expect("session was created above");
+        if let Some(subj) = extracted_subj {
+            session.last_subject = Some(subj);
+        }
         session
             .carrier_history
             .extend(final_receipt.emitted_ops.iter().copied());
         session.cursor =
             GeodesicCursor::from_prefix(&self.server.mlir_catalog, &session.carrier_history).ok();
+        self.server.persist_global_map_live_turn()?;
         Ok(MainModelTurnReceipt {
             response_text: final_receipt.decoded_output_text.clone(),
             emitted_ops: final_receipt.emitted_ops.clone(),
@@ -569,5 +648,23 @@ mod tests {
             .transducer
             .transduce_egress_ops(&ops);
         assert_eq!(restored, source);
+    }
+
+    #[test]
+    fn configured_global_map_is_created_and_snapshotted() {
+        let weights = FrozenBaseWeights::freeze("runtime-persistence-test", 1, vec![0.5; 8]);
+        let mut server = MonsterHybridServer::boot_default(weights).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "runtime-global-map-{}-{}.atoma_map",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        server.load_or_init_persistent_vault(&path).unwrap();
+        server.persist_global_map().unwrap();
+        assert!(path.is_file());
+        std::fs::remove_file(path).unwrap();
     }
 }

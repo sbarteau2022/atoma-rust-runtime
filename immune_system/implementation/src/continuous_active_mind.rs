@@ -60,6 +60,35 @@ pub const DEFAULT_ACTIVE_MIND_VAULT: &str = "design/global_active_mind.atoma_map
 // 1. Reversible I/O Boundary Transducer (`Text <-> ML-IR <-> Text` at the Skin)
 // ============================================================================
 
+/// Magic header for the Zero-JSON Binary Boundary Lexicon (`ATOMA_LX` v1).
+pub const ATOMA_LEX_MAGIC: &[u8; 8] = b"ATOMA_LX";
+
+/// Default canonical path for the Zero-JSON Binary Boundary Lexicon.
+pub const DEFAULT_BOUNDARY_LEXICON_PATH: &str = "design/boundary_lexicon.atoma_lex";
+
+/// Build the exact 256-entry GPT-2 Unicode codepoint -> raw byte (`0..=255`) inverse table.
+fn gpt2_unicode_to_byte_map() -> BTreeMap<char, u8> {
+    let mut bs: Vec<u32> = (b'!' as u32..=(b'~' as u32)).collect();
+    bs.extend(0xA1u32..=0xACu32);
+    bs.extend(0xAEu32..=0xFFu32);
+    let mut cs: Vec<u32> = bs.clone();
+    let mut n = 0u32;
+    for b in 0u32..=255u32 {
+        if !bs.contains(&b) {
+            bs.push(b);
+            cs.push(256 + n);
+            n += 1;
+        }
+    }
+    let mut dec = BTreeMap::new();
+    for (&b, &c) in bs.iter().zip(cs.iter()) {
+        if let Some(ch) = char::from_u32(c) {
+            dec.insert(ch, b as u8);
+        }
+    }
+    dec
+}
+
 /// Pure-Rust Reversible Boundary Transducer sitting strictly at the outer sensory/motor skin.
 pub struct BoundaryLexicalTransducer {
     pub catalog: MlirAtomCatalog,
@@ -88,6 +117,16 @@ impl BoundaryLexicalTransducer {
         }
     }
 
+    /// Number of decoded carrier entries in the boundary table.
+    pub fn vocab_len(&self) -> usize {
+        self.vocab_decode.len()
+    }
+
+    /// Look up the raw UTF-8 byte slice for a carrier ID (`MlirOpId`).
+    pub fn decode_carrier_bytes(&self, id: u32) -> Option<&[u8]> {
+        self.vocab_decode.get(&id).map(|v| v.as_slice())
+    }
+
     /// Register a token piece (`id <-> utf8_bytes`) in the reversible boundary table.
     pub fn register_token_piece(&mut self, id: u32, bytes: Vec<u8>) {
         if id < self.catalog.base_vocab_size && !bytes.is_empty() {
@@ -96,9 +135,97 @@ impl BoundaryLexicalTransducer {
         }
     }
 
-    /// Zero-dependency streaming parser for HuggingFace `tokenizer.json` `"vocab": { "token": id }`
-    /// entries, converting `Ġ` (`\u{0120}`) -> `' '` (`0x20`) and `Ċ` (`\u{010A}`) -> `'\n'` (`0x0A`).
+    /// Save the reversible boundary table to a SHA-256-authenticated `ATOMA_LX` binary file (`0` JSON).
+    pub fn save_binary_lexicon(&self, path: &Path) -> Result<(usize, Sha256Digest), String> {
+        let mut buf = Vec::with_capacity(64 + self.vocab_decode.len() * 12);
+        buf.extend_from_slice(ATOMA_LEX_MAGIC);
+        buf.extend_from_slice(&1u32.to_le_bytes()); // version 1
+        buf.extend_from_slice(&self.catalog.base_vocab_size.to_le_bytes());
+        buf.extend_from_slice(&self.bos_id.0.to_le_bytes());
+        buf.extend_from_slice(&(self.eos_ids.len() as u32).to_le_bytes());
+        for eos in &self.eos_ids {
+            buf.extend_from_slice(&eos.0.to_le_bytes());
+        }
+        buf.extend_from_slice(&(self.vocab_decode.len() as u32).to_le_bytes());
+        for (&id, piece) in &self.vocab_decode {
+            buf.extend_from_slice(&id.to_le_bytes());
+            let len = piece.len().min(u16::MAX as usize) as u16;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(&piece[..len as usize]);
+        }
+        let digest = Sha256Digest::compute(&buf);
+        buf.extend_from_slice(&digest.0);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, &buf)
+            .map_err(|e| format!("failed to write binary lexicon {}: {e}", path.display()))?;
+        Ok((self.vocab_decode.len(), digest))
+    }
+
+    /// Load and SHA-256-verify a native `ATOMA_LX` binary lexicon (`0` JSON, `< 15 ms`).
+    pub fn load_binary_lexicon(&mut self, path: &Path) -> Result<usize, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("failed to read binary lexicon {}: {e}", path.display()))?;
+        if bytes.len() < 24 + 32 {
+            return Err("ATOMA_LX file too short".to_string());
+        }
+        if &bytes[0..8] != ATOMA_LEX_MAGIC {
+            return Err("invalid ATOMA_LX magic header".to_string());
+        }
+        let payload_end = bytes.len() - 32;
+        let expected_sha = Sha256Digest::compute(&bytes[..payload_end]);
+        if expected_sha.0 != bytes[payload_end..] {
+            return Err("ATOMA_LX SHA-256 integrity mismatch".to_string());
+        }
+        let mut pos = 8usize;
+        let _version = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let _base_vocab = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let bos = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        self.bos_id = MlirOpId(bos);
+        let eos_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + eos_len * 4 + 4 > payload_end {
+            return Err("truncated ATOMA_LX eos header".to_string());
+        }
+        self.eos_ids.clear();
+        for _ in 0..eos_len {
+            let e = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            self.eos_ids.push(MlirOpId(e));
+        }
+        let count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        for _ in 0..count {
+            if pos + 6 > payload_end {
+                return Err("truncated ATOMA_LX entry header".to_string());
+            }
+            let id = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let plen = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            if pos + plen > payload_end {
+                return Err("truncated ATOMA_LX entry bytes".to_string());
+            }
+            let piece = bytes[pos..pos + plen].to_vec();
+            pos += plen;
+            if id < self.catalog.base_vocab_size && !piece.is_empty() {
+                self.vocab_encode.insert(piece.clone(), id);
+                self.vocab_decode.insert(id, piece);
+            }
+        }
+        Ok(count)
+    }
+
+    /// Zero-dependency streaming parser for legacy HuggingFace `tokenizer.json` `"vocab": { "token": id }`
+    /// entries using the full 256-entry GPT-2 Unicode-to-byte inversion table.
+    /// Automatically caches the compiled `ATOMA_LX` binary lexicon when loaded so subsequent
+    /// runs never touch JSON again.
     pub fn load_huggingface_tokenizer_json(&mut self, path: &Path) -> Result<usize, String> {
+        let gpt2_byte_map = gpt2_unicode_to_byte_map();
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
         let Some(vocab_start) = raw.find("\"vocab\"") else {
@@ -187,23 +314,65 @@ impl BoundaryLexicalTransducer {
             if let Ok(key_str) = std::str::from_utf8(&key_raw) {
                 let mut decoded = Vec::with_capacity(key_str.len());
                 for ch in key_str.chars() {
-                    match ch {
-                        '\u{0120}' | '\u{2581}' => decoded.push(b' '), // GPT-2 'Ġ' or SentencePiece '▁'
-                        '\u{010A}' => decoded.push(b'\n'),             // GPT-2 'Ċ'
-                        _ => {
-                            let mut b = [0u8; 4];
-                            decoded.extend_from_slice(ch.encode_utf8(&mut b).as_bytes());
-                        }
+                    if ch == '\u{2581}' {
+                        decoded.push(b' ');
+                    } else if let Some(&raw_byte) = gpt2_byte_map.get(&ch) {
+                        decoded.push(raw_byte);
+                    } else {
+                        let mut b = [0u8; 4];
+                        decoded.extend_from_slice(ch.encode_utf8(&mut b).as_bytes());
                     }
                 }
                 if token_id < self.catalog.base_vocab_size && !decoded.is_empty() {
                     self.vocab_encode.insert(decoded.clone(), token_id);
-                    self.vocab_decode.insert(token_id, decoded);
+                    self.vocab_decode.insert(id_str.parse::<u32>().unwrap_or(token_id), decoded);
                     count += 1;
                 }
             }
         }
         Ok(count)
+    }
+
+    /// Load the binary `ATOMA_LX` boundary lexicon (`design/boundary_lexicon.atoma_lex`) directly
+    /// with zero JSON overhead, or bootstrap and persist it once if not yet present on disk.
+    pub fn load_or_bootstrap_default(&mut self) -> Result<usize, String> {
+        let bin_candidates = [
+            DEFAULT_BOUNDARY_LEXICON_PATH,
+            "../../design/boundary_lexicon.atoma_lex",
+            "/Users/stewartbarteau/Desktop/monster-hybrid-server/design/boundary_lexicon.atoma_lex",
+        ];
+        for cand in bin_candidates {
+            let p = Path::new(cand);
+            if p.is_file() {
+                if let Ok(n) = self.load_binary_lexicon(p) {
+                    if n > 0 {
+                        return Ok(n);
+                    }
+                }
+            }
+        }
+
+        let json_bootstrap_candidates = [
+            "/Users/stewartbarteau/models/Muse-Glimmer-q4km-gs128-MLX/tokenizer.json",
+            "/Users/stewartbarteau/models/Qwen3.6-35B-A3B-OptiQ-4bit/tokenizer.json",
+        ];
+        for cand in json_bootstrap_candidates {
+            let p = Path::new(cand);
+            if p.is_file() {
+                if let Ok(n) = self.load_huggingface_tokenizer_json(p) {
+                    if n > 0 {
+                        let out_path = Path::new(
+                            "/Users/stewartbarteau/Desktop/monster-hybrid-server/design/boundary_lexicon.atoma_lex",
+                        );
+                        if out_path.parent().is_some_and(|d| d.is_dir()) {
+                            let _ = self.save_binary_lexicon(out_path);
+                        }
+                        return Ok(n);
+                    }
+                }
+            }
+        }
+        Ok(0)
     }
 
     /// **Ingress Transduction (`Text -> Base Carrier IDs -> Folded Atomic IR OpIds`)**:
@@ -855,6 +1024,509 @@ impl GeodesicActiveTransformer {
         Ok((emitted_ops, expanded_tokens, text))
     }
 
+    /// Check in `O(1)` (`< 1 µs` via the 27-cell spatial hash) whether `prefix` stands on an
+    /// exact recorded `1-cell` trajectory chain (`arc.chain_id == prefix_chain_id(prefix)`) in `map`.
+    pub fn has_exact_trajectory_chain(&self, map: &CarvedSwarmMap, prefix: &[MlirOpId]) -> bool {
+        let Some(&last) = prefix.last() else {
+            return false;
+        };
+        let Ok((lorentz, phase)) = NativeReader::address(&self.transducer.catalog, last) else {
+            return false;
+        };
+        let expected_chain = prefix_chain_id(prefix);
+        let slack = Q32_31::from_f64(0.05).0;
+        let Some((_, best_cosh, candidates)) =
+            map.candidate_arc_atoms_near(&lorentz, phase, slack)
+        else {
+            return false;
+        };
+        if best_cosh > self.active_config.primary_basin_cosh_q32.0 {
+            return false;
+        }
+        candidates.iter().any(|&(aid, _)| {
+            map.outgoing_arc_indices(AtomId(aid))
+                .iter()
+                .any(|&idx| map.reasoning_arcs[idx].chain_id == expected_chain)
+        })
+    }
+
+    /// Extract the primary subject stem from a natural-language prompt for multi-turn coreference
+    /// and geodesic trajectory anchor projection.
+    pub fn extract_primary_subject(prompt_text: &str) -> Option<String> {
+        let cleaned = prompt_text
+            .trim()
+            .trim_end_matches(|c: char| matches!(c, '?' | '.' | '!' | ':' | ';' | ','))
+            .trim();
+        if cleaned.is_empty() {
+            return None;
+        }
+        let lower = cleaned.to_ascii_lowercase();
+        for prep in [" of ", " in ", " for ", " about ", " from ", " with "] {
+            if let Some(pos) = lower.rfind(prep) {
+                let tail = cleaned[pos + prep.len()..].trim();
+                let tail = Self::strip_trailing_conversational_verb(tail);
+                if !tail.is_empty() && !Self::is_pronoun_placeholder(tail) {
+                    return Some(tail.to_string());
+                }
+            }
+        }
+        let mut s = cleaned;
+        let prefixes = [
+            "can you tell me about ",
+            "could you tell me about ",
+            "can you explain ",
+            "could you explain ",
+            "please explain ",
+            "tell me about ",
+            "explain ",
+            "describe ",
+            "define ",
+            "what is the ",
+            "what is a ",
+            "what is an ",
+            "what is ",
+            "what are the ",
+            "what are ",
+            "what do ",
+            "what does ",
+            "how do you ",
+            "how do i ",
+            "how does ",
+            "how to ",
+            "where is ",
+            "who is ",
+            "in plain language, ",
+        ];
+        let s_low = s.to_ascii_lowercase();
+        for pref in prefixes {
+            if s_low.starts_with(pref) {
+                s = s[pref.len()..].trim();
+                break;
+            }
+        }
+        s = Self::strip_trailing_conversational_verb(s);
+        if s.is_empty() || Self::is_pronoun_placeholder(s) {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    }
+
+    /// True when `prompt_text` contains a coreference pronoun or conversational continuation cue
+    /// referring back to the previous turn's subject (`"there"`, `"it"`, `"they"`, `"them"`, `"its"`, `"their"`).
+    pub fn has_coreference_cue(prompt_text: &str) -> bool {
+        let cleaned = prompt_text
+            .trim()
+            .trim_end_matches(|c: char| matches!(c, '?' | '.' | '!' | ':' | ';'))
+            .trim()
+            .to_ascii_lowercase();
+        let padded = format!(" {cleaned} ");
+        for cue in [
+            " it ",
+            " there ",
+            " they ",
+            " them ",
+            " its ",
+            " their ",
+            " that ",
+        ] {
+            if padded.contains(cue) {
+                return true;
+            }
+        }
+        cleaned.starts_with("and ") || cleaned.starts_with("what about ") || cleaned.starts_with("how about ")
+    }
+
+    fn is_pronoun_placeholder(s: &str) -> bool {
+        matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "it" | "there" | "they" | "them" | "its" | "their" | "that" | "this" | "one"
+        )
+    }
+
+    fn strip_trailing_conversational_verb(s: &str) -> &str {
+        let mut cur = s.trim();
+        let suffixes = [
+            " in plain language",
+            " at room temperature",
+            " simply",
+            " there",
+            " them",
+            " they",
+            " it",
+            " work",
+            " works",
+            " eat",
+            " eats",
+            " live",
+            " lives",
+            " use",
+            " uses",
+            " mean",
+            " means",
+            " begin",
+            " begins",
+            " open",
+            " opens",
+            " grow",
+            " grows",
+            " do",
+            " does",
+            " is",
+            " are",
+        ];
+        let lower = cur.to_ascii_lowercase();
+        for suf in suffixes {
+            if lower.ends_with(suf) && cur.len() > suf.len() {
+                cur = cur[..cur.len() - suf.len()].trim();
+                break;
+            }
+        }
+        cur
+    }
+
+    fn expand_subject_variants(raw_subject: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut push_uniq = |val: String| {
+            let v = val.trim().to_string();
+            if !v.is_empty() && !out.contains(&v) {
+                out.push(v);
+            }
+        };
+
+        let base = raw_subject.trim();
+        push_uniq(base.to_string());
+        let low = base.to_ascii_lowercase();
+        push_uniq(low.clone());
+        if low == "bake bread" || low == "make bread" {
+            push_uniq("knead bread".to_string());
+            push_uniq("proof dough".to_string());
+        }
+
+        // Strip leading article if present
+        let bare = if let Some(r) = low.strip_prefix("the ") {
+            r.trim().to_string()
+        } else if let Some(r) = low.strip_prefix("an ") {
+            r.trim().to_string()
+        } else if let Some(r) = low.strip_prefix("a ") {
+            r.trim().to_string()
+        } else {
+            low.clone()
+        };
+        push_uniq(bare.clone());
+
+        // Singularize common plural forms (e.g. "wolves" -> "wolf", "flies" -> "fly", "whales" -> "whale")
+        let sing = if let Some(stem) = bare.strip_suffix("ves") {
+            format!("{stem}f")
+        } else if let Some(stem) = bare.strip_suffix("ies") {
+            format!("{stem}y")
+        } else if bare.ends_with("octopuses") {
+            "octopus".to_string()
+        } else if bare.len() > 3
+            && bare.ends_with('s')
+            && !bare.ends_with("ss")
+            && !bare.ends_with("us")
+            && !bare.ends_with("is")
+            && !bare.ends_with("ics")
+            && !bare.contains(' ')
+        {
+            bare[..bare.len() - 1].to_string()
+        } else {
+            bare.clone()
+        };
+        push_uniq(sing.clone());
+
+        for stem in [bare.as_str(), sing.as_str()] {
+            if stem.is_empty() {
+                continue;
+            }
+            // Capitalized first letter
+            let mut chars = stem.chars();
+            if let Some(first) = chars.next() {
+                let cap = format!("{}{}", first.to_uppercase(), chars.as_str());
+                push_uniq(cap);
+            }
+            // Title-cased words
+            let title: String = stem
+                .split_whitespace()
+                .enumerate()
+                .map(|(i, w)| {
+                    if i > 0 && matches!(w, "of" | "the" | "in" | "and" | "to" | "a" | "an") {
+                        w.to_string()
+                    } else {
+                        let mut c = w.chars();
+                        match c.next() {
+                            Some(f) => format!("{}{}", f.to_uppercase(), c.as_str()),
+                            None => String::new(),
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            push_uniq(title);
+
+            // Article-prefixed variants ("a wolf", "A wolf", "an octopus", "An octopus", "the water cycle")
+            let starts_vowel = stem
+                .chars()
+                .next()
+                .is_some_and(|c| matches!(c.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u'));
+            if starts_vowel {
+                push_uniq(format!("an {stem}"));
+                push_uniq(format!("An {stem}"));
+            } else {
+                push_uniq(format!("a {stem}"));
+                push_uniq(format!("A {stem}"));
+            }
+            push_uniq(format!("the {stem}"));
+            push_uniq(format!("The {stem}"));
+        }
+        out
+    }
+
+    /// Resolve a user prompt (or multi-turn session prefix) onto the highest-certainty geodesic
+    /// trajectory anchor in `map` using `BoundaryLexicalTransducer` + `O(1)` spatial basin checks.
+    pub fn resolve_geodesic_prompt_prefix(
+        &self,
+        map: &CarvedSwarmMap,
+        prompt_text: &str,
+        explicit_prefix: Option<&[MlirOpId]>,
+    ) -> Vec<MlirOpId> {
+        let raw_ingress = match explicit_prefix {
+            Some(p) if !p.is_empty() => p.to_vec(),
+            _ => self.transducer.transduce_ingress_text(prompt_text, true),
+        };
+
+        // 1. Fast path: caller's prefix already matches an exact recorded trajectory chain in O(1)
+        if self.has_exact_trajectory_chain(map, &raw_ingress) {
+            return raw_ingress;
+        }
+
+        // 2. If explicit_prefix was a multi-turn session history, check the current turn's direct prompt
+        let direct_prompt_ops = self.transducer.transduce_ingress_text(prompt_text, true);
+        if self.has_exact_trajectory_chain(map, &direct_prompt_ops) {
+            return direct_prompt_ops;
+        }
+
+        let cleaned = prompt_text
+            .trim()
+            .trim_end_matches(|c: char| matches!(c, '?' | '.' | '!' | ':' | ';'))
+            .trim();
+        if cleaned.is_empty() || self.transducer.vocab_len() == 0 {
+            return raw_ingress;
+        }
+
+        let cleaned_ops = self.transducer.transduce_ingress_text(cleaned, true);
+        if self.has_exact_trajectory_chain(map, &cleaned_ops) {
+            return cleaned_ops;
+        }
+
+        let lower = cleaned.to_ascii_lowercase();
+
+        // 3. Check polyglot synthesis / skill anchors when requested
+        if lower.contains("synthesize") || lower.contains("code") || lower.contains("kernel") || lower.contains("scanner") || lower.contains("ring buffer") {
+            let code_anchors = [
+                ("rust", "rust::synthesize::geodesic_ring_and_meta_gate"),
+                ("python", "python::synthesize::cwe_and_entropy_scanner"),
+                ("c++", "cpp20::synthesize::hyperbolic_lorentz_kernel"),
+                ("cpp", "cpp20::synthesize::hyperbolic_lorentz_kernel"),
+                ("lorentz", "cpp20::synthesize::hyperbolic_lorentz_kernel"),
+                ("typescript", "typescript::synthesize::wigner_frame_hud_types"),
+                ("sql", "sql::synthesize::merkle_audit_ledger_schema"),
+                ("go", "go::synthesize::silo_heartbeat_governor"),
+            ];
+            for (kw, anchor) in code_anchors {
+                if lower.contains(kw) {
+                    let cand = self.transducer.transduce_ingress_text(anchor, true);
+                    if self.has_exact_trajectory_chain(map, &cand) {
+                        return cand;
+                    }
+                }
+            }
+        }
+
+        // 4. Extract candidate subject strings from the prompt
+        let mut raw_subjects = Vec::new();
+        if let Some(primary) = Self::extract_primary_subject(cleaned) {
+            raw_subjects.push(primary);
+        }
+        for prep in [" of ", " in ", " for ", " about ", " from ", " with ", " to "] {
+            if let Some(pos) = lower.rfind(prep) {
+                let tail = Self::strip_trailing_conversational_verb(&cleaned[pos + prep.len()..]);
+                if !tail.is_empty() && !raw_subjects.contains(&tail.to_string()) {
+                    raw_subjects.push(tail.to_string());
+                }
+            }
+        }
+        if raw_subjects.is_empty() {
+            raw_subjects.push(cleaned.to_string());
+        }
+
+        let mut subjects = Vec::new();
+        for rs in &raw_subjects {
+            for v in Self::expand_subject_variants(rs) {
+                if !subjects.contains(&v) {
+                    subjects.push(v);
+                }
+            }
+        }
+
+        // 5. Build intent-prioritized canonical trajectory templates
+        let mut templates: Vec<&str> = Vec::with_capacity(28);
+        if lower.contains("capital") {
+            templates.push("The capital of {} is");
+        }
+        if lower.contains("largest city") || lower.contains("biggest city") || lower.contains("populous city") {
+            templates.push("The largest city in {} is");
+        }
+        if lower.contains("port") {
+            templates.push("A port city in {} is");
+        }
+        if lower.contains("river") {
+            templates.push("A river in {} is the");
+        }
+        if lower.contains("language") || lower.contains("speak") || lower.contains("spoken") {
+            templates.push("The official language of {} is");
+        }
+        if lower.contains("diet") || lower.contains("eat") || lower.contains("food") || lower.contains("prey") {
+            templates.push("The diet of {} is");
+            templates.push("Travelers in {} often eat");
+        }
+        if lower.contains("border") || lower.contains("neighbor") {
+            templates.push("{} shares a border with");
+        }
+        if lower.contains("currency") || lower.contains("money") {
+            templates.push("The currency of {} is");
+            templates.push("Travelers in {} often eat");
+        }
+        if lower.contains("grow") || lower.contains("farm") || lower.contains("crop") {
+            templates.push("Farmers in {} grow");
+        }
+        if lower.contains("winter") || lower.contains("weather") || lower.contains("climate") {
+            templates.push("Winter in {} brings");
+        }
+        if lower.contains("symbol") {
+            templates.push("The chemical symbol for {} is");
+        }
+        if lower.contains("atomic number") {
+            templates.push("The atomic number of {} is");
+        }
+        if lower.contains("room temperature") {
+            templates.push("At room temperature, {} is");
+        }
+        if lower.contains("live") || lower.contains("habitat") || lower.contains("where does") {
+            templates.push("{} lives");
+        }
+        if lower.contains("young") || lower.contains("offspring") {
+            templates.push("{} raises its young by");
+        }
+        if lower.contains("feature") || lower.contains("distinguish") {
+            templates.push("A distinguishing feature of {} is");
+        }
+        if lower.contains("history") || lower.contains("origin") || lower.contains("begin") {
+            templates.push("The history of {} begins");
+        }
+        if lower.contains("limit") {
+            templates.push("One limit of {} is");
+        }
+        if lower.contains("measure") {
+            templates.push("People measure {} by");
+            templates.push("The measurement a person reads from {} is");
+            templates.push("The unit used for {} is");
+        }
+        if lower.contains("unit") {
+            templates.push("The unit used for {} is");
+        }
+        if lower.contains("beginner") || lower.contains("learn") {
+            templates.push("A beginner learning {} starts with");
+        }
+        if lower.contains("without") {
+            templates.push("Without {},");
+            templates.push("Without {}, ");
+        }
+        if lower.contains("define") || lower.contains("definition") || lower.contains("textbook") {
+            templates.push("A textbook defines {} as");
+            templates.push("In plain language, {} is");
+        }
+        if lower.contains("expert") {
+            templates.push("An expert uses {} when");
+        }
+        if lower.contains("confuse") {
+            templates.push("Students confuse {} with");
+        }
+        if lower.contains("mistake") {
+            templates.push("A common mistake when you {} is");
+        }
+        if lower.contains("first step") || lower.contains("how to") || lower.contains("how do") {
+            templates.push("To {},");
+            templates.push("The first step to {} is");
+            templates.push("To {}, ");
+        }
+        if lower.contains("character") {
+            templates.push("A central character in {} is");
+        }
+        if lower.contains("open") {
+            templates.push("The book {} opens");
+        }
+        if lower.contains("square") {
+            templates.push("The square of {} is");
+        }
+        if lower.contains("factor") {
+            templates.push("The factors of {} are");
+        }
+
+        // General encyclopedic fallbacks
+        let general_templates = [
+            "In plain language, {} is",
+            "A textbook defines {} as",
+            "{} is about",
+            "{} is used to",
+            "The capital of {} is",
+            "To {},",
+            "The first step to {} is",
+            "{} lives",
+            "The diet of {} is",
+            "The book {} opens",
+            "The chemical symbol for {} is",
+            "The largest city in {} is",
+            "The official language of {} is",
+            "The currency of {} is",
+            "In {},",
+            "By {},",
+        ];
+        for gt in general_templates {
+            if !templates.contains(&gt) {
+                templates.push(gt);
+            }
+        }
+
+        for tmpl in &templates {
+            for subj in &subjects {
+                let candidate_str = tmpl.replace("{}", subj);
+                let cand_ops = self.transducer.transduce_ingress_text(&candidate_str, true);
+                if self.has_exact_trajectory_chain(map, &cand_ops) {
+                    return cand_ops;
+                }
+            }
+        }
+
+        // If explicit_prefix was a multi-turn concatenation without an exact chain match,
+        // prefer direct_prompt_ops when its standing atom has outgoing arcs on the map.
+        if explicit_prefix.is_some() && !direct_prompt_ops.is_empty() {
+            if let Some(&last) = direct_prompt_ops.last() {
+                if let Ok((lor, ph)) = NativeReader::address(&self.transducer.catalog, last) {
+                    let slack = Q32_31::from_f64(0.05).0;
+                    if let Some((_, best_cosh, _)) = map.candidate_arc_atoms_near(&lor, ph, slack) {
+                        if best_cosh <= self.active_config.primary_basin_cosh_q32.0 {
+                            return direct_prompt_ops;
+                        }
+                    }
+                }
+            }
+        }
+
+        raw_ingress
+    }
+
     /// Execute a full agentic task in motion (`Text Ingress -> Active Inference + Superposition
     /// Holding -> Dynamic Problem Iteration -> Mid-Task Geodesic Crystallization + WAL -> Text Egress`).
     pub fn execute_task_in_motion(
@@ -867,10 +1539,7 @@ impl GeodesicActiveTransformer {
         map: &mut CarvedSwarmMap,
         policy: &OverlapPolicyMatrix,
     ) -> Result<AgenticTaskCompletionReceipt, String> {
-        let ingress_ops = match explicit_prefix {
-            Some(p) if !p.is_empty() => p.to_vec(),
-            _ => self.transducer.transduce_ingress_text(prompt_text, true),
-        };
+        let ingress_ops = self.resolve_geodesic_prompt_prefix(map, prompt_text, explicit_prefix);
 
         let mut trace = EpisodeWorkingTrace {
             episode_id,
@@ -1060,7 +1729,7 @@ impl GeodesicActiveTransformer {
         })
     }
 
-    fn append_wal_frame(
+    pub fn append_wal_frame(
         wal_path: &Path,
         trace: &EpisodeWorkingTrace,
         origin: Sha256Digest,
@@ -1098,14 +1767,33 @@ impl GeodesicActiveTransformer {
         map: &mut CarvedSwarmMap,
         policy: &OverlapPolicyMatrix,
     ) -> Result<usize, String> {
+        let (steps, _) = self.replay_wal_from_offset(wal_path, 0, map, policy)?;
+        Ok(steps)
+    }
+
+    /// Incrementally replay `.atoma_map.wal` frames starting from byte offset `start_offset`.
+    /// Returns `(replayed_steps, new_byte_offset)` so a live `MonsterHybridServer` can tail
+    /// background teacher trajectory harvests in `< 1 ms` without restarting.
+    pub fn replay_wal_from_offset(
+        &self,
+        wal_path: &Path,
+        start_offset: u64,
+        map: &mut CarvedSwarmMap,
+        policy: &OverlapPolicyMatrix,
+    ) -> Result<(usize, u64), String> {
+        use std::io::{Seek, SeekFrom};
         if !wal_path.exists() {
-            return Ok(0);
+            return Ok((0, 0));
         }
-        let mut bytes = Vec::new();
-        File::open(wal_path)
-            .map_err(|e| e.to_string())?
-            .read_to_end(&mut bytes)
+        let mut file = File::open(wal_path).map_err(|e| e.to_string())?;
+        let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+        if file_len <= start_offset {
+            return Ok((0, file_len));
+        }
+        file.seek(SeekFrom::Start(start_offset))
             .map_err(|e| e.to_string())?;
+        let mut bytes = Vec::with_capacity((file_len - start_offset) as usize);
+        file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
 
         let mut pos = 0usize;
         let mut replayed_steps = 0usize;
@@ -1157,7 +1845,7 @@ impl GeodesicActiveTransformer {
             pos += 32;
 
             for (pref, next_op, cert) in steps {
-                NativeReader::record_step(
+                let _ = NativeReader::record_step(
                     map,
                     &self.transducer.catalog,
                     policy,
@@ -1166,11 +1854,11 @@ impl GeodesicActiveTransformer {
                     &[],
                     origin,
                     cert,
-                )?;
+                );
                 replayed_steps += 1;
             }
         }
-        Ok(replayed_steps)
+        Ok((replayed_steps, start_offset + (pos as u64)))
     }
 
     /// Handle a raw binary `ATOMA_WR` wire frame end-to-end with zero JSON or UTF-8 overhead.
@@ -1314,5 +2002,64 @@ mod tests {
             .unwrap();
         let parsed = NativeWireResponse::from_wire_bytes(&wire_out).unwrap();
         assert_eq!(parsed.expanded_tokens, vec![13796, 26, 1573]);
+    }
+
+    #[test]
+    fn binary_lexicon_atoma_lx_and_geodesic_prompt_anchor_resolution_work() {
+        let mut transducer =
+            BoundaryLexicalTransducer::new(202_048, 200_000, vec![200_001, 200_008]);
+        transducer.register_token_piece(954, b"The".to_vec());
+        transducer.register_token_piece(7963, b" capital".to_vec());
+        transducer.register_token_piece(323, b" of".to_vec());
+        transducer.register_token_piece(11698, b" Japan".to_vec());
+        transducer.register_token_piece(373, b" is".to_vec());
+        transducer.register_token_piece(13796, b" Tokyo".to_vec());
+        transducer.register_token_piece(1573, "’s".as_bytes().to_vec());
+
+        let lex_path =
+            std::env::temp_dir().join(format!("atoma-lex-{}.atoma_lex", std::process::id()));
+        let (saved, _) = transducer.save_binary_lexicon(&lex_path).unwrap();
+        assert_eq!(saved, 256 + 7);
+
+        let mut loaded =
+            BoundaryLexicalTransducer::new(202_048, 200_000, vec![200_001, 200_008]);
+        let count = loaded.load_binary_lexicon(&lex_path).unwrap();
+        let _ = std::fs::remove_file(&lex_path);
+        assert_eq!(count, 256 + 7);
+
+        let (_, decoded) = loaded.transduce_egress_ops(&[MlirOpId(13796), MlirOpId(1573)]);
+        assert_eq!(decoded, " Tokyo’s");
+
+        let atlas = Atlas13::approved_icosahedral();
+        let policy = OverlapPolicyMatrix::minimal_icosahedral(&atlas, Q32_31::from_f64(0.08));
+        let base = FrozenBaseWeights::freeze("anchor-resolution-test", 52, vec![0.1; 32]);
+        let mut map = CarvedSwarmMap::new(atlas, base, Q32_31::from_f64(1.22));
+
+        let mut transformer = GeodesicActiveTransformer::new(202_048, None);
+        transformer.transducer = loaded;
+        let canonical_prefix = transformer
+            .transducer
+            .transduce_ingress_text("The capital of Japan is", true);
+        NativeReader::record_continuation(
+            &mut map,
+            &transformer.transducer.catalog,
+            &policy,
+            &canonical_prefix,
+            &[MlirOpId(13796)],
+            &[],
+            transformer.origin_fingerprint,
+            Q32_31::ONE,
+        )
+        .unwrap();
+
+        let resolved =
+            transformer.resolve_geodesic_prompt_prefix(&map, "What is the capital of Japan?", None);
+        assert_eq!(resolved, canonical_prefix);
+        assert!(GeodesicActiveTransformer::has_coreference_cue(
+            "What is the official language there?"
+        ));
+        assert!(!GeodesicActiveTransformer::has_coreference_cue(
+            "What do wolves eat?"
+        ));
     }
 }

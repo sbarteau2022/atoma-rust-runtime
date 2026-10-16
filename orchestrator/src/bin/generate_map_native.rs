@@ -156,6 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let icap = InstrumentedLayerCapture {
                     layer: cap.layer,
                     token_id: cap.token_id,
+                    next_token_id: cap.next_token_id,
                     pos: cap.pos,
                     x_in: cap.x_in.clone(),
                     attn_delta: cap.attn_delta.clone(),

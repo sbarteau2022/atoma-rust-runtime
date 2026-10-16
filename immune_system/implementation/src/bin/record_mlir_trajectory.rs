@@ -163,6 +163,7 @@ fn run_steps(args: &[String], out: &Path) -> Result<(), String> {
     let Some(steps_path) = arg_value(args, "--steps").map(PathBuf::from) else {
         return Err("--steps is required".to_string());
     };
+    let append_wal_path = arg_value(args, "--append-wal").map(PathBuf::from);
     let continuations = read_steps(&steps_path)?;
     if continuations.is_empty() {
         return Err("steps file has no continuations".to_string());
@@ -187,6 +188,25 @@ fn run_steps(args: &[String], out: &Path) -> Result<(), String> {
         };
         conflicts += step_conflicts;
         written += steps;
+        if let Some(ref wal_path) = append_wal_path {
+            let mut pref = continuation.prefix.clone();
+            let mut tentative_steps = Vec::with_capacity(continuation.generated.len());
+            for &next_op in &continuation.generated {
+                tentative_steps.push((pref.clone(), next_op, certainty));
+                pref.push(next_op);
+            }
+            let trace = atoma_immune::EpisodeWorkingTrace {
+                episode_id: (i as u64) + 1,
+                initial_prefix: continuation.prefix.clone(),
+                active_prefix: pref,
+                tentative_steps,
+                pruned_dead_ends: Vec::new(),
+                superposition_holds: 0,
+            };
+            let _ = atoma_immune::GeodesicActiveTransformer::append_wal_frame(
+                wal_path, &trace, origin,
+            )?;
+        }
         println!(
             "continuation {i} steps={steps} conflicts={step_conflicts} prefix={} generated={}",
             continuation.prefix.len(),

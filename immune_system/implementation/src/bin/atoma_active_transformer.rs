@@ -26,11 +26,6 @@ use atoma_immune::{
 use std::path::PathBuf;
 use std::time::Instant;
 
-const DEFAULT_TOKENIZER_CANDIDATES: &[&str] = &[
-    "/Users/stewartbarteau/models/Muse-Glimmer-q4km-gs128-MLX/tokenizer.json",
-    "/Users/stewartbarteau/models/Qwen3.6-35B-A3B-OptiQ-4bit/tokenizer.json",
-];
-
 fn resolve_default_vault() -> PathBuf {
     let candidates = [
         DEFAULT_ACTIVE_MIND_VAULT,
@@ -132,36 +127,22 @@ fn main() -> Result<(), String> {
     let (loaded_atoms, loaded_arcs, loaded_sha) = map.load_from_binary_vault(&vault_path, &policy)?;
     let boot_ms = t_boot.elapsed().as_secs_f64() * 1_000.0;
 
-    // 2. Initialize GeodesicActiveTransformer + BoundaryLexicalTransducer
+    // 2. Initialize GeodesicActiveTransformer + BoundaryLexicalTransducer (Binary ATOMA_LX first)
     let wal_path = derive_wal_path(&vault_path);
     let mut transformer = GeodesicActiveTransformer::new(202_048, Some(wal_path.clone()));
-    let resolved_tok = tokenizer_path.or_else(|| {
-        DEFAULT_TOKENIZER_CANDIDATES
-            .iter()
-            .map(PathBuf::from)
-            .find(|p| p.exists())
-    });
-    let loaded_vocab_entries = if let Some(ref tp) = resolved_tok {
-        match transformer.transducer.load_huggingface_tokenizer_json(tp) {
-            Ok(count) => {
-                println!(
-                    "[BOUNDARY TRANSDUCER] Loaded {} reversible token pieces from {}",
-                    count,
-                    tp.display()
-                );
-                count
-            }
-            Err(e) => {
-                println!(
-                    "[BOUNDARY TRANSDUCER] Warning: failed to load {}: {} (using deterministic fallback)",
-                    tp.display(),
-                    e
-                );
-                0
-            }
+    let loaded_vocab_entries = if let Some(ref tp) = tokenizer_path {
+        if tp.extension().is_some_and(|e| e == "atoma_lex") {
+            transformer.transducer.load_binary_lexicon(tp)?
+        } else {
+            transformer.transducer.load_huggingface_tokenizer_json(tp)?
         }
     } else {
-        0
+        let count = transformer.transducer.load_or_bootstrap_default()?;
+        println!(
+            "[BOUNDARY TRANSDUCER] Loaded {} reversible carrier pieces via binary ATOMA_LX lexicon",
+            count
+        );
+        count
     };
 
     // Replay any existing `.atoma_map.wal` delta frames
