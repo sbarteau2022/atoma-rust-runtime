@@ -51,15 +51,17 @@ pub use skill_evolution::{
 pub use continuous_active_mind::{
     ATOMA_LEX_MAGIC, ATOMA_WAL_MAGIC, ATOMA_WIRE_MAGIC, AgenticTaskCompletionReceipt,
     BoundaryLexicalTransducer, CrystallizationReceipt, DEFAULT_ACTIVE_MIND_VAULT,
-    DEFAULT_BOUNDARY_LEXICON_PATH, EpisodeWorkingTrace, GeodesicActiveTransformer, GeodesicCursor,
-    NativeWireRequest, NativeWireResponse, SpanFoldingReceipt, SubAgentTaskReceipt,
-    fold_high_certainty_trajectory_spans,
+    DEFAULT_BOUNDARY_LEXICON_PATH, DreamConsolidationReceipt, EpisodeWorkingTrace,
+    GeodesicActiveTransformer, GeodesicCursor, NativeWireRequest, NativeWireResponse,
+    SpanFoldingReceipt, SubAgentTaskReceipt, fold_high_certainty_trajectory_spans,
 };
 
 pub use map_native::{
-    COUPLED_OPERATOR_MAGIC, CoupledOperatorAtomPayload, InstrumentedLayerCapture,
+    COUPLED_OPERATOR_MAGIC, CoupledOperatorAtomPayload, DEFAULT_MGS_ORTHO_EPSILON,
+    InstrumentedLayerCapture, JacobianTangentSlot, MAX_ACCRETION_ENTROPY_BITS, MAX_JACOBIAN_RANK,
     MapNativeInferenceEngine, MapNativeLayerReceipt, MapSubstitutionMode, RECEPTOR_SKETCH_DIM,
-    VectorComparisonMetrics, compute_receptor_sketch,
+    Rank8AccretionReceipt, VectorComparisonMetrics, align_cross_model_effector_dim,
+    compute_receptor_sketch, generate_icosahedral_perturbation_ray,
 };
 
 pub use atlas13::{

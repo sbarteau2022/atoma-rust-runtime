@@ -626,6 +626,441 @@ impl MonsterHybridServer {
     }
 }
 
+/// Fixed-size `O(1)` 2nd-order Fourier-Toroidal Harmonic Field State on `(R_+ x S^1)^(D/2)`.
+///
+/// By expanding the isotropic toroidal kernel `K(theta_q, theta_k) = (1 + cos(theta_q - theta_k))^2`
+/// into circular harmonics `{1, cos(theta), sin(theta), cos(2*theta), sin(2*theta)}`, any causal
+/// sequence of length `N` (`1K .. 10M+` tokens) is compressed into five `D`-dimensional harmonic
+/// moment vectors (`O(1)` memory, `O(D)` per-token update & query time, zero KV cache growth).
+#[derive(Debug, Clone)]
+pub struct ToroidalHarmonicFieldState {
+    pub hidden_dim: usize,
+    pub tokens_ingested: usize,
+    /// Scalar partition accumulators for `{1, cos(theta), sin(theta), cos(2*theta), sin(2*theta)}`
+    /// averaged across the `D/2` polar pairs.
+    pub z_0: f64,
+    pub z_c1: Vec<f64>,
+    pub z_s1: Vec<f64>,
+    pub z_c2: Vec<f64>,
+    pub z_s2: Vec<f64>,
+    /// Value moment accumulators weighted by each circular harmonic per pair.
+    pub m_0: Vec<f64>,
+    pub m_c1: Vec<f64>,
+    pub m_s1: Vec<f64>,
+    pub m_c2: Vec<f64>,
+    pub m_s2: Vec<f64>,
+}
+
+impl ToroidalHarmonicFieldState {
+    pub fn new(hidden_dim: usize) -> Self {
+        let pairs = (hidden_dim / 2).max(1);
+        Self {
+            hidden_dim,
+            tokens_ingested: 0,
+            z_0: 0.0,
+            z_c1: vec![0.0; pairs],
+            z_s1: vec![0.0; pairs],
+            z_c2: vec![0.0; pairs],
+            z_s2: vec![0.0; pairs],
+            m_0: vec![0.0; hidden_dim],
+            m_c1: vec![0.0; hidden_dim],
+            m_s1: vec![0.0; hidden_dim],
+            m_c2: vec![0.0; hidden_dim],
+            m_s2: vec![0.0; hidden_dim],
+        }
+    }
+
+    /// Update the `O(1)` toroidal harmonic field state with a new causal token state `x_in`
+    /// and query the resulting phase-coherent context vector in `O(D)` time.
+    pub fn step_and_readout(&mut self, x_in: &[f32], decay: f64) -> Vec<f32> {
+        let d_len = x_in.len().min(self.hidden_dim);
+        let pairs = d_len / 2;
+        if pairs == 0 {
+            return vec![0.0; x_in.len()];
+        }
+
+        // Apply gentle exponential horizon decay so recent phase structure stays sharp
+        let gamma = decay.clamp(0.90, 1.0);
+        self.z_0 *= gamma;
+        for p in 0..pairs {
+            self.z_c1[p] *= gamma;
+            self.z_s1[p] *= gamma;
+            self.z_c2[p] *= gamma;
+            self.z_s2[p] *= gamma;
+        }
+        for d in 0..d_len {
+            self.m_0[d] *= gamma;
+            self.m_c1[d] *= gamma;
+            self.m_s1[d] *= gamma;
+            self.m_c2[d] *= gamma;
+            self.m_s2[d] *= gamma;
+        }
+
+        // Compute isotropic RMS radius across pairs so no outlier dimension dominates
+        let mut mean_r_sq = 0.0f64;
+        for p in 0..pairs {
+            let x0 = x_in[2 * p] as f64;
+            let x1 = x_in[2 * p + 1] as f64;
+            mean_r_sq += x0 * x0 + x1 * x1;
+        }
+        let rms_r = (mean_r_sq / (pairs as f64)).sqrt().max(1e-9);
+
+        let mut c1_q = vec![0.0f64; pairs];
+        let mut s1_q = vec![0.0f64; pairs];
+        let mut c2_q = vec![0.0f64; pairs];
+        let mut s2_q = vec![0.0f64; pairs];
+
+        self.z_0 += 1.5;
+        for p in 0..pairs {
+            let x0 = x_in[2 * p] as f64;
+            let x1 = x_in[2 * p + 1] as f64;
+            let r = x0.hypot(x1);
+            let (c1, s1) = if r > 1e-12 {
+                (x0 / r, x1 / r)
+            } else {
+                (1.0, 0.0)
+            };
+            // Double-angle identity: cos(2t) = c1^2 - s1^2, sin(2t) = 2*c1*s1
+            let c2 = c1 * c1 - s1 * s1;
+            let s2 = 2.0 * c1 * s1;
+            let r_iso = (r / rms_r).clamp(0.0, 4.0);
+
+            c1_q[p] = c1;
+            s1_q[p] = s1;
+            c2_q[p] = c2;
+            s2_q[p] = s2;
+
+            self.z_c1[p] += 2.0 * r_iso * c1;
+            self.z_s1[p] += 2.0 * r_iso * s1;
+            self.z_c2[p] += 0.5 * r_iso * c2;
+            self.z_s2[p] += 0.5 * r_iso * s2;
+
+            for lane in 0..2 {
+                let idx = 2 * p + lane;
+                let v = x_in[idx] as f64;
+                self.m_0[idx] += 1.5 * v;
+                self.m_c1[idx] += 2.0 * r_iso * c1 * v;
+                self.m_s1[idx] += 2.0 * r_iso * s1 * v;
+                self.m_c2[idx] += 0.5 * r_iso * c2 * v;
+                self.m_s2[idx] += 0.5 * r_iso * s2 * v;
+            }
+        }
+        self.tokens_ingested += 1;
+
+        // O(D) harmonic readout
+        let mut out = vec![0.0f32; x_in.len()];
+        for p in 0..pairs {
+            let denom = (self.z_0
+                + c1_q[p] * self.z_c1[p]
+                + s1_q[p] * self.z_s1[p]
+                + c2_q[p] * self.z_c2[p]
+                + s2_q[p] * self.z_s2[p])
+                .max(1e-9);
+            for lane in 0..2 {
+                let idx = 2 * p + lane;
+                let numer = self.m_0[idx]
+                    + c1_q[p] * self.m_c1[idx]
+                    + s1_q[p] * self.m_s1[idx]
+                    + c2_q[p] * self.m_c2[idx]
+                    + s2_q[p] * self.m_s2[idx];
+                out[idx] = (numer / denom) as f32;
+            }
+        }
+        out
+    }
+}
+
+/// Receipt for a single layer execution inside the Toroidal Isotropic Transformer Runtime.
+#[derive(Debug, Clone)]
+pub struct ToroidalIsotropicLayerReceipt {
+    pub layer: usize,
+    pub routed_role: RoleId,
+    pub top_atom_id: AtomId,
+    pub active_jacobian_rank: usize,
+    pub max_receptor_cosine: f64,
+    pub min_cosh_distance: f64,
+    pub isotropic_rms_radius: f64,
+}
+
+/// Receipt for a full multi-layer step of `ToroidalIsotropicRuntime` ("The Hands of the Mind").
+#[derive(Debug, Clone)]
+pub struct ToroidalIsotropicStepReceipt {
+    pub position: usize,
+    pub predicted_next_mlir_id: u32,
+    pub winning_vote_weight: f64,
+    pub mean_active_jacobian_rank: f64,
+    pub mean_receptor_cosine: f64,
+    pub layer_receipts: Vec<ToroidalIsotropicLayerReceipt>,
+    pub final_hidden_state: Vec<f32>,
+}
+
+/// **Toroidal Isotropic Transformer Runtime ("The Hands of the Mind")**
+///
+/// Replaces the frozen dense GPU weight stack and `O(N^2)` KV cache with a weightless,
+/// persistent geometric execution runtime that couples:
+/// 1. **`O(1)` Toroidal Harmonic Field State** on `(R_+ x S^1)^(D/2)` for infinite-horizon
+///    causal phase coherence (`O(D)` time and `O(D)` memory independent of sequence length `N`),
+/// 2. **`ATOMA_OP_V3` Rank-8 Local Jacobian Contraction** over the persistent `(H^3 x T^2)/Gamma_12`
+///    `CarvedSwarmMap`, and
+/// 3. **Isotropic Polar RMS Normalization** across `2D` toroidal pairs so hidden trajectories stay
+///    on the balanced `(R_+ x S^1)^(D/2)` manifold across arbitrarily deep layer stacks.
+
+/// Discrete entity/quantity register slot inside [`ToroidalWorkingMemory`].
+#[derive(Debug, Clone)]
+pub struct WorkingMemoryRegister {
+    pub reg_id: u16,
+    pub entity_key: String,
+    pub unit_kind: String,
+    pub value_f64: f64,
+    pub value_q32: atoma_immune::geometry::fixed::Q32_31,
+    pub source_clause_idx: usize,
+    pub is_rate: bool,
+    pub polarity: i8,
+}
+
+/// Proposition frame extracted from a natural-language clause by [`ToroidalWorkingMemory`].
+#[derive(Debug, Clone)]
+pub struct PropositionalClauseFrame {
+    pub clause_index: usize,
+    pub raw_clause: String,
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub numbers: Vec<f64>,
+    pub polarity: i8,
+}
+
+/// **Pillar 1 — Compositional Working Memory (`ToroidalWorkingMemory`)**
+///
+/// Couples with [`ToroidalHarmonicFieldState`] inside [`ToroidalIsotropicRuntime`] so that
+/// while the harmonic field maintains `O(1)` global phase coherence, the runtime simultaneously
+/// maintains discrete, addressable entity/quantity registers and propositional frames across
+/// sentences, compiling state transitions into deterministic [`atoma_immune::MlirSsaBlock`] (`Q32_31`) ops.
+#[derive(Debug, Clone, Default)]
+pub struct ToroidalWorkingMemory {
+    pub registers: Vec<WorkingMemoryRegister>,
+    pub propositions: Vec<PropositionalClauseFrame>,
+    pub ssa_ops: Vec<(char, u8, u8)>,
+    pub ssa_constants: Vec<f64>,
+    pub trace_steps: Vec<String>,
+}
+
+impl ToroidalWorkingMemory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push_constant(&mut self, entity: &str, unit: &str, val: f64, clause_idx: usize, is_rate: bool) -> u8 {
+        let id = self.registers.len() as u16;
+        let q32 = atoma_immune::geometry::fixed::Q32_31::from_f64((val / 10_000.0).clamp(-1.99, 1.99));
+        self.registers.push(WorkingMemoryRegister {
+            reg_id: id,
+            entity_key: entity.to_string(),
+            unit_kind: unit.to_string(),
+            value_f64: val,
+            value_q32: q32,
+            source_clause_idx: clause_idx,
+            is_rate,
+            polarity: 1,
+        });
+        if self.ssa_constants.len() < 12 {
+            self.ssa_constants.push(val);
+        }
+        (id as u8).min(14)
+    }
+
+    pub fn emit_binary_op(&mut self, op: char, lhs_reg: u8, rhs_reg: u8, entity: &str, unit: &str, clause_idx: usize) -> f64 {
+        let a = self.registers.get(lhs_reg as usize).map(|r| r.value_f64).unwrap_or(0.0);
+        let b = self.registers.get(rhs_reg as usize).map(|r| r.value_f64).unwrap_or(0.0);
+        let res = match op {
+            '+' => a + b,
+            '-' => a - b,
+            '*' => a * b,
+            '/' => if b.abs() > 1e-12 { a / b } else { 0.0 },
+            _ => a + b,
+        };
+        let dst_id = self.registers.len() as u16;
+        let q32 = atoma_immune::geometry::fixed::Q32_31::from_f64((res / 10_000.0).clamp(-1.99, 1.99));
+        self.registers.push(WorkingMemoryRegister {
+            reg_id: dst_id,
+            entity_key: entity.to_string(),
+            unit_kind: unit.to_string(),
+            value_f64: res,
+            value_q32: q32,
+            source_clause_idx: clause_idx,
+            is_rate: false,
+            polarity: 1,
+        });
+        self.ssa_ops.push((op, lhs_reg, rhs_reg));
+        self.trace_steps.push(format!("{:.2} {} {:.2} = {:.2}", a, op, b, res));
+        res
+    }
+}
+
+pub struct ToroidalIsotropicRuntime {
+    pub hidden_dim: usize,
+    pub active_layers: Vec<usize>,
+    pub total_model_layers: usize,
+    pub toroidal_field_mix: f32,
+    pub horizon_decay: f64,
+    pub map_engine: atoma_immune::MapNativeInferenceEngine,
+    pub layer_fields: Vec<ToroidalHarmonicFieldState>,
+    pub working_memory: ToroidalWorkingMemory,
+}
+
+impl ToroidalIsotropicRuntime {
+    pub fn new(hidden_dim: usize, active_layers: Vec<usize>, total_model_layers: usize) -> Self {
+        let layer_fields = active_layers
+            .iter()
+            .map(|_| ToroidalHarmonicFieldState::new(hidden_dim))
+            .collect();
+        Self {
+            hidden_dim,
+            active_layers,
+            total_model_layers: total_model_layers.max(1),
+            toroidal_field_mix: 0.18,
+            horizon_decay: 0.995,
+            map_engine: atoma_immune::MapNativeInferenceEngine::default(),
+            layer_fields,
+            working_memory: ToroidalWorkingMemory::new(),
+        }
+    }
+
+    /// Apply isotropic pair-wise RMS normalization on `(R_+ x S^1)^(D/2)` while preserving
+    /// the target radial energy `target_l2_norm`.
+    pub fn isotropic_toroidal_rms_normalize(x: &mut [f32], target_l2_norm: f32) {
+        let pairs = x.len() / 2;
+        if pairs == 0 {
+            return;
+        }
+        let mut sum_sq = 0.0f64;
+        for p in 0..pairs {
+            let r_sq = (x[2 * p] as f64).powi(2) + (x[2 * p + 1] as f64).powi(2);
+            sum_sq += r_sq;
+        }
+        let mean_pair_r = (sum_sq / (pairs as f64)).sqrt().max(1e-9);
+        // Soft-clamp extreme rogue pair radii (> 3.0x RMS) onto the isotropic torus
+        let max_r = 3.0 * mean_pair_r;
+        let mut new_norm_sq = 0.0f64;
+        for p in 0..pairs {
+            let x0 = x[2 * p] as f64;
+            let x1 = x[2 * p + 1] as f64;
+            let r = x0.hypot(x1);
+            if r > max_r {
+                let s = (max_r / r) as f32;
+                x[2 * p] *= s;
+                x[2 * p + 1] *= s;
+            }
+            new_norm_sq += (x[2 * p] as f64).powi(2) + (x[2 * p + 1] as f64).powi(2);
+        }
+        let cur_norm = new_norm_sq.sqrt().max(1e-9) as f32;
+        let scale = target_l2_norm / cur_norm;
+        for v in x.iter_mut() {
+            *v *= scale;
+        }
+    }
+
+    /// Execute one token step through all `active_layers` using `O(1)` Toroidal Harmonic Field
+    /// coherence + `ATOMA_OP_V3` Rank-8 Local Jacobian charts from `swarm_map`.
+    pub fn step_token(
+        &mut self,
+        position: usize,
+        x_in: &[f32],
+        swarm_map: &atoma_immune::CarvedSwarmMap,
+    ) -> Result<ToroidalIsotropicStepReceipt, String> {
+        let mut x_curr = x_in.to_vec();
+        let base_norm = x_curr
+            .iter()
+            .map(|&v| (v as f64) * (v as f64))
+            .sum::<f64>()
+            .sqrt()
+            .max(1e-6) as f32;
+
+        let mut layer_receipts = Vec::with_capacity(self.active_layers.len());
+        let mut rank_sum = 0usize;
+        let mut cos_sum = 0.0f64;
+
+        for (idx, &layer) in self.active_layers.iter().enumerate() {
+            let toroidal_ctx = self.layer_fields[idx].step_and_readout(&x_curr, self.horizon_decay);
+            let map_rec = self.map_engine.retrieve_and_synthesize_layer(
+                layer,
+                position,
+                self.total_model_layers,
+                &x_curr,
+                atoma_immune::MapSubstitutionMode::FullLayer,
+                swarm_map,
+            )?;
+
+            let active_rank = swarm_map
+                .global_atom(map_rec.top_atom_id)
+                .and_then(|ga| atoma_immune::CoupledOperatorAtomPayload::peek_rank(&ga.payload))
+                .unwrap_or(1);
+
+            let mix = self.toroidal_field_mix;
+            let inv_mix = 1.0 - mix;
+            for d in 0..x_curr.len() {
+                let map_step = map_rec.attn_delta[d] + map_rec.mlp_delta[d];
+                let torus_delta = toroidal_ctx[d] - x_curr[d];
+                x_curr[d] += inv_mix * map_step + mix * torus_delta;
+            }
+            let target_norm = map_rec
+                .synthesized_x_out
+                .iter()
+                .map(|&v| (v as f64) * (v as f64))
+                .sum::<f64>()
+                .sqrt()
+                .max(base_norm as f64) as f32;
+            Self::isotropic_toroidal_rms_normalize(&mut x_curr, target_norm);
+
+            let pairs = (x_curr.len() / 2).max(1) as f64;
+            let iso_rms = ((target_norm as f64).powi(2) / pairs).sqrt();
+
+            rank_sum += active_rank;
+            cos_sum += map_rec.max_receptor_cosine;
+            layer_receipts.push(ToroidalIsotropicLayerReceipt {
+                layer,
+                routed_role: map_rec.routed_role,
+                top_atom_id: map_rec.top_atom_id,
+                active_jacobian_rank: active_rank,
+                max_receptor_cosine: map_rec.max_receptor_cosine,
+                min_cosh_distance: map_rec.min_cosh_distance,
+                isotropic_rms_radius: iso_rms,
+            });
+        }
+
+        let last_layer = *self.active_layers.last().unwrap_or(&0);
+        let votes = self
+            .map_engine
+            .retrieve_next_id_votes(
+                last_layer,
+                position,
+                self.total_model_layers,
+                &x_curr,
+                swarm_map,
+            )
+            .unwrap_or_default();
+        let mut tally = std::collections::BTreeMap::<u32, f64>::new();
+        for (_aid, w, next_id) in votes {
+            *tally.entry(next_id).or_insert(0.0) += w;
+        }
+        let (predicted_next_mlir_id, winning_vote_weight) = tally
+            .into_iter()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap_or((0, 0.0));
+
+        let n_layers = layer_receipts.len().max(1) as f64;
+        Ok(ToroidalIsotropicStepReceipt {
+            position,
+            predicted_next_mlir_id,
+            winning_vote_weight,
+            mean_active_jacobian_rank: (rank_sum as f64) / n_layers,
+            mean_receptor_cosine: cos_sum / n_layers,
+            layer_receipts,
+            final_hidden_state: x_curr,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

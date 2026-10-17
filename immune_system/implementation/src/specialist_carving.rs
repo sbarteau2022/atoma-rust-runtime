@@ -537,10 +537,14 @@ impl CarvedSwarmMap {
                 .decode_span_accelerated_incremental(self, &resolved_prefix, 28)
                 .unwrap_or_else(|_| (Vec::new(), Vec::new(), String::new()));
 
-            if p_idx == 0 && !decoded_txt.is_empty() {
+            let is_coherent = crate::continuous_active_mind::BoundaryLexicalTransducer::is_coherent_egress_text(
+                p_text,
+                &decoded_txt,
+            );
+            if p_idx == 0 && !decoded_txt.is_empty() && is_coherent {
                 primary_emitted_ops = emitted_ops.iter().map(|op| op.0).collect();
                 primary_decoded = decoded_txt;
-            } else if primary_decoded.is_empty() && !decoded_txt.is_empty() {
+            } else if primary_decoded.is_empty() && !decoded_txt.is_empty() && is_coherent {
                 primary_emitted_ops = emitted_ops.iter().map(|op| op.0).collect();
                 primary_decoded = decoded_txt;
             }

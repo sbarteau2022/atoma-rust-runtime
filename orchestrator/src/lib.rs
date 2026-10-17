@@ -17,6 +17,10 @@ pub mod routing;
 pub mod runtime_model;
 pub mod swarm;
 pub mod toroidal_attention;
+pub use toroidal_attention::{
+    ToroidalHarmonicFieldState, ToroidalIsotropicLayerReceipt, ToroidalIsotropicRuntime,
+    ToroidalIsotropicStepReceipt,
+};
 
 use atoma_immune::cache::geometric::{AtomId, Phase};
 use atoma_immune::geometry::fixed::Q32_31;
@@ -103,6 +107,8 @@ pub struct MonsterHybridServer {
     pub wal_replayed_offset: u64,
     /// Monotonic centralized-map generation used to invalidate worker-local atom caches.
     pub map_generation: u64,
+    /// Controls whether map learning (crystallization + WAL append) and trajectory replay are enabled.
+    pub map_learning_and_replay_enabled: bool,
 }
 
 impl MonsterHybridServer {
@@ -146,6 +152,7 @@ impl MonsterHybridServer {
             persistent_vault_path: None,
             wal_replayed_offset: 0,
             map_generation: 0,
+            map_learning_and_replay_enabled: true,
         })
     }
 
@@ -879,12 +886,14 @@ impl MonsterHybridServer {
                 .load_from_binary_vault(vault_path, &self.immune.policy)?;
             let wal_path = Self::wal_path_for(vault_path);
             if wal_path.exists() {
-                let (_steps, new_offset) = self.active_transformer.replay_wal_from_offset(
-                    &wal_path,
-                    0,
-                    &mut self.swarm_map,
-                    &self.immune.policy,
-                )?;
+                let (_steps, new_offset, _had_torn_tail) = self
+                    .active_transformer
+                    .recover_wal_from_offset(
+                        &wal_path,
+                        0,
+                        &mut self.swarm_map,
+                        &self.immune.policy,
+                    )?;
                 self.wal_replayed_offset = new_offset;
                 self.persist_global_map_live_turn()?;
             } else {
@@ -917,12 +926,14 @@ impl MonsterHybridServer {
         if !wal_path.exists() {
             return Ok(0);
         }
-        let (replayed, new_offset) = self.active_transformer.replay_wal_from_offset(
-            &wal_path,
-            self.wal_replayed_offset,
-            &mut self.swarm_map,
-            &self.immune.policy,
-        )?;
+        let (replayed, new_offset, _had_torn_tail) = self
+            .active_transformer
+            .recover_wal_from_offset(
+                &wal_path,
+                self.wal_replayed_offset,
+                &mut self.swarm_map,
+                &self.immune.policy,
+            )?;
         self.wal_replayed_offset = new_offset;
         if replayed > 0 {
             self.mark_map_updated();
@@ -1231,6 +1242,30 @@ impl MonsterHybridServer {
             holonomy_flux_rad_q32: holonomy.enclosed_curvature_flux_q32,
             live_ingest,
         })
+    }
+
+    /// Execute an autonomous Dream State consolidation cycle across the centralized
+    /// `(H^3 x T^2)/Gamma_12` Mind:
+    /// 1. Completes sub-rank `ATOMA_OP_V3` charts (`R_m < 8`) via 7-ray icosahedral perturbations,
+    /// 2. Synthesizes & crystallizes novel multi-concept geodesic bridges across empty space,
+    /// 3. Folds recurring high-certainty `1-cell` spans into `AtomicIrAlphabet` macro-opcodes.
+    pub fn execute_autonomous_dream_cycle(
+        &mut self,
+        dream_epoch: u64,
+        max_rank8_charts: usize,
+        max_empty_space_bridges: usize,
+    ) -> Result<atoma_immune::DreamConsolidationReceipt, String> {
+        let receipt = self.active_transformer.execute_autonomous_dream_cycle(
+            dream_epoch,
+            max_rank8_charts,
+            max_empty_space_bridges,
+            &mut self.swarm_map,
+            &self.immune.policy,
+        )?;
+        if receipt.charts_upgraded_to_multi_rank > 0 || receipt.empty_space_bridges_minted > 0 {
+            self.map_generation = self.map_generation.wrapping_add(1);
+        }
+        Ok(receipt)
     }
 }
 

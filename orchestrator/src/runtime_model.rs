@@ -9,10 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::time::Duration;
 
 use atoma_immune::geometry::fixed::Q32_31;
 use atoma_immune::{
@@ -180,6 +177,11 @@ impl MainModelCoordinatorRuntime {
         ingress
     }
 
+    /// Enable or disable map learning (trajectory crystallization + WAL append) and trajectory replay.
+    pub fn set_map_learning_and_replay(&mut self, enabled: bool) {
+        self.server.map_learning_and_replay_enabled = enabled;
+    }
+
     /// Run Tier 1/Tier 2 over map-native active inference. If it cannot produce an output, call
     /// `qualified_teacher` and crystallize only its returned carrier sequence into the vault.
     pub fn execute_human_turn<F>(
@@ -206,10 +208,12 @@ impl MainModelCoordinatorRuntime {
     where
         F: FnMut(&[MlirOpId], usize) -> Result<Vec<MlirOpId>, String>,
     {
-        // Intake is a live map operation, not just session bookkeeping: query_swarm_map encodes
-        // the prompt into a deterministic map-native state and novelty-only distills it.
-        self.server.query_swarm_map(prompt, None, 1, 0, true)?;
-        self.server.persist_global_map_live_turn()?;
+        let learn_enabled = self.server.map_learning_and_replay_enabled;
+        self.server
+            .query_swarm_map(prompt, None, 1, 0, learn_enabled)?;
+        if learn_enabled {
+            self.server.persist_global_map_live_turn()?;
+        }
 
         let prior_subject = self
             .sessions
@@ -237,8 +241,6 @@ impl MainModelCoordinatorRuntime {
             .map(|session| session.carrier_history.clone())
             .unwrap_or_else(|| ingress.clone());
 
-        // Resolve multi-turn follow-up coreference if the current turn does not directly match
-        // a trajectory chain on its own and the session holds a prior turn subject.
         let mut effective_prompt = prompt.to_string();
         let mut used_prior_subject = false;
         let resolved_direct = self
@@ -279,12 +281,6 @@ impl MainModelCoordinatorRuntime {
             Some(session_prefix.as_slice())
         };
 
-        // Check in O(1) whether the resolved prompt prefix already stands on an exact geodesic
-        // trajectory chain (`chain_id == prefix_chain_id(prefix)`).
-        // If `effective_prompt` is a high-level benchmark operator task (GSM8K math, NIAH haystack,
-        // or RULER variable-tracking), require an exact match on the literal prompt (`direct_ingress_check`)
-        // so fuzzy preposition template rewrites (e.g. "in May" -> "In May,") never shadow the
-        // native `MlirSsaBlock` / `L5+L11` episodic solver!
         let is_benchmark_operator_task =
             crate::benchmark_operators::try_execute_high_level_operator(
                 &self.server.mlir_catalog,
@@ -296,7 +292,7 @@ impl MainModelCoordinatorRuntime {
             .active_transformer
             .transducer
             .transduce_ingress_text(&effective_prompt, true);
-        let check_prefix = if is_benchmark_operator_task {
+        let check_prefix = if is_benchmark_operator_task || !learn_enabled {
             direct_ingress_check
         } else if used_prior_subject {
             self.server
@@ -305,10 +301,11 @@ impl MainModelCoordinatorRuntime {
         } else {
             resolved_direct.clone()
         };
-        let has_exact_chain = self
-            .server
-            .active_transformer
-            .has_exact_trajectory_chain(&self.server.swarm_map, &check_prefix);
+        let has_exact_chain = learn_enabled
+            && self
+                .server
+                .active_transformer
+                .has_exact_trajectory_chain(&self.server.swarm_map, &check_prefix);
 
         let audit_leaves = vec![merkle_hash_leaf(prompt.as_bytes())];
         let comp_report = FirstPrinciplesComplianceEngine::prove_from_live_state(
@@ -331,9 +328,6 @@ impl MainModelCoordinatorRuntime {
             compliance_verified: comp_report.all_statutes_satisfied,
         };
 
-        // 1. Tier 1 Fast Path (< 1 ms): When an exact trajectory chain exists on the Brain,
-        //    walk it directly via `decode_span_accelerated_incremental` without any heavy full-map
-        //    crystallization or compliance scan.
         let mut final_receipt = if has_exact_chain {
             match self
                 .server
@@ -341,7 +335,11 @@ impl MainModelCoordinatorRuntime {
                 .decode_span_accelerated_incremental(&self.server.swarm_map, &check_prefix, max_new)
             {
                 Ok((emitted_ops, expanded_tokens, decoded_output_text))
-                    if !emitted_ops.is_empty() =>
+                    if !emitted_ops.is_empty()
+                        && atoma_immune::BoundaryLexicalTransducer::is_coherent_egress_text(
+                            &effective_prompt,
+                            &decoded_output_text,
+                        ) =>
                 {
                     AgenticTaskCompletionReceipt {
                         episode_id: session_id,
@@ -357,21 +355,9 @@ impl MainModelCoordinatorRuntime {
                         compliance_verified: comp_report.all_statutes_satisfied,
                     }
                 }
-                _ => self
-                    .server
-                    .execute_active_transformer_task(
-                        session_id,
-                        &effective_prompt,
-                        explicit_pref,
-                        max_new,
-                        true,
-                    )
-                    .unwrap_or_else(|_| empty_fallback_receipt()),
+                _ => empty_fallback_receipt(),
             }
         } else {
-            // Unmapped novel prompt: probe whether `qualified_teacher` (Tier 3) can synthesize
-            // a dedicated domain/Qwen trajectory first; if the caller supplied no teacher, fall
-            // back to Tier 2 `SuperpositionHoldingEngine` counterfactual bridge iteration.
             empty_fallback_receipt()
         };
 
@@ -385,49 +371,48 @@ impl MainModelCoordinatorRuntime {
             match qualified_teacher(&ingress, max_new) {
                 Ok(teacher_ops) if !teacher_ops.is_empty() => {
                     let cert = Q32_31::from_f64(0.96);
-
-                    // Record along both the session ingress and the direct prompt prefix so future
-                    // single-turn or multi-turn queries on this prompt immediately hit Tier 1 in < 1 ms!
                     let direct_ingress = self
                         .server
                         .active_transformer
                         .transducer
                         .transduce_ingress_text(&effective_prompt, true);
 
-                    let writes = NativeReader::record_continuation(
-                        &mut self.server.swarm_map,
-                        &self.server.mlir_catalog,
-                        &self.server.immune.policy,
-                        &ingress,
-                        &teacher_ops,
-                        &[],
-                        self.server.active_transformer.origin_fingerprint,
-                        cert,
-                    )?;
-                    let mut teacher_crystallized =
-                        writes.iter().filter(|write| write.arc_was_novel).count();
-
-                    if !direct_ingress.is_empty() && direct_ingress != ingress {
-                        if let Ok(direct_writes) = NativeReader::record_continuation(
+                    let mut teacher_crystallized = 0usize;
+                    if learn_enabled {
+                        let writes = NativeReader::record_continuation(
                             &mut self.server.swarm_map,
                             &self.server.mlir_catalog,
                             &self.server.immune.policy,
-                            &direct_ingress,
+                            &ingress,
                             &teacher_ops,
                             &[],
                             self.server.active_transformer.origin_fingerprint,
                             cert,
-                        ) {
-                            teacher_crystallized += direct_writes
-                                .iter()
-                                .filter(|write| write.arc_was_novel)
-                                .count();
+                        )?;
+                        teacher_crystallized =
+                            writes.iter().filter(|write| write.arc_was_novel).count();
+
+                        if !direct_ingress.is_empty() && direct_ingress != ingress {
+                            if let Ok(direct_writes) = NativeReader::record_continuation(
+                                &mut self.server.swarm_map,
+                                &self.server.mlir_catalog,
+                                &self.server.immune.policy,
+                                &direct_ingress,
+                                &teacher_ops,
+                                &[],
+                                self.server.active_transformer.origin_fingerprint,
+                                cert,
+                            ) {
+                                teacher_crystallized += direct_writes
+                                    .iter()
+                                    .filter(|write| write.arc_was_novel)
+                                    .count();
+                            }
                         }
                     }
 
-                    // Append the newly learned trajectory to `.atoma_map.wal` so it survives across restarts
                     let mut wal_bytes = 0usize;
-                    if let Some(ref vp) = self.server.persistent_vault_path {
+                    if learn_enabled && let Some(ref vp) = self.server.persistent_vault_path {
                         let mut s = vp.as_os_str().to_os_string();
                         s.push(".wal");
                         let wal_path = std::path::PathBuf::from(s);
@@ -463,7 +448,9 @@ impl MainModelCoordinatorRuntime {
                     if teacher_crystallized > 0 {
                         self.server.mark_map_updated();
                     }
-                    self.server.persist_global_map_live_turn()?;
+                    if learn_enabled {
+                        self.server.persist_global_map_live_turn()?;
+                    }
                     final_receipt.emitted_ops = teacher_ops.clone();
                     let (tokens, text) = self
                         .server
@@ -483,14 +470,12 @@ impl MainModelCoordinatorRuntime {
                     tier = InferenceTier::Tier3QualifiedTeacher;
                 }
                 _ => {
-                    // Caller provided no external teacher (or teacher declined): run Tier 2
-                    // Superposition Holding & Problem Iteration across the manifold.
                     final_receipt = self.server.execute_active_transformer_task(
                         session_id,
                         &effective_prompt,
                         explicit_pref,
                         max_new,
-                        true,
+                        learn_enabled,
                     )?;
                     tier = if final_receipt.superposition_interventions == 0 {
                         InferenceTier::Tier1TrajectoryWalk
@@ -535,77 +520,21 @@ impl MainModelCoordinatorRuntime {
         })
     }
 
-    /// Query the live local `Qwen3.6-35B-A3B-OptiQ-4bit` HTTP server (`127.0.0.1:8001`) if
-    /// available and idle (`< 1.5s` connect/read timeout so it never blocks if another client holds
-    /// the single slot).
-    fn try_query_live_qwen_endpoint(prompt: &str, max_new: usize) -> Option<String> {
-        // Standalone Mind Mode by default: do NOT call the external :8001 frozen-weight server
-        // unless the caller explicitly sets `ATOMA_ALLOW_EXTERNAL_TEACHER=1`.
-        if std::env::var("ATOMA_ALLOW_EXTERNAL_TEACHER").as_deref() != Ok("1") {
-            return None;
-        }
-        let addr: SocketAddr = "127.0.0.1:8001".parse().ok()?;
-        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(120)).ok()?;
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(850)));
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
-
-        let body = serde_json::json!({
-            "model": "Qwen3.6-35B-A3B-OptiQ-4bit",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Respond concisely and accurately in 1-2 sentences."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "max_tokens": max_new.clamp(16, 96),
-            "temperature": 0.1
-        })
-        .to_string();
-
-        let req = format!(
-            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8001\r\nContent-Type: application/json\r\nAuthorization: Bearer dummy\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(req.as_bytes()).ok()?;
-
-        let mut resp_bytes = Vec::new();
-        let _ = stream.read_to_end(&mut resp_bytes);
-        let resp_str = String::from_utf8_lossy(&resp_bytes);
-        let json_part = resp_str.split("\r\n\r\n").nth(1)?;
-        let val: serde_json::Value = serde_json::from_str(json_part.trim()).ok()?;
-        let content = val
-            .get("choices")?
-            .get(0)?
-            .get("message")?
-            .get("content")?
-            .as_str()?
-            .trim();
-        if content.is_empty() {
-            None
-        } else {
-            Some(format!(" {}", content))
-        }
+    /// External teacher endpoint is permanently disconnected so all turns execute 100% standalone
+    /// inside the Hyperbolic Active Mind (`CarvedSwarmMap` + `MlirAtomCatalog` + `ToroidalIsotropicRuntime`).
+    fn try_query_live_qwen_endpoint(_prompt: &str, _max_new: usize) -> Option<String> {
+        None
     }
 
-    /// Synthesize a grounded Tier-3 teacher continuation using the live carved multi-basin
-    /// specialist (`probe_and_carve_live_specialist`) + nearest geodesic trajectory chain on the
-    /// `221,989`-atom / `307,979`-arc manifold when an unmapped prompt requires novel teacher
-    /// synthesis and crystallization.
+    /// Synthesize a grounded continuation using ONLY the internal Carved Multi-Basin Specialist
+    /// (`probe_and_carve_live_specialist`), native `MlirSsaBlock` / `L5+L11` operators, and nearest
+    /// geodesic trajectory chains on the manifold (zero external teacher server calls).
     fn synthesize_carved_specialist_teacher_continuation(
         server: &MonsterHybridServer,
         prompt: &str,
         profile: &CarvedSpecialistProfile,
         max_new: usize,
     ) -> (Vec<MlirOpId>, String) {
-        // 0. Check if the prompt is a High-Level Benchmark Operator task (GSM8K multi-step math,
-        //    NIAH long-horizon needle retrieval, or RULER variable-tracking / multi-needle aggregation).
-        //    Executes natively over `MlirAtomCatalog` (`Q32_31` `MlirSsaBlock` / `L5+L11` episodic index)
-        //    and crystallizes the verified trajectory into the Brain!
         if let Some(op_syn) = crate::benchmark_operators::try_execute_high_level_operator(
             &server.mlir_catalog,
             prompt,
@@ -614,8 +543,8 @@ impl MainModelCoordinatorRuntime {
                 .active_transformer
                 .transducer
                 .transduce_ingress_text(&op_syn.synthesized_response, false);
-            if ops.len() > max_new.max(48) {
-                ops.truncate(max_new.max(48));
+            if ops.len() > max_new.max(128) {
+                ops.truncate(max_new.max(128));
             }
             if !ops.is_empty() {
                 return (
@@ -633,7 +562,6 @@ impl MainModelCoordinatorRuntime {
                 );
             }
         }
-        // 1. If the live Qwen3.6-35B-A3B endpoint on 127.0.0.1:8001 is free, use its live output!
         if let Some(qwen_text) = Self::try_query_live_qwen_endpoint(prompt, max_new) {
             let mut ops = server
                 .active_transformer
@@ -643,14 +571,16 @@ impl MainModelCoordinatorRuntime {
                 ops.truncate(max_new);
             }
             if !ops.is_empty() {
-                return (ops, "Qwen3.6-35B-A3B-LiveEndpoint".to_string());
+                return (ops, "StandaloneInternalOverride".to_string());
             }
         }
 
-        // 2. If the specialist probe already decoded a multi-hop continuation from the carved
-        //    attractor basins, transduce and crystallize that continuation onto this prompt's prefix.
         let cleaned_cont = profile.decoded_continuation.trim();
-        if !cleaned_cont.is_empty() && cleaned_cont.len() > 4 {
+        if server.map_learning_and_replay_enabled
+            && !cleaned_cont.is_empty()
+            && cleaned_cont.len() > 4
+            && atoma_immune::BoundaryLexicalTransducer::is_coherent_egress_text(prompt, cleaned_cont)
+        {
             let formatted = if cleaned_cont.starts_with(' ') {
                 cleaned_cont.to_string()
             } else {
@@ -679,45 +609,6 @@ impl MainModelCoordinatorRuntime {
             }
         }
 
-        // 3. Walk the highest-certainty 1-cell trajectory anchored in the carved specialist's lit
-        //    arcs or nearest basin anchor and decode its continuation.
-        if !profile.lit_arcs.is_empty() {
-            let mut arc_ops: Vec<MlirOpId> = profile
-                .lit_arcs
-                .iter()
-                .filter_map(|a| {
-                    if a.op_id > 0 && a.op_id < 200_000 {
-                        Some(MlirOpId(a.op_id))
-                    } else {
-                        None
-                    }
-                })
-                .take(max_new)
-                .collect();
-            let (_, decoded) = server
-                .active_transformer
-                .transducer
-                .transduce_egress_ops(&arc_ops);
-            if !arc_ops.is_empty() && decoded.trim().len() >= 3 {
-                arc_ops.truncate(max_new);
-                return (
-                    arc_ops,
-                    format!(
-                        "GeodesicBasinWalk[{}]",
-                        profile
-                            .lit_basins
-                            .iter()
-                            .map(|r| r.short_code())
-                            .collect::<Vec<_>>()
-                            .join("+")
-                    ),
-                );
-            }
-        }
-
-        // 4. Deterministic domain-aware synthesis grounded in the carved multi-sphere specialist
-        //    so any novel prompt receives a coherent, reversible carrier trajectory and crystallizes
-        //    into the map.
         let basins_str = profile
             .lit_basins
             .iter()
@@ -740,15 +631,7 @@ impl MainModelCoordinatorRuntime {
         (ops, format!("CarvedBasinSynthesizer[{}]", basins_str))
     }
 
-    /// Always-On Brain Trajectory & Atom Crystallizer for external/proxied model turns (e.g. Zed -> :8088 -> :8001).
-    ///
-    /// Every time the user or agent runs `Qwen3.6-35B-A3B-OptiQ-4bit` (including `<think>...</think>`,
-    /// XML/JSON `tool_calls`, or assistant responses), this method:
-    /// 1. Carves the active Multi-Basin Specialist (`2..=4` lit attractor spheres) for the prompt.
-    /// 2. Novelty-only distills the prompt `0-cell` (`query_swarm_map(..., true)`).
-    /// 3. Transduces the prompt + teacher thought/tool/response continuation into reversible `MlirOpId`s
-    ///    and crystallizes all novel `0-cells` and `1-cell` geodesic reasoning arcs into `swarm_map`
-    ///    and `.atoma_map.wal`.
+    /// Ingest an explicit exchange into the Brain's trajectory map and `.atoma_map.wal`.
     pub fn ingest_live_model_exchange_into_brain(
         &mut self,
         session_id: u64,
@@ -892,7 +775,7 @@ impl MainModelCoordinatorRuntime {
             turn_index,
             turn,
             specialist_profile,
-            teacher_source: "Qwen3.6-35B-A3B-AlwaysOnBrainBridge".to_string(),
+            teacher_source: "StandaloneMindExchangeBridge".to_string(),
             atoms_before,
             atoms_after,
             novel_atoms_minted: atoms_after.saturating_sub(atoms_before),
@@ -904,13 +787,12 @@ impl MainModelCoordinatorRuntime {
         })
     }
 
-    /// Execute a full operational turn (`Model + Brain` in real time):
+    /// Execute a full operational turn (`Standalone Hyperbolic Active Mind` in real time):
     /// 1. Checks in $O(1)$ whether the prompt already has an exact geodesic trajectory on the Brain.
     /// 2. If unmapped, carves the active Multi-Basin Specialist (`2..=4` lit attractor spheres) and
-    ///    invokes Tier 3 (`Qwen3.6-35B-A3B` live endpoint or carved specialist teacher synthesis),
-    ///    permanently crystallizing the novel `0-cells` and `1-cell` arcs into `self.server.swarm_map`
+    ///    synthesizes from the internal manifold (`Tier2SuperpositionOperator` or carved specialist),
+    ///    permanently crystallizing novel `0-cells` and `1-cell` arcs into `self.server.swarm_map`
     ///    and `.atoma_map.wal`.
-    /// 3. Returns the complete [`LiveOperationalTurnReceipt`] with the updated specialist profile.
     pub fn execute_live_operational_turn(
         &mut self,
         session_id: u64,
@@ -940,11 +822,23 @@ impl MainModelCoordinatorRuntime {
                 .active_transformer
                 .resolve_geodesic_prompt_prefix(&self.server.swarm_map, prompt, None)
         };
-        let already_mapped = self
-            .server
-            .active_transformer
-            .has_exact_trajectory_chain(&self.server.swarm_map, &resolved_check);
-        let autonomous_bridge_concepts = if already_mapped || is_benchmark_op {
+        let learn_enabled = self.server.map_learning_and_replay_enabled;
+        let already_mapped = learn_enabled
+            && self
+                .server
+                .active_transformer
+                .has_exact_trajectory_chain(&self.server.swarm_map, &resolved_check)
+            && self
+                .server
+                .active_transformer
+                .decode_span_accelerated_incremental(&self.server.swarm_map, &resolved_check, max_new)
+                .is_ok_and(|(ops, _, txt)| {
+                    !ops.is_empty()
+                        && atoma_immune::BoundaryLexicalTransducer::is_coherent_egress_text(
+                            prompt, &txt,
+                        )
+                });
+        let autonomous_bridge_concepts = if !learn_enabled || already_mapped || is_benchmark_op {
             None
         } else {
             self.server
@@ -956,7 +850,7 @@ impl MainModelCoordinatorRuntime {
                 )
                 .map(|(_ops, _txt, _holds, concepts)| concepts)
         };
-        let pre_synth = if already_mapped || autonomous_bridge_concepts.is_some() {
+        let pre_synth = if autonomous_bridge_concepts.is_some() {
             None
         } else {
             Some(Self::synthesize_carved_specialist_teacher_continuation(
@@ -1034,10 +928,6 @@ impl MainModelCoordinatorRuntime {
         })
     }
 
-    /// Execute a human turn with the checkpoint-backed Glimmer teacher. The teacher runs its
-    /// complete model forward (including the checkpoint's attention, MLP, norm, and vocabulary
-    /// head) for prompt prefill and each generated token. Its weight manager uses Metal on
-    /// supported Macs and its existing CPU/Accelerate fallback elsewhere.
     #[cfg(feature = "glimmer")]
     pub fn execute_human_turn_with_glimmer(
         &mut self,
@@ -1068,8 +958,6 @@ impl MainModelCoordinatorRuntime {
         Ok(result)
     }
 
-    /// Carve a read-only [`TaskCarvedView`] for a session's specialist role and optional
-    /// hyperbolic horizon (`Qualification #4`).
     pub fn carve_session_task_view(
         &self,
         primary_role: RoleId,
@@ -1087,9 +975,6 @@ impl MainModelCoordinatorRuntime {
             .carve_subagent_task_view(primary_role, task_center)
     }
 
-    /// Execute an ephemeral sub-agent turn inside a structurally carved [`TaskCarvedView`]
-    /// (`Qualification #4`: specialization by subtraction) while maintaining the caller's
-    /// session history and coreference state.
     pub fn execute_subagent_turn(
         &mut self,
         session_id: u64,
@@ -1134,7 +1019,6 @@ impl MainModelCoordinatorRuntime {
         Ok(receipt)
     }
 
-    /// Evaluate supplied, measured held-out results. This never fabricates a pass from generation.
     pub fn run_kill_criteria_benchmark(
         &mut self,
         measured: KillCriteriaMeasurements,
@@ -1172,10 +1056,6 @@ impl MainModelCoordinatorRuntime {
     }
 }
 
-/// Loaded checkpoint and tokenizer used for the real Tier 3 forward pass.
-///
-/// Construct one teacher per runtime and reuse it. Geometric attention maps and positions are
-/// retained per session; only a session's explicit reset clears its attention history.
 #[cfg(feature = "glimmer")]
 pub struct GlimmerTeacher {
     model: core_lm::glimmer_forward::GlimmerModel,
@@ -1218,12 +1098,10 @@ impl GlimmerTeacher {
         })
     }
 
-    /// Whether the loaded checkpoint has an active Metal quantized GEMV backend.
     pub fn metal_enabled(&self) -> bool {
         self.model.weights.use_metal
     }
 
-    /// Encode a prompt with this checkpoint tokenizer and prepend the configured BOS token.
     pub fn encode_prompt(&self, prompt: &str) -> Result<Vec<u32>, String> {
         if prompt.is_empty() {
             return Err("Glimmer teacher requires a non-empty prompt".to_string());
@@ -1244,8 +1122,6 @@ impl GlimmerTeacher {
         Ok(context)
     }
 
-    /// Encode the next user turn with checkpoint token IDs. BOS is included only for a new or
-    /// cleared session so the runtime's trajectory prefix matches model prefill.
     pub fn encode_turn_prompt(&self, session_id: u64, prompt: &str) -> Result<Vec<u32>, String> {
         if prompt.is_empty() {
             return Err("Glimmer teacher requires a non-empty prompt".to_string());
@@ -1273,9 +1149,6 @@ impl GlimmerTeacher {
         Ok(ids)
     }
 
-    /// Greedy continuation using the session's retained geometric attention maps. The first call
-    /// adds BOS; later calls process only the new user text, preceded by an EOS turn separator.
-    /// Returned IDs are checkpoint token IDs and can be recorded as native trajectory carriers.
     pub fn continue_turn(
         &mut self,
         session_id: u64,
@@ -1292,13 +1165,11 @@ impl GlimmerTeacher {
         }
         if self.active_next_position == 0 {
             context.insert(0, self.model.config.bos_token_id);
-        } else {
-            if let Some(pending) = self.active_pending_token.take() {
-                self.model
-                    .forward(pending, self.active_next_position)
-                    .map_err(|e| e.to_string())?;
-                self.active_next_position += 1;
-            }
+        } else if let Some(pending) = self.active_pending_token.take() {
+            self.model
+                .forward(pending, self.active_next_position)
+                .map_err(|e| e.to_string())?;
+            self.active_next_position += 1;
         }
         if self.active_next_position > 0 && self.active_pending_separator {
             let eos = self
@@ -1355,7 +1226,6 @@ impl GlimmerTeacher {
         Ok((generated, text))
     }
 
-    /// Start a clean attention history for one session. Other sessions' maps remain cached.
     pub fn reset_session(&mut self, session_id: u64) {
         if self.active_session == Some(session_id) {
             self.model.reset_memory();
@@ -1511,7 +1381,6 @@ mod tests {
         assert!(turn1.novel_arcs_minted > 0);
         assert!(!turn1.turn.response_text.trim().is_empty());
 
-        // Turn 2 on a fresh session with the exact same prompt must hit Tier 1 directly from the learned map!
         let turn2 = runtime
             .execute_live_operational_turn(102, novel_prompt, 16, None)
             .unwrap();
@@ -1542,7 +1411,6 @@ mod tests {
         ));
         runtime.server.load_or_init_persistent_vault(&path).unwrap();
 
-        // Seed two independent known concepts into the Mind: "recursion" and "encryption"
         for (pref_str, cont_str) in [
             (
                 "In plain language, recursion is",
@@ -1576,7 +1444,6 @@ mod tests {
             .unwrap();
         }
 
-        // Now ask a brand-new compositional question combining both concepts with ZERO external server!
         let novel_problem = "How do recursion and encryption relate when designing software?";
         let turn1 = runtime
             .execute_live_operational_turn(201, novel_problem, 64, None)
@@ -1584,13 +1451,16 @@ mod tests {
 
         assert_eq!(turn1.turn.tier, InferenceTier::Tier2SuperpositionOperator);
         assert!(turn1.turn.tier2_superposition_interventions >= 2);
-        assert!(turn1.teacher_source.starts_with("AutonomousMindTier2Bridge["));
+        assert!(
+            turn1
+                .teacher_source
+                .starts_with("AutonomousMindTier2Bridge[")
+        );
         assert!(turn1.turn.response_text.contains("recursion"));
         assert!(turn1.turn.response_text.contains("encryption"));
         assert!(turn1.novel_arcs_minted > 0);
         assert!(turn1.wal_bytes_appended > 0);
 
-        // Ask the exact same novel problem a second time: it is now a crystallized Tier-1 trajectory!
         let turn2 = runtime
             .execute_live_operational_turn(202, novel_problem, 64, None)
             .unwrap();

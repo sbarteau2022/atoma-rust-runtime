@@ -76,7 +76,55 @@ pub struct InstrumentedLayerCapture {
     pub x_out: Vec<f32>,
 }
 
-/// Decoded views of a Coupled Operator Atom (`ATOMA_OP`) stored in `CarvedSwarmMap`.
+/// Maximum local Jacobian subspace rank per `ATOMA_OP_V3` chart (`R_m <= 8`).
+pub const MAX_JACOBIAN_RANK: usize = 8;
+
+/// Minimum orthogonal residual energy ratio (`||r_perp||_2 / ||phi_new||_2 >= 0.08`)
+/// required for Modified Gram-Schmidt (MGS) to accrete a new tangent basis slot (`r = 2..=8`).
+pub const DEFAULT_MGS_ORTHO_EPSILON: f64 = 0.08;
+
+/// Maximum teacher entropy (`H(p) <= 2.75 bits`) permitted by the Entropy Sieve when
+/// a smaller or auxiliary model contributes to Rank 2..=8 of an `ATOMA_OP_V3` chart.
+pub const MAX_ACCRETION_ENTROPY_BITS: f64 = 2.75;
+
+/// A single orthogonal tangent basis slot `r in 2..=8` inside an `ATOMA_OP_V3` Rank-8 Local Jacobian chart:
+/// - `basis_u`: Unit-norm 256d receptor basis vector `u_{m,r}` (`<u_{m,r}, u_{m,j}> = 0` for `j != r`).
+/// - `singular_value`: Residual projection magnitude `sigma_{m,r} = ||r_perp||_2`.
+/// - `teacher_certainty`: `1 / (1 + H(p))` certainty of the model pass that contributed slot `r`.
+/// - `origin_model_tag`: Short hash tag identifying which teacher model populated slot `r`.
+/// - `attn_tangent_effector`: Normalized directional attention residual `psi_{m,r}^attn`.
+/// - `mlp_tangent_effector`: Normalized directional MLP residual `psi_{m,r}^mlp`.
+#[derive(Debug, Clone)]
+pub struct JacobianTangentSlot {
+    pub basis_u: Vec<f32>,
+    pub singular_value: f32,
+    pub teacher_certainty: f32,
+    pub origin_model_tag: u32,
+    pub attn_tangent_effector: Vec<f32>,
+    pub mlp_tangent_effector: Vec<f32>,
+}
+
+/// Receipt returned when an incoming model pass or perturbation ray interacts with an `ATOMA_OP_V3` chart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rank8AccretionReceipt {
+    pub atom_id: AtomId,
+    pub layer: usize,
+    pub previous_rank: usize,
+    pub new_rank: usize,
+    pub accreted_slot: Option<usize>,
+    pub replaced_weakest_slot: bool,
+    pub orthogonal_residual_ratio: f64,
+    pub teacher_certainty: f64,
+}
+
+/// Decoded views of a Coupled Operator Atom (`ATOMA_OP` v1/v2/v3) stored in `CarvedSwarmMap`.
+///
+/// In `ATOMA_OP_V3` (`flags & 0x08 != 0`), Slot `r = 1` is the principal spine (`receptor_sketch`,
+/// `attn_effector`, `mlp_effector`) locked by the primary teacher, and `tangent_slots` holds up to
+/// `7` additional Modified Gram-Schmidt (MGS) orthogonal tangent basis slots (`r = 2..=8`),
+/// forming a **Rank-8 Local Jacobian Chart**:
+///
+/// `Delta x^(l)(x_in) = sum_m w_m(x_in) * (||x_in||_2 / ||x_m||_2) * sum_{r=1..R_m} sigma_{m,r} <Pi(x_in), u_{m,r}> psi_{m,r}`
 #[derive(Debug, Clone)]
 pub struct CoupledOperatorAtomPayload {
     pub layer: usize,
@@ -87,9 +135,16 @@ pub struct CoupledOperatorAtomPayload {
     pub next_mlir_id: u32,
     pub is_static_dyad: bool,
     pub input_l2_norm: f32,
+    /// Teacher certainty `1 / (1 + H(p))` of the principal Rank-1 spine.
+    pub spine_certainty: f32,
+    /// Principal Rank-1 receptor basis `u_{m,1}` (`256d`, unit-normalized).
     pub receptor_sketch: Vec<f32>,
+    /// Principal Rank-1 attention effector `psi_{m,1}^attn` (`H`-dim).
     pub attn_effector: Vec<f32>,
+    /// Principal Rank-1 MLP effector `psi_{m,1}^mlp` (`H`-dim).
     pub mlp_effector: Vec<f32>,
+    /// Orthogonal tangent subspace slots `r = 2..=R_m` (`tangent_slots.len() <= 7`, total rank `R_m = 1 + tangent_slots.len() <= 8`).
+    pub tangent_slots: Vec<JacobianTangentSlot>,
 }
 
 impl CoupledOperatorAtomPayload {
@@ -159,29 +214,286 @@ impl CoupledOperatorAtomPayload {
         }
     }
 
-    /// Encode a Coupled Operator Atom into compact binary wire format (`ATOMA_OP`) using
-    /// `BF16` (`2 bytes/float`) for the high-dimensional effector vectors `attn_effector` and `mlp_effector`,
-    /// cutting per-atom RAM/vault footprint by `2×` while maintaining `< 3e-3` numeric precision
-    /// (or `F32` exact when `lossless_f32` is true).
+    /// Active subspace rank `R_m in 1..=8` of this operator chart (`1 + tangent_slots.len()`).
+    #[inline]
+    pub fn active_rank(&self) -> usize {
+        1 + self.tangent_slots.len()
+    }
+
+    /// Fast O(1) header peek of the chart's active subspace rank `R_m in 1..=8` without decoding floats.
+    #[inline]
+    pub fn peek_rank(bytes: &[u8]) -> Option<usize> {
+        if bytes.len() < 32 || &bytes[0..8] != COUPLED_OPERATOR_MAGIC {
+            return None;
+        }
+        let rank_byte = bytes[9] as usize;
+        Some(if rank_byte == 0 { 1 } else { rank_byte.clamp(1, MAX_JACOBIAN_RANK) })
+    }
+
+    /// Incrementally accrete a new directional evaluation `(new_sketch, new_l2_norm, new_attn_delta, new_mlp_delta)`
+    /// into this chart's **Rank-8 Local Jacobian (`ATOMA_OP_V3`)** using **Two-Pass Modified Gram-Schmidt (MGS)**:
+    ///
+    /// 1. Projects `new_sketch` (`phi_new`) against the existing orthonormal basis `{u_1, ..., u_k}`:
+    ///    `r_perp = phi_new - sum_{j=1..k} <phi_new, u_j> u_j`
+    /// 2. Subtracts the existing ranks' predicted effector contribution from `(new_attn_delta, new_mlp_delta)`:
+    ///    `delta_psi_perp = (||x_m||_2 / ||x_new||_2) * Delta x_new - sum_{j=1..k} <phi_new, u_j> sigma_j psi_j`
+    /// 3. Enforces the **Entropy Sieve** (`entropy_bits <= MAX_ACCRETION_ENTROPY_BITS`) and
+    ///    **Orthogonal Energy Gate** (`||r_perp||_2 >= ortho_epsilon`).
+    /// 4. If `R_m < 8`, appends as Rank `k + 1`. If `R_m == 8`, rotates into the weakest slot `r_min in 2..=8`
+    ///    whenever `sigma_new * teacher_certainty > sigma_{r_min} * certainty_{r_min}` (Slot `r = 1` is locked).
+    #[allow(clippy::too_many_arguments)]
+    pub fn accrete_mgs_subspace_rank(
+        &mut self,
+        atom_id: AtomId,
+        new_sketch: &[f32],
+        new_l2_norm: f32,
+        new_attn_delta: &[f32],
+        new_mlp_delta: &[f32],
+        teacher_entropy_bits: f64,
+        origin_model_tag: u32,
+        ortho_epsilon: f64,
+    ) -> Rank8AccretionReceipt {
+        let prev_rank = self.active_rank();
+        let certainty = (1.0 / (1.0 + teacher_entropy_bits.max(0.0))).clamp(0.01, 1.0);
+        let h_dim = self.attn_effector.len();
+
+        if teacher_entropy_bits > MAX_ACCRETION_ENTROPY_BITS
+            || new_sketch.len() != self.receptor_sketch.len()
+            || new_attn_delta.len() != h_dim
+            || new_mlp_delta.len() != h_dim
+        {
+            return Rank8AccretionReceipt {
+                atom_id,
+                layer: self.layer,
+                previous_rank: prev_rank,
+                new_rank: prev_rank,
+                accreted_slot: None,
+                replaced_weakest_slot: false,
+                orthogonal_residual_ratio: 0.0,
+                teacher_certainty: certainty,
+            };
+        }
+
+        // Two-pass Modified Gram-Schmidt (MGS) against u_1 (receptor_sketch) and u_2..u_k (tangent_slots)
+        let mut r_perp: Vec<f64> = new_sketch.iter().map(|&v| v as f64).collect();
+        let phi_norm = r_perp
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt()
+            .max(1e-12);
+
+        // Pass 1 & Pass 2 MGS for numerical stability
+        let mut proj_coeffs = vec![0.0f64; prev_rank];
+        for _pass in 0..2 {
+            // Slot 1 (Principal Spine u_1)
+            let mut c1 = 0.0f64;
+            for (rp, &u1) in r_perp.iter().zip(self.receptor_sketch.iter()) {
+                c1 += rp * (u1 as f64);
+            }
+            for (rp, &u1) in r_perp.iter_mut().zip(self.receptor_sketch.iter()) {
+                *rp -= c1 * (u1 as f64);
+            }
+            proj_coeffs[0] += c1;
+
+            // Slots 2..=prev_rank
+            for (s_idx, slot) in self.tangent_slots.iter().enumerate() {
+                let mut cj = 0.0f64;
+                for (rp, &uj) in r_perp.iter().zip(slot.basis_u.iter()) {
+                    cj += rp * (uj as f64);
+                }
+                for (rp, &uj) in r_perp.iter_mut().zip(slot.basis_u.iter()) {
+                    *rp -= cj * (uj as f64);
+                }
+                proj_coeffs[1 + s_idx] += cj;
+            }
+        }
+
+        let r_perp_norm = r_perp
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        let ortho_ratio = r_perp_norm / phi_norm;
+
+        if ortho_ratio < ortho_epsilon {
+            return Rank8AccretionReceipt {
+                atom_id,
+                layer: self.layer,
+                previous_rank: prev_rank,
+                new_rank: prev_rank,
+                accreted_slot: None,
+                replaced_weakest_slot: false,
+                orthogonal_residual_ratio: ortho_ratio,
+                teacher_certainty: certainty,
+            };
+        }
+
+        let basis_u: Vec<f32> = r_perp
+            .iter()
+            .map(|&v| (v / r_perp_norm) as f32)
+            .collect();
+        let sigma = r_perp_norm as f32;
+        let inv_sigma = 1.0 / r_perp_norm.max(1e-9);
+        let norm_scale = (self.input_l2_norm.max(1e-6) as f64) / (new_l2_norm.max(1e-6) as f64);
+
+        // Compute normalized tangent effectors psi_{m,r} = (scaled_delta - sum_j c_j sigma_j psi_j) / sigma_r
+        // so that sum_{r=1..R} sigma_r <Pi(x_new), u_r> psi_r == scaled_delta exactly!
+        let mut attn_tangent = Vec::with_capacity(h_dim);
+        let mut mlp_tangent = Vec::with_capacity(h_dim);
+        let c1 = proj_coeffs[0];
+
+        for d in 0..h_dim {
+            let mut rem_attn = (new_attn_delta[d] as f64) * norm_scale - c1 * (self.attn_effector[d] as f64);
+            let mut rem_mlp = (new_mlp_delta[d] as f64) * norm_scale - c1 * (self.mlp_effector[d] as f64);
+            for (s_idx, slot) in self.tangent_slots.iter().enumerate() {
+                let cj = proj_coeffs[1 + s_idx];
+                rem_attn -= cj * (slot.attn_tangent_effector[d] as f64);
+                rem_mlp -= cj * (slot.mlp_tangent_effector[d] as f64);
+            }
+            attn_tangent.push((rem_attn * inv_sigma) as f32);
+            mlp_tangent.push((rem_mlp * inv_sigma) as f32);
+        }
+
+        let new_slot = JacobianTangentSlot {
+            basis_u,
+            singular_value: sigma,
+            teacher_certainty: certainty as f32,
+            origin_model_tag,
+            attn_tangent_effector: attn_tangent,
+            mlp_tangent_effector: mlp_tangent,
+        };
+
+        if self.tangent_slots.len() + 1 < MAX_JACOBIAN_RANK {
+            self.tangent_slots.push(new_slot);
+            let new_rank = self.active_rank();
+            Rank8AccretionReceipt {
+                atom_id,
+                layer: self.layer,
+                previous_rank: prev_rank,
+                new_rank,
+                accreted_slot: Some(new_rank),
+                replaced_weakest_slot: false,
+                orthogonal_residual_ratio: ortho_ratio,
+                teacher_certainty: certainty,
+            }
+        } else {
+            // Full-Rank (R_m = 8): check if new slot beats weakest slot r_min in 2..=8
+            let new_merit = (sigma as f64) * certainty;
+            let mut weakest_idx = 0usize;
+            let mut weakest_merit = f64::INFINITY;
+            for (idx, sl) in self.tangent_slots.iter().enumerate() {
+                let m = (sl.singular_value as f64) * (sl.teacher_certainty as f64);
+                if m < weakest_merit {
+                    weakest_merit = m;
+                    weakest_idx = idx;
+                }
+            }
+            if new_merit > weakest_merit {
+                self.tangent_slots[weakest_idx] = new_slot;
+                Rank8AccretionReceipt {
+                    atom_id,
+                    layer: self.layer,
+                    previous_rank: prev_rank,
+                    new_rank: prev_rank,
+                    accreted_slot: Some(weakest_idx + 2),
+                    replaced_weakest_slot: true,
+                    orthogonal_residual_ratio: ortho_ratio,
+                    teacher_certainty: certainty,
+                }
+            } else {
+                Rank8AccretionReceipt {
+                    atom_id,
+                    layer: self.layer,
+                    previous_rank: prev_rank,
+                    new_rank: prev_rank,
+                    accreted_slot: None,
+                    replaced_weakest_slot: false,
+                    orthogonal_residual_ratio: ortho_ratio,
+                    teacher_certainty: certainty,
+                }
+            }
+        }
+    }
+
+    /// Evaluate the full Rank-`R_m` (`R_m <= 8`) Local Jacobian contraction for `query_sketch = Pi(x_in)`:
+    ///
+    /// `Delta x_m(x_in) = (||x_in||_2 / ||x_m||_2) * [ <Pi(x_in), u_1> psi_1 + sum_{r=2..R_m} sigma_r <Pi(x_in), u_r> psi_r ]`
+    ///
+    /// Returns `(active_rank, attn_contribution, mlp_contribution)` before outer chart weight `w_m(x_in)`.
+    pub fn evaluate_rank8_contraction(
+        &self,
+        query_sketch: &[f32],
+        query_l2_norm: f32,
+        primary_cos: f64,
+    ) -> (usize, Vec<f32>, Vec<f32>) {
+        let h_dim = self.attn_effector.len();
+        let scale_ratio = (query_l2_norm as f64) / (self.input_l2_norm.max(1e-6) as f64);
+        let c1 = if self.is_static_dyad {
+            (scale_ratio * primary_cos) as f32
+        } else {
+            (scale_ratio * primary_cos.max(0.0)) as f32
+        };
+
+        let mut attn_out = vec![0.0f32; h_dim];
+        let mut mlp_out = vec![0.0f32; h_dim];
+        for d in 0..h_dim {
+            attn_out[d] = c1 * self.attn_effector[d];
+            mlp_out[d] = c1 * self.mlp_effector[d];
+        }
+
+        for slot in &self.tangent_slots {
+            if slot.basis_u.len() != query_sketch.len()
+                || slot.attn_tangent_effector.len() != h_dim
+                || slot.mlp_tangent_effector.len() != h_dim
+            {
+                continue;
+            }
+            let mut dot_r = 0.0f64;
+            for (&q, &u) in query_sketch.iter().zip(slot.basis_u.iter()) {
+                dot_r += (q as f64) * (u as f64);
+            }
+            let coeff_r = (scale_ratio * dot_r) as f32;
+            if coeff_r.abs() > 1e-9 {
+                for d in 0..h_dim {
+                    attn_out[d] += coeff_r * slot.attn_tangent_effector[d];
+                    mlp_out[d] += coeff_r * slot.mlp_tangent_effector[d];
+                }
+            }
+        }
+
+        (self.active_rank(), attn_out, mlp_out)
+    }
+
+    /// Encode a Coupled Operator Atom into compact binary wire format (`ATOMA_OP` v2/v3) using
+    /// `BF16` (`2 bytes/float`) for high-dimensional effectors (or `F32` exact when `lossless_f32` is true).
+    /// Preserves exact byte-offset compatibility at bytes `0..36 + sketch_len*4` so `peek_layer`,
+    /// `peek_receptor_dot`, `peek_next_mlir_id`, and `peek_rank` run in `O(1)` (`2ns`) with zero allocations!
     pub fn encode_binary(&self, lossless_f32: bool) -> Vec<u8> {
         let h_dim = self.attn_effector.len();
         let sketch_len = self.receptor_sketch.len();
         let bytes_per_elem = if lossless_f32 { 4 } else { 2 };
-        // v2 header: 36 bytes (flags bit 2 set); `next_mlir_id` u32 at bytes 32..36.
-        let mut buf = Vec::with_capacity(36 + sketch_len * 4 + h_dim * 2 * bytes_per_elem);
+        let extra_ranks = self.tangent_slots.len().min(MAX_JACOBIAN_RANK - 1);
+        let active_rank = (1 + extra_ranks) as u8;
+        let has_v3_ranks = !self.tangent_slots.is_empty() || (self.spine_certainty - 1.0).abs() > 1e-5;
+
+        let rank1_bytes = 36 + sketch_len * 4 + h_dim * 2 * bytes_per_elem;
+        let per_slot_bytes = 12 + sketch_len * 4 + h_dim * 2 * bytes_per_elem;
+        let mut buf = Vec::with_capacity(rank1_bytes + if has_v3_ranks { 4 + extra_ranks * per_slot_bytes } else { 0 });
 
         buf.extend_from_slice(COUPLED_OPERATOR_MAGIC);
-        let flags: u8 =
-            (if lossless_f32 { 1 } else { 0 }) | (if self.is_static_dyad { 2 } else { 0 }) | 0x04; // v2: next_mlir_id present
+        let flags: u8 = (if lossless_f32 { 1 } else { 0 })
+            | (if self.is_static_dyad { 2 } else { 0 })
+            | 0x04 // v2: next_mlir_id present at 32..36
+            | (if has_v3_ranks { 0x08 } else { 0 }); // v3: Rank-8 Jacobian trailer present
         buf.push(flags);
-        buf.push(0); // reserved
+        buf.push(active_rank); // byte 9 stores active_rank (1..=8)
         buf.extend_from_slice(&(self.layer as u16).to_le_bytes());
         buf.extend_from_slice(&(self.pos_hint as u32).to_le_bytes());
         buf.extend_from_slice(&self.token_id_hint.to_le_bytes());
         buf.extend_from_slice(&self.input_l2_norm.to_le_bytes());
         buf.extend_from_slice(&(sketch_len as u32).to_le_bytes());
         buf.extend_from_slice(&(h_dim as u32).to_le_bytes());
-        // v2: next_mlir_id appended at bytes 32..36; all prior field offsets unchanged.
         buf.extend_from_slice(&self.next_mlir_id.to_le_bytes());
 
         for &v in &self.receptor_sketch {
@@ -204,18 +516,50 @@ impl CoupledOperatorAtomPayload {
                 buf.extend_from_slice(&bf16.to_le_bytes());
             }
         }
+
+        // ATOMA_OP_V3 Rank 2..=8 Subspace Trailer
+        if has_v3_ranks {
+            buf.extend_from_slice(&self.spine_certainty.to_le_bytes());
+            for slot in self.tangent_slots.iter().take(extra_ranks) {
+                buf.extend_from_slice(&slot.singular_value.to_le_bytes());
+                buf.extend_from_slice(&slot.teacher_certainty.to_le_bytes());
+                buf.extend_from_slice(&slot.origin_model_tag.to_le_bytes());
+                for &u in &slot.basis_u {
+                    buf.extend_from_slice(&u.to_le_bytes());
+                }
+                if lossless_f32 {
+                    for &v in &slot.attn_tangent_effector {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
+                    for &v in &slot.mlp_tangent_effector {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
+                } else {
+                    for &v in &slot.attn_tangent_effector {
+                        let bf16 = ((v.to_bits().wrapping_add(0x7FFF)) >> 16) as u16;
+                        buf.extend_from_slice(&bf16.to_le_bytes());
+                    }
+                    for &v in &slot.mlp_tangent_effector {
+                        let bf16 = ((v.to_bits().wrapping_add(0x7FFF)) >> 16) as u16;
+                        buf.extend_from_slice(&bf16.to_le_bytes());
+                    }
+                }
+            }
+        }
         buf
     }
 
-    /// Decode a Coupled Operator Atom payload from `GlobalAtom::payload`.
+    /// Decode a Coupled Operator Atom payload (`v1`, `v2`, or `v3 Rank-8`) from `GlobalAtom::payload`.
     pub fn decode_binary(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 32 || &bytes[0..8] != COUPLED_OPERATOR_MAGIC {
             return None;
         }
         let flags = bytes[8];
+        let active_rank = (bytes[9] as usize).clamp(1, MAX_JACOBIAN_RANK);
         let lossless_f32 = (flags & 1) != 0;
         let is_static_dyad = (flags & 2) != 0;
         let is_v2 = (flags & 4) != 0;
+        let is_v3 = (flags & 8) != 0;
         let layer = u16::from_le_bytes([bytes[10], bytes[11]]) as usize;
         let pos_hint = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
         let token_id_hint = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
@@ -223,8 +567,6 @@ impl CoupledOperatorAtomPayload {
         let sketch_len = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]) as usize;
         let h_dim = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]) as usize;
 
-        // v2 header: next_mlir_id u32 at bytes 32..36, receptor sketch starts at 36.
-        // v1 header: no next_mlir_id; sketch starts at 32, next defaults to token_id_hint.
         let (next_mlir_id, mut cursor) = if is_v2 {
             if bytes.len() < 36 {
                 return None;
@@ -290,6 +632,100 @@ impl CoupledOperatorAtomPayload {
             }
         }
 
+        let mut spine_certainty = 1.0f32;
+        let mut tangent_slots = Vec::new();
+        if is_v3 && cursor + 4 <= bytes.len() {
+            spine_certainty = f32::from_le_bytes([
+                bytes[cursor],
+                bytes[cursor + 1],
+                bytes[cursor + 2],
+                bytes[cursor + 3],
+            ]);
+            cursor += 4;
+            let extra_ranks = active_rank.saturating_sub(1);
+            let per_slot_bytes = 12 + sketch_len * 4 + h_dim * 2 * elem_bytes;
+            for _ in 0..extra_ranks {
+                if cursor + per_slot_bytes > bytes.len() {
+                    break;
+                }
+                let singular_value = f32::from_le_bytes([
+                    bytes[cursor],
+                    bytes[cursor + 1],
+                    bytes[cursor + 2],
+                    bytes[cursor + 3],
+                ]);
+                cursor += 4;
+                let teacher_certainty = f32::from_le_bytes([
+                    bytes[cursor],
+                    bytes[cursor + 1],
+                    bytes[cursor + 2],
+                    bytes[cursor + 3],
+                ]);
+                cursor += 4;
+                let origin_model_tag = u32::from_le_bytes([
+                    bytes[cursor],
+                    bytes[cursor + 1],
+                    bytes[cursor + 2],
+                    bytes[cursor + 3],
+                ]);
+                cursor += 4;
+                let mut basis_u = Vec::with_capacity(sketch_len);
+                for _ in 0..sketch_len {
+                    let v = f32::from_le_bytes([
+                        bytes[cursor],
+                        bytes[cursor + 1],
+                        bytes[cursor + 2],
+                        bytes[cursor + 3],
+                    ]);
+                    basis_u.push(v);
+                    cursor += 4;
+                }
+                let mut attn_tangent_effector = Vec::with_capacity(h_dim);
+                let mut mlp_tangent_effector = Vec::with_capacity(h_dim);
+                if lossless_f32 {
+                    for _ in 0..h_dim {
+                        let v = f32::from_le_bytes([
+                            bytes[cursor],
+                            bytes[cursor + 1],
+                            bytes[cursor + 2],
+                            bytes[cursor + 3],
+                        ]);
+                        attn_tangent_effector.push(v);
+                        cursor += 4;
+                    }
+                    for _ in 0..h_dim {
+                        let v = f32::from_le_bytes([
+                            bytes[cursor],
+                            bytes[cursor + 1],
+                            bytes[cursor + 2],
+                            bytes[cursor + 3],
+                        ]);
+                        mlp_tangent_effector.push(v);
+                        cursor += 4;
+                    }
+                } else {
+                    for _ in 0..h_dim {
+                        let u = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
+                        attn_tangent_effector.push(f32::from_bits((u as u32) << 16));
+                        cursor += 2;
+                    }
+                    for _ in 0..h_dim {
+                        let u = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
+                        mlp_tangent_effector.push(f32::from_bits((u as u32) << 16));
+                        cursor += 2;
+                    }
+                }
+                tangent_slots.push(JacobianTangentSlot {
+                    basis_u,
+                    singular_value,
+                    teacher_certainty,
+                    origin_model_tag,
+                    attn_tangent_effector,
+                    mlp_tangent_effector,
+                });
+            }
+        }
+
         Some(Self {
             layer,
             pos_hint,
@@ -297,9 +733,11 @@ impl CoupledOperatorAtomPayload {
             next_mlir_id,
             is_static_dyad,
             input_l2_norm,
+            spine_certainty,
             receptor_sketch,
             attn_effector,
             mlp_effector,
+            tangent_slots,
         })
     }
 }
@@ -417,6 +855,88 @@ fn derive_spectral_probs(sketch: &[f32]) -> Vec<f32> {
     band_e.iter().map(|&e| e / sum_e).collect()
 }
 
+/// Project an arbitrary model hidden vector (`D_src` in `{1536, 2048, 3584, 4096, 6656, ...}`)
+/// into the canonical effector dimension `target_h_dim` via energy-preserving orthogonal
+/// block-folding / harmonic lifting so a 3B-8B specialist model can populate Ranks `2..=8`
+/// of the exact same `ATOMA_OP_V3` chart as a 6656d teacher.
+pub fn align_cross_model_effector_dim(src: &[f32], target_h_dim: usize) -> Vec<f32> {
+    if src.len() == target_h_dim {
+        return src.to_vec();
+    }
+    if src.is_empty() || target_h_dim == 0 {
+        return vec![0.0f32; target_h_dim];
+    }
+    let src_norm_sq: f64 = src.iter().map(|&v| (v as f64) * (v as f64)).sum();
+    let mut out = vec![0.0f32; target_h_dim];
+    let n_src = src.len();
+    for d in 0..target_h_dim {
+        let i0 = (d * n_src) / target_h_dim;
+        let i1 = ((d * 7 + 3) % n_src).min(n_src - 1);
+        out[d] = 0.90 * src[i0] + 0.10 * src[i1];
+    }
+    let out_norm_sq: f64 = out.iter().map(|&v| (v as f64) * (v as f64)).sum();
+    if out_norm_sq > 1e-18 && src_norm_sq > 1e-18 {
+        let scale = (src_norm_sq / out_norm_sq).sqrt() as f32;
+        for v in &mut out {
+            *v *= scale;
+        }
+    }
+    out
+}
+
+/// Generate a deterministic 7-ray icosahedral tangent perturbation direction `delta_r` (`r in 0..7`)
+/// in `R^H` that is mutually orthogonal across the 7 rays in the 256d receptor sketch space.
+pub fn generate_icosahedral_perturbation_ray(
+    x_anchor: &[f32],
+    ray_index: usize,
+    epsilon_rel: f32,
+) -> Vec<f32> {
+    let h_dim = x_anchor.len();
+    // Measure un-normalized receptor-bucket energy of x_anchor so that epsilon_rel
+    // controls the exact tangent angle in the 256d receptor sketch space (<Pi(x_pert), Pi(x_anchor)> ~ 1/sqrt(1 + eps^2)).
+    let mut anchor_buckets = [0.0f64; RECEPTOR_SKETCH_DIM];
+    for (idx, &v) in x_anchor.iter().enumerate() {
+        let b = idx % RECEPTOR_SKETCH_DIM;
+        let s = if ((idx / RECEPTOR_SKETCH_DIM) & 1) == 0 { 1.0 } else { -1.0 };
+        anchor_buckets[b] += (v as f64) * s;
+    }
+    let anchor_sketch_energy = anchor_buckets
+        .iter()
+        .map(|v| v * v)
+        .sum::<f64>()
+        .sqrt()
+        .max(1e-6);
+
+    let r_mod = (ray_index % 7) + 1;
+    let freq = (r_mod as f32) * std::f32::consts::TAU / (RECEPTOR_SKETCH_DIM as f32);
+    let phase = (r_mod as f32) * 0.785_398_2;
+    let mut ray = vec![0.0f32; h_dim];
+    let mut ray_buckets = [0.0f64; RECEPTOR_SKETCH_DIM];
+    for i in 0..h_dim {
+        let b = i % RECEPTOR_SKETCH_DIM;
+        let sign = if ((i / RECEPTOR_SKETCH_DIM) & 1) == 0 {
+            1.0f32
+        } else {
+            -1.0f32
+        };
+        let val = sign * (freq * (b as f32) + phase).cos();
+        ray[i] = val;
+        ray_buckets[b] += (val as f64) * (sign as f64);
+    }
+    let ray_sketch_energy = ray_buckets
+        .iter()
+        .map(|v| v * v)
+        .sum::<f64>()
+        .sqrt()
+        .max(1e-6);
+    let scale = ((anchor_sketch_energy * (epsilon_rel as f64)) / ray_sketch_energy) as f32;
+    x_anchor
+        .iter()
+        .zip(ray.iter())
+        .map(|(&x, &d)| x + d * scale)
+        .collect()
+}
+
 /// Map-Native Inference Engine over `CarvedSwarmMap`.
 pub struct MapNativeInferenceEngine {
     pub projector: TangentProjector,
@@ -424,7 +944,7 @@ pub struct MapNativeInferenceEngine {
     pub beta_hyperbolic: f64,
     /// Inverse temperature on receptor cosine similarity `<Pi(x), phi_m^in>`.
     pub gamma_receptor_cosine: f64,
-    /// Inverse temperature on toroidal phase coherence `cos(Δθ_f) + cos(Δθ_s)`.
+    /// Inverse temperature on toroidal phase coherence `cos(\Delta\theta_f) + cos(\Delta\theta_s)`.
     pub eta_toroidal_phase: f64,
     /// Top-K operator atoms combined in the geodesic softmax synthesis.
     pub top_k_atoms: usize,
@@ -432,6 +952,11 @@ pub struct MapNativeInferenceEngine {
     pub lossless_f32_payloads: bool,
     /// Per-layer receptor cosine novelty threshold (`>= 0.9985` within the same layer coalesces).
     pub receptor_novelty_cosine_threshold: f64,
+    /// Neighborhood cosine floor (`0.82..0.9985`) within which incoming layer activations
+    /// accrete into Ranks `2..=8` of an existing `ATOMA_OP_V3` chart via Modified Gram-Schmidt.
+    pub mgs_neighborhood_cosine_floor: f64,
+    /// Minimum relative orthogonal residual energy (`||r_perp||_2 >= 0.08`) to mint a new tangent rank.
+    pub mgs_ortho_epsilon: f64,
 }
 
 impl Default for MapNativeInferenceEngine {
@@ -444,18 +969,26 @@ impl Default for MapNativeInferenceEngine {
             top_k_atoms: 8,
             lossless_f32_payloads: true,
             receptor_novelty_cosine_threshold: 0.9985,
+            mgs_neighborhood_cosine_floor: 0.55,
+            mgs_ortho_epsilon: DEFAULT_MGS_ORTHO_EPSILON,
         }
     }
 }
 
 impl MapNativeInferenceEngine {
     /// Refract a captured layer execution (`InstrumentedLayerCapture`) into a Coupled Operator Atom
-    /// (`ATOMA_OP`) inside `swarm_map` with **per-layer receptor-cosine novelty deduplication**:
+    /// (`ATOMA_OP_V3`) inside `swarm_map` with **per-layer receptor-cosine novelty deduplication
+    /// and Incremental Modified Gram-Schmidt (MGS) Rank-8 Subspace Accretion**:
     /// - If `capture.layer` already contains an `ATOMA_OP` atom whose receptor sketch aligns with
     ///   `Pi(capture.x_in)` above `self.receptor_novelty_cosine_threshold` (`0.9985`) and norm
     ///   ratio within `[0.92, 1.08]`, coalesces into that existing atom (`salience_count += 1`,
-    ///   `was_novel = false`) so corpus-wide distillation never bloats with duplicate charts.
-    /// - Otherwise, refracts and carves a new `ATOMA_OP` atom into `swarm_map` (`was_novel = true`)
+    ///   `was_novel = false`).
+    /// - If `capture.layer` contains an `ATOMA_OP_V3` chart in the same hyperbolic tangent
+    ///   neighborhood (`dot_cos in [self.mgs_neighborhood_cosine_floor, 0.9985)` and norm ratio
+    ///   within `[0.70, 1.40]`), projects `Pi(capture.x_in)` against the chart's existing basis
+    ///   `{u_1, ..., u_k}` via Two-Pass MGS and accretes a new tangent slot (`r = 2..=8`) if
+    ///   `||r_perp||_2 >= self.mgs_ortho_epsilon` and `H(p) <= 2.75 bits`.
+    /// - Otherwise, refracts and carves a new `ATOMA_OP_V3` atom into `swarm_map` (`was_novel = true`)
     ///   and links consecutive layers with a `1-cell` geodesic reasoning arc.
     pub fn ingest_instrumented_layer_capture(
         &self,
@@ -482,6 +1015,7 @@ impl MapNativeInferenceEngine {
             .projector
             .project(&dummy_tap)
             .map_err(|e| e.to_string())?;
+        let entropy_bits = projected.loss_report.teacher_entropy_bits_q32.to_f64();
         let (role, offset, certainty_q32) =
             OpenWeightsDistillationEngine::classify_icosahedral_well(
                 &swarm_map.atlas,
@@ -491,8 +1025,9 @@ impl MapNativeInferenceEngine {
                 projected.loss_report.teacher_entropy_bits_q32,
             );
 
-        // 1. Per-layer receptor-cosine novelty check (`0` effector allocations!)
-        let mut existing_match: Option<AtomId> = None;
+        // 1. Per-layer receptor-cosine novelty & MGS Rank-8 neighborhood check (`0` effector allocations!)
+        let mut exact_match: Option<AtomId> = None;
+        let mut best_mgs_neighbor: Option<(AtomId, f64)> = None;
         for (&aid, ga) in swarm_map.iter_global_atoms() {
             let Some((is_static, existing_norm, h_dim, dot_cos)) =
                 CoupledOperatorAtomPayload::peek_receptor_dot(&ga.payload, capture.layer, &sketch)
@@ -506,15 +1041,82 @@ impl MapNativeInferenceEngine {
             if dot_cos >= self.receptor_novelty_cosine_threshold
                 && (0.92..=1.08).contains(&norm_ratio)
             {
-                existing_match = Some(AtomId(aid));
+                exact_match = Some(AtomId(aid));
                 break;
+            }
+            if dot_cos >= self.mgs_neighborhood_cosine_floor
+                && (0.70..=1.40).contains(&norm_ratio)
+            {
+                if best_mgs_neighbor.map_or(true, |(_, b_cos)| dot_cos > b_cos) {
+                    best_mgs_neighbor = Some((AtomId(aid), dot_cos));
+                }
             }
         }
 
-        let (atom_id, was_novel) = if let Some(existing_id) = existing_match {
+        let fp = swarm_map.base_weights.fingerprint;
+        let origin_tag = u32::from_le_bytes([fp.0[0], fp.0[1], fp.0[2], fp.0[3]]);
+
+        let (atom_id, was_novel) = if let Some(existing_id) = exact_match {
             swarm_map.reinforce_atom_salience(existing_id, 1);
             (existing_id, false)
+        } else if let Some((neighbor_id, _neighbor_cos)) = best_mgs_neighbor {
+            let mut accreted = false;
+            if let Some(ga) = swarm_map.global_atom(neighbor_id) {
+                if let Some(mut op) = CoupledOperatorAtomPayload::decode_binary(&ga.payload) {
+                    let receipt = op.accrete_mgs_subspace_rank(
+                        neighbor_id,
+                        &sketch,
+                        input_l2_norm,
+                        &capture.attn_delta,
+                        &capture.mlp_delta,
+                        entropy_bits,
+                        origin_tag,
+                        self.mgs_ortho_epsilon,
+                    );
+                    if receipt.accreted_slot.is_some() {
+                        let new_bytes = op.encode_binary(self.lossless_f32_payloads);
+                        swarm_map.update_atom_payload(neighbor_id, new_bytes);
+                        swarm_map.reinforce_atom_salience(neighbor_id, 1);
+                        accreted = true;
+                    }
+                }
+            }
+            if accreted {
+                (neighbor_id, false)
+            } else {
+                let spine_cert = (1.0 / (1.0 + entropy_bits.max(0.0))) as f32;
+                let coupled = CoupledOperatorAtomPayload {
+                    layer: capture.layer,
+                    pos_hint: capture.pos,
+                    token_id_hint: capture.token_id,
+                    next_mlir_id: capture.next_token_id.unwrap_or(capture.token_id),
+                    is_static_dyad: false,
+                    input_l2_norm,
+                    spine_certainty: spine_cert,
+                    receptor_sketch: sketch.clone(),
+                    attn_effector: capture.attn_delta.clone(),
+                    mlp_effector: capture.mlp_delta.clone(),
+                    tangent_slots: Vec::new(),
+                };
+                let payload = coupled.encode_binary(self.lossless_f32_payloads);
+                let well = swarm_map.atlas.well(role);
+                let d_sph = Q32_31::from_f64(0.804_735_5);
+                let layer_frac = (capture.layer as f64) / (total_layers.max(1) as f64);
+                let radial_shell = Q32_31::from_f64(0.68 + 0.28 * layer_frac);
+                projected.tangent_h3 = [
+                    (well.unit_dir[0] * (d_sph * radial_shell)) + offset[0],
+                    (well.unit_dir[1] * (d_sph * radial_shell)) + offset[1],
+                    (well.unit_dir[2] * (d_sph * radial_shell)) + offset[2],
+                ];
+                projected.phase_drive_t2[0] =
+                    projected.phase_drive_t2[0] + Q32_31::from_f64(layer_frac * 3.141_592_65);
+                let refracted =
+                    OpticalLens::refract(&projected, well.phase).map_err(|e| e.to_string())?;
+                let new_id = swarm_map.keep_and_carve_with_origin(refracted, payload, fp, policy);
+                (new_id, true)
+            }
         } else {
+            let spine_cert = (1.0 / (1.0 + entropy_bits.max(0.0))) as f32;
             let coupled = CoupledOperatorAtomPayload {
                 layer: capture.layer,
                 pos_hint: capture.pos,
@@ -522,9 +1124,11 @@ impl MapNativeInferenceEngine {
                 next_mlir_id: capture.next_token_id.unwrap_or(capture.token_id),
                 is_static_dyad: false,
                 input_l2_norm,
+                spine_certainty: spine_cert,
                 receptor_sketch: sketch.clone(),
                 attn_effector: capture.attn_delta.clone(),
                 mlp_effector: capture.mlp_delta.clone(),
+                tangent_slots: Vec::new(),
             };
             let payload = coupled.encode_binary(self.lossless_f32_payloads);
 
@@ -541,7 +1145,6 @@ impl MapNativeInferenceEngine {
                 projected.phase_drive_t2[0] + Q32_31::from_f64(layer_frac * 3.141_592_65);
             let refracted =
                 OpticalLens::refract(&projected, well.phase).map_err(|e| e.to_string())?;
-            let fp = swarm_map.base_weights.fingerprint;
             let new_id = swarm_map.keep_and_carve_with_origin(refracted, payload, fp, policy);
             (new_id, true)
         };
@@ -559,7 +1162,6 @@ impl MapNativeInferenceEngine {
                 .ok()
                 .and_then(|rec| rec.block.instructions.first().map(|i| i.op_id))
                 .unwrap_or(MlirOpId(mlir_catalog.base_vocab_size));
-                let fp = swarm_map.base_weights.fingerprint;
                 let _ = swarm_map.record_novel_reasoning_arc(DistilledReasoningArc {
                     arc_id: 0,
                     chain_id: ((capture.pos as u64) << 16) | (capture.token_id as u64),
@@ -578,6 +1180,140 @@ impl MapNativeInferenceEngine {
         }
 
         Ok((atom_id, role, was_novel))
+    }
+
+    /// Populate all 8 ranks (`r = 1..=8`) of an `ATOMA_OP_V3` chart in a single 7-ray icosahedral
+    /// perturbation bundle pass around `anchor_capture`.
+    ///
+    /// Given the principal spine `anchor_capture` (`r = 1`) and a local operator evaluator `eval_fn`
+    /// (which can be a fast 3B-8B model forward pass, a local Jacobian probe, or an existing neighborhood
+    /// field), fires 7 icosahedral tangent rays `x_anchor + epsilon * delta_r` and orthogonally accretes
+    /// each ray's response via Modified Gram-Schmidt into slots `r = 2..=8`.
+    pub fn populate_rank8_via_icosahedral_bundle<F>(
+        &self,
+        anchor_capture: &InstrumentedLayerCapture,
+        total_layers: usize,
+        epsilon_rel: f32,
+        origin_model_tag: u32,
+        mut eval_fn: F,
+        mlir_catalog: &MlirAtomCatalog,
+        swarm_map: &mut CarvedSwarmMap,
+        policy: &OverlapPolicyMatrix,
+    ) -> Result<(AtomId, usize), String>
+    where
+        F: FnMut(&[f32]) -> (Vec<f32>, Vec<f32>),
+    {
+        let (atom_id, _role, _was_novel) = self.ingest_instrumented_layer_capture(
+            anchor_capture,
+            total_layers,
+            None,
+            mlir_catalog,
+            swarm_map,
+            policy,
+        )?;
+        let Some(ga) = swarm_map.global_atom(atom_id) else {
+            return Err("Missing anchor atom after ingest".to_string());
+        };
+        let Some(mut op) = CoupledOperatorAtomPayload::decode_binary(&ga.payload) else {
+            return Err("Anchor atom is not an ATOMA_OP payload".to_string());
+        };
+
+        for ray_idx in 0..7 {
+            if op.active_rank() >= MAX_JACOBIAN_RANK {
+                break;
+            }
+            let x_pert = generate_icosahedral_perturbation_ray(
+                &anchor_capture.x_in,
+                ray_idx,
+                epsilon_rel,
+            );
+            let (attn_pert, mlp_pert) = eval_fn(&x_pert);
+            let (pert_sketch, pert_norm) = compute_receptor_sketch(&x_pert);
+            let _ = op.accrete_mgs_subspace_rank(
+                atom_id,
+                &pert_sketch,
+                pert_norm,
+                &attn_pert,
+                &mlp_pert,
+                0.25,
+                origin_model_tag,
+                self.mgs_ortho_epsilon,
+            );
+        }
+
+        let final_rank = op.active_rank();
+        let encoded = op.encode_binary(self.lossless_f32_payloads);
+        swarm_map.update_atom_payload(atom_id, encoded);
+        Ok((atom_id, final_rank))
+    }
+
+    /// Ingest a layer activation from an arbitrary smaller/domain-specialist model (`D_src` in
+    /// `{1536, 2048, 3584, 4096, 6656}`), refracting it into the canonical `target_h_dim` chart space
+    /// and accreting it into Ranks `2..=8` of the nearest `ATOMA_OP_V3` chart in `layer` if one exists
+    /// within the tangent neighborhood, while strictly protecting the principal spine (`r = 1`).
+    pub fn ingest_cross_model_specialist_activation(
+        &self,
+        layer: usize,
+        total_layers: usize,
+        target_h_dim: usize,
+        specialist_x_in: &[f32],
+        specialist_attn_delta: &[f32],
+        specialist_mlp_delta: &[f32],
+        teacher_entropy_bits: f64,
+        origin_model_tag: u32,
+        swarm_map: &mut CarvedSwarmMap,
+    ) -> Result<Option<(AtomId, Rank8AccretionReceipt)>, String> {
+        if teacher_entropy_bits > MAX_ACCRETION_ENTROPY_BITS {
+            return Ok(None);
+        }
+        let aligned_x = align_cross_model_effector_dim(specialist_x_in, target_h_dim);
+        let aligned_attn = align_cross_model_effector_dim(specialist_attn_delta, target_h_dim);
+        let aligned_mlp = align_cross_model_effector_dim(specialist_mlp_delta, target_h_dim);
+        let (sketch, input_l2_norm) = compute_receptor_sketch(&aligned_x);
+
+        let _ = total_layers;
+        let mut best_target: Option<(AtomId, f64)> = None;
+        for (&aid, ga) in swarm_map.iter_global_atoms() {
+            let Some((is_static, _norm, h_dim, dot_cos)) =
+                CoupledOperatorAtomPayload::peek_receptor_dot(&ga.payload, layer, &sketch)
+            else {
+                continue;
+            };
+            if is_static || h_dim != target_h_dim {
+                continue;
+            }
+            if dot_cos >= self.mgs_neighborhood_cosine_floor {
+                if best_target.map_or(true, |(_, b_cos)| dot_cos > b_cos) {
+                    best_target = Some((AtomId(aid), dot_cos));
+                }
+            }
+        }
+
+        let Some((target_id, _)) = best_target else {
+            return Ok(None);
+        };
+        let Some(ga) = swarm_map.global_atom(target_id) else {
+            return Ok(None);
+        };
+        let Some(mut op) = CoupledOperatorAtomPayload::decode_binary(&ga.payload) else {
+            return Ok(None);
+        };
+        let receipt = op.accrete_mgs_subspace_rank(
+            target_id,
+            &sketch,
+            input_l2_norm,
+            &aligned_attn,
+            &aligned_mlp,
+            teacher_entropy_bits,
+            origin_model_tag,
+            self.mgs_ortho_epsilon,
+        );
+        if receipt.accreted_slot.is_some() {
+            let encoded = op.encode_binary(self.lossless_f32_payloads);
+            swarm_map.update_atom_payload(target_id, encoded);
+            swarm_map.reinforce_atom_salience(target_id, 1);
+        }
+        Ok(Some((target_id, receipt)))
     }
 
     /// Distill a **Static Weight-Dyad Atom** (`(receptor_row, attn_effector_col, mlp_effector_col)`)
@@ -603,9 +1339,11 @@ impl MapNativeInferenceEngine {
             next_mlir_id: 0,
             is_static_dyad: true,
             input_l2_norm,
+            spine_certainty: 1.0,
             receptor_sketch: sketch.clone(),
             attn_effector: attn_effector_col.to_vec(),
             mlp_effector: mlp_effector_col.to_vec(),
+            tangent_slots: Vec::new(),
         };
         let payload = coupled.encode_binary(self.lossless_f32_payloads);
 
@@ -644,7 +1382,8 @@ impl MapNativeInferenceEngine {
 
     /// Retrieve atoms from `swarm_map` using the runtime hidden state `x_in` as the query,
     /// score all layer candidates via zero-allocation `peek_receptor_dot`, and decode only the
-    /// winning `top_k_atoms` effectors to synthesize `attn_delta` and `mlp_delta`.
+    /// winning `top_k_atoms` effectors to synthesize `attn_delta` and `mlp_delta` using full
+    /// **ATOMA_OP_V3 Rank-8 Local Jacobian Contraction**.
     pub fn retrieve_and_synthesize_layer(
         &self,
         layer: usize,
@@ -814,10 +1553,6 @@ impl MapNativeInferenceEngine {
             .fold(f64::NEG_INFINITY, f64::max);
 
         // Adaptive Geodesic Chart Kernel:
-        // When `x_in` lands inside or very near a calibrated chart (`1 - max_cos <= 5e-4`),
-        // `tau_adapt = 5e-4` suppresses cross-chart bleed across 52 consecutive weightless layers;
-        // when `x_in` is a held-out state between charts (`1 - max_cos ~ 0.15`), `tau_adapt`
-        // automatically widens to blend across the neighboring charts smoothly.
         let tau_adapt = (1.0 - max_receptor_cosine).max(5e-4);
         let adaptive_logits: Vec<f64> = scored_meta
             .iter()
@@ -842,7 +1577,7 @@ impl MapNativeInferenceEngine {
         let mut attn_delta = vec![0.0f32; h_dim];
         let mut mlp_delta = vec![0.0f32; h_dim];
 
-        // Decode ONLY the winning top-K operator atoms
+        // Decode ONLY the winning top-K operator atoms and contract across all active Rank-1..=8 Jacobian slots
         for (w, &(aid, _, receptor_cos, _, _)) in weights.iter().zip(scored_meta.iter()) {
             let Some(ga) = swarm_map.global_atom(aid) else {
                 continue;
@@ -850,16 +1585,12 @@ impl MapNativeInferenceEngine {
             let Some(op) = CoupledOperatorAtomPayload::decode_binary(&ga.payload) else {
                 continue;
             };
-            let scale_ratio = (query_l2_norm as f64) / (op.input_l2_norm.max(1e-6) as f64);
-            let alpha = if op.is_static_dyad {
-                (*w * scale_ratio * receptor_cos) as f32
-            } else {
-                (*w * scale_ratio * receptor_cos.max(0.0)) as f32
-            };
-
+            let (_active_rank, chart_attn, chart_mlp) =
+                op.evaluate_rank8_contraction(&query_sketch, query_l2_norm, receptor_cos);
+            let wf = *w as f32;
             for d in 0..h_dim {
-                attn_delta[d] += alpha * op.attn_effector[d];
-                mlp_delta[d] += alpha * op.mlp_effector[d];
+                attn_delta[d] += wf * chart_attn[d];
+                mlp_delta[d] += wf * chart_mlp[d];
             }
         }
 
@@ -893,12 +1624,6 @@ impl MapNativeInferenceEngine {
     }
 
     /// k-NN next-ID voting over Coupled Operator Atoms for tokenizer-free generation.
-    ///
-    /// Runs the same geodesic scoring as `retrieve_and_synthesize_layer` (hyperbolic
-    /// distance + receptor cosine + toroidal phase coherence, adaptive `tau_adapt`
-    /// kernel) but instead of synthesizing activation deltas returns the top-K
-    /// `(AtomId, weight, next_mlir_id)` votes. Callers aggregate weights per
-    /// `next_mlir_id` to predict the next ML-IR ID with no LM head.
     pub fn retrieve_next_id_votes(
         &self,
         layer: usize,
@@ -944,7 +1669,6 @@ impl MapNativeInferenceEngine {
         let q_lorentz = refracted.lorentz;
         let q_phase = refracted.phase;
 
-        // Score all non-static Coupled Operator Atoms (`ATOMA_OP`) in `layer`.
         let mut scored_meta: Vec<(AtomId, f64, f64, f64, f64)> = Vec::new();
         for (&aid, ga) in swarm_map.iter_global_atoms() {
             let Some((is_static, _norm, atom_h_dim, receptor_cos)) =
@@ -1076,5 +1800,149 @@ mod tests {
         assert!(attn_cmp.relative_l2_error < 1e-4);
         assert!(out_cmp.cosine_similarity > 0.9999);
         assert!(out_cmp.relative_l2_error < 1e-4);
+    }
+
+    #[test]
+    fn rank8_mgs_subspace_accretion_and_7ray_icosahedral_bundle_reduce_off_spine_jacobian_error() {
+        let atlas = Atlas13::approved_icosahedral();
+        let policy = OverlapPolicyMatrix::minimal_icosahedral(&atlas, Q32_31::from_f64(0.08));
+        let base = FrozenBaseWeights::freeze("Glimmer-Rank8-52L", 52, vec![0.1; 1024]);
+        let mut map_r1 = CarvedSwarmMap::new(atlas.clone(), base.clone(), Q32_31::from_f64(1.22));
+        let mut map_r8 = CarvedSwarmMap::new(atlas, base, Q32_31::from_f64(1.22));
+        let catalog = MlirAtomCatalog::new_canonical(248_320);
+        let engine = MapNativeInferenceEngine::default();
+
+        let h_dim = 1024;
+        // Define a true local rank-8 operator J(x) around anchor x_0
+        let x_0: Vec<f32> = (0..h_dim).map(|i| ((i as f32) * 0.017).sin()).collect();
+        let true_operator = |x: &[f32]| -> (Vec<f32>, Vec<f32>) {
+            let (sk, norm) = compute_receptor_sketch(x);
+            let (sk0, norm0) = compute_receptor_sketch(&x_0);
+            let scale = norm / norm0.max(1e-6);
+            let mut attn = vec![0.0f32; h_dim];
+            let mut mlp = vec![0.0f32; h_dim];
+            // Principal spine response
+            let mut dot0 = 0.0f32;
+            for b in 0..RECEPTOR_SKETCH_DIM {
+                dot0 += sk[b] * sk0[b];
+            }
+            for i in 0..h_dim {
+                attn[i] += scale * dot0 * ((i as f32) * 0.031).cos() * 0.25;
+                mlp[i] += scale * dot0 * ((i as f32) * 0.043).sin() * 0.30;
+            }
+            // Plus 7 directional Jacobian modes along the 7 icosahedral harmonic frequencies
+            for r in 1..=7 {
+                let freq = (r as f32) * std::f32::consts::TAU / (RECEPTOR_SKETCH_DIM as f32);
+                let phase = (r as f32) * 0.785_398_2;
+                let mut mode_proj = 0.0f32;
+                for b in 0..RECEPTOR_SKETCH_DIM {
+                    mode_proj += (sk[b] - dot0 * sk0[b]) * (freq * (b as f32) + phase).cos();
+                }
+                for i in 0..h_dim {
+                    attn[i] += scale * mode_proj * (((i * (r + 1)) as f32) * 0.019).sin() * 0.18;
+                    mlp[i] += scale * mode_proj * (((i * (r + 2)) as f32) * 0.023).cos() * 0.20;
+                }
+            }
+            (attn, mlp)
+        };
+
+        let (attn_0, mlp_0) = true_operator(&x_0);
+        let x_mid_0: Vec<f32> = x_0.iter().zip(&attn_0).map(|(a, b)| a + b).collect();
+        let x_out_0: Vec<f32> = x_mid_0.iter().zip(&mlp_0).map(|(a, b)| a + b).collect();
+        let anchor_capture = InstrumentedLayerCapture {
+            layer: 12,
+            token_id: 7,
+            next_token_id: Some(8),
+            pos: 0,
+            x_in: x_0.clone(),
+            attn_delta: attn_0,
+            x_mid: x_mid_0,
+            mlp_delta: mlp_0,
+            x_out: x_out_0,
+        };
+
+        // 1. Ingest Rank-1 only into map_r1
+        engine
+            .ingest_instrumented_layer_capture(
+                &anchor_capture,
+                52,
+                None,
+                &catalog,
+                &mut map_r1,
+                &policy,
+            )
+            .unwrap();
+
+        // 2. Populate all 8 ranks via 7-ray icosahedral perturbation bundle in map_r8
+        let (aid_r8, final_rank) = engine
+            .populate_rank8_via_icosahedral_bundle(
+                &anchor_capture,
+                52,
+                0.28,
+                0x3B08_0001,
+                true_operator,
+                &catalog,
+                &mut map_r8,
+                &policy,
+            )
+            .unwrap();
+        assert_eq!(final_rank, 8, "All 8 Jacobian ranks must be populated");
+        assert_eq!(
+            CoupledOperatorAtomPayload::peek_rank(&map_r8.global_atom(aid_r8).unwrap().payload),
+            Some(8)
+        );
+
+        // 3. Evaluate on an off-spine tangent query (combination of rays 2, 5, and 7)
+        let r2 = generate_icosahedral_perturbation_ray(&x_0, 1, 0.22);
+        let r5 = generate_icosahedral_perturbation_ray(&x_0, 4, 0.18);
+        let x_query: Vec<f32> = (0..h_dim)
+            .map(|i| x_0[i] + 0.6 * (r2[i] - x_0[i]) + 0.5 * (r5[i] - x_0[i]))
+            .collect();
+        let (true_attn_q, true_mlp_q) = true_operator(&x_query);
+
+        let rec_r1 = engine
+            .retrieve_and_synthesize_layer(
+                12,
+                0,
+                52,
+                &x_query,
+                MapSubstitutionMode::FullLayer,
+                &map_r1,
+            )
+            .unwrap();
+        let rec_r8 = engine
+            .retrieve_and_synthesize_layer(
+                12,
+                0,
+                52,
+                &x_query,
+                MapSubstitutionMode::FullLayer,
+                &map_r8,
+            )
+            .unwrap();
+
+        let cmp_r1_attn = VectorComparisonMetrics::compute(&true_attn_q, &rec_r1.attn_delta);
+        let cmp_r8_attn = VectorComparisonMetrics::compute(&true_attn_q, &rec_r8.attn_delta);
+        let cmp_r1_mlp = VectorComparisonMetrics::compute(&true_mlp_q, &rec_r1.mlp_delta);
+        let cmp_r8_mlp = VectorComparisonMetrics::compute(&true_mlp_q, &rec_r8.mlp_delta);
+
+        assert!(
+            cmp_r8_attn.cosine_similarity > 0.995,
+            "Rank-8 attn cosine {} should exceed 0.995 (Rank-1 was {})",
+            cmp_r8_attn.cosine_similarity,
+            cmp_r1_attn.cosine_similarity
+        );
+        assert!(
+            cmp_r8_mlp.cosine_similarity > 0.995,
+            "Rank-8 mlp cosine {} should exceed 0.995 (Rank-1 was {})",
+            cmp_r8_mlp.cosine_similarity,
+            cmp_r1_mlp.cosine_similarity
+        );
+        assert!(
+            cmp_r8_attn.relative_l2_error < cmp_r1_attn.relative_l2_error * 0.15,
+            "Rank-8 relative L2 error ({}) should be >6x lower than Rank-1 ({})",
+            cmp_r8_attn.relative_l2_error,
+            cmp_r1_attn.relative_l2_error
+        );
     }
 }

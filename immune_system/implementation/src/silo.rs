@@ -1049,6 +1049,23 @@ impl CarvedSwarmMap {
         }
     }
 
+    /// Overwrite `payload` onto `id` across both `global_atoms` and any `SiloView` containing `id`
+    /// (used when an `ATOMA_OP_V3` Coupled Operator Atom accretes a new Rank-2..=8 MGS tangent slot).
+    pub fn update_atom_payload(&mut self, id: AtomId, payload: Vec<u8>) -> bool {
+        if let Some(atom) = self.global_atoms.get_mut(&id.0) {
+            let shared: std::sync::Arc<[u8]> =
+                std::sync::Arc::from(payload.into_boxed_slice());
+            atom.payload = std::sync::Arc::clone(&shared);
+            for silo in &mut self.silos {
+                if let Some(sa) = silo.atoms.get_mut(&id.0) {
+                    sa.payload = std::sync::Arc::clone(&shared);
+                }
+            }
+            return true;
+        }
+        false
+    }
+
     /// Record a directed 1-cell [`DistilledReasoningArc`] in the global map.
     pub fn record_reasoning_arc(&mut self, arc: DistilledReasoningArc) -> u64 {
         self.record_novel_reasoning_arc(arc).0
@@ -1459,8 +1476,20 @@ impl CarvedSwarmMap {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        std::fs::write(path, &buf)
-            .map_err(|e| format!("Failed to write vault {}: {e}", path.display()))?;
+        let mut tmp_os = path.as_os_str().to_os_string();
+        tmp_os.push(".tmp");
+        let tmp_path = std::path::PathBuf::from(tmp_os);
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp_path)
+                .map_err(|e| format!("Failed to create temp vault {}: {e}", tmp_path.display()))?;
+            f.write_all(&buf)
+                .map_err(|e| format!("Failed to write temp vault {}: {e}", tmp_path.display()))?;
+            f.sync_all()
+                .map_err(|e| format!("Failed to fsync temp vault {}: {e}", tmp_path.display()))?;
+        }
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| format!("Failed to atomically rename vault {}: {e}", path.display()))?;
         Ok((self.global_atoms.len(), self.reasoning_arcs.len(), digest))
     }
 

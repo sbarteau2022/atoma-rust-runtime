@@ -1497,12 +1497,34 @@ fn apply_anti_lobotomy_brain_checkpoint(
         } else {
             1usize
         };
-        let keep_tail = 4usize.min(msgs.len().saturating_sub(prefix_keep));
-        let fold_end = msgs.len().saturating_sub(keep_tail);
+        let keep_tail = 6usize.min(msgs.len().saturating_sub(prefix_keep));
+        let mut fold_end = msgs.len().saturating_sub(keep_tail);
+        // Never split a `tool` result from its preceding `assistant` `tool_calls` message!
+        while fold_end > prefix_keep
+            && msgs.get(fold_end).and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("tool")
+        {
+            fold_end -= 1;
+        }
+        // If `msgs[fold_end]` is still `tool` (because `prefix_keep` blocked walking back), advance past orphaned `tool` messages.
+        while fold_end < msgs.len()
+            && msgs.get(fold_end).and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("tool")
+        {
+            fold_end += 1;
+        }
         let banner = ckpt.format_recovery_banner();
-        let mut new_msgs = Vec::with_capacity(prefix_keep + 1 + keep_tail);
+        let mut new_msgs = Vec::with_capacity(prefix_keep + 1 + msgs.len().saturating_sub(fold_end));
         for i in 0..prefix_keep {
-            new_msgs.push(msgs[i].clone());
+            let mut pm = msgs[i].clone();
+            // Ensure a prefix assistant message does not keep dangling tool_calls whose tool responses were folded away
+            if i + 1 == prefix_keep
+                && pm.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                && pm.get("tool_calls").is_some()
+            {
+                if let Some(obj) = pm.as_object_mut() {
+                    obj.remove("tool_calls");
+                }
+            }
+            new_msgs.push(pm);
         }
         new_msgs.push(serde_json::json!({
             "role": "user",
@@ -2079,11 +2101,10 @@ fn run_persistent_tcp_server(
                     &user_prompt,
                 )
                 .is_some();
-                let wants_upstream_qwen = !is_bench_op
-                    && model_name != "atoma-active-mind-12basin"
-                    && (model_name.contains("Qwen")
-                        || parsed.get("tools").is_some()
-                        || parsed.get("tool_choice").is_some());
+                // STANDALONE TEACHER-OFF MODE: External :8001 teacher proxy is permanently disabled.
+                let _ = is_bench_op;
+                let _ = &model_name;
+                let wants_upstream_qwen = false;
 
                 if wants_upstream_qwen {
                     let mut upstream_json = parsed.clone();
@@ -2388,7 +2409,7 @@ fn run_persistent_tcp_server(
                 continue;
             }
 
-            if route_path == "/api/map-state" {
+            if route_path == "/api/map-state" || route_path == "/v1/mind/state" {
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     cached_map_state_json.len(),
@@ -2399,7 +2420,7 @@ fn run_persistent_tcp_server(
                 continue;
             }
 
-            if route_path == "/api/map-points.bin" {
+            if route_path == "/api/map-points.bin" || route_path == "/v1/mind/points.bin" {
                 let header = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     cached_point_cloud_bin.len()
@@ -2410,7 +2431,7 @@ fn run_persistent_tcp_server(
                 continue;
             }
 
-            if route_path == "/api/turn" {
+            if route_path == "/api/turn" || route_path == "/v1/mind/turn" {
                 let q_param = extract_query_param(query_part, "q").unwrap_or_else(|| {
                     if first_line.starts_with("POST ") {
                         req_str
@@ -2470,7 +2491,7 @@ fn run_persistent_tcp_server(
                 continue;
             }
 
-            if route_path == "/api/probe" {
+            if route_path == "/api/probe" || route_path == "/v1/mind/probe" {
                 let q_param = extract_query_param(query_part, "q")
                     .unwrap_or_else(|| "coding_intensive".to_string());
                 let basins_param = extract_query_param(query_part, "basins");
@@ -2507,6 +2528,54 @@ fn run_persistent_tcp_server(
                         .render_specialist_profile_json(&profile, t_p.elapsed().as_micros())
                 };
 
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    json_body.len(),
+                    json_body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                handled += 1;
+                continue;
+            }
+
+            if route_path == "/api/dream" || route_path == "/v1/mind/dream" {
+                let t_dream = std::time::Instant::now();
+                let max_charts = extract_query_param(query_part, "charts")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(16);
+                let max_bridges = extract_query_param(query_part, "bridges")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(4);
+                let json_body = match runtime.server.execute_autonomous_dream_cycle(
+                    handled as u64 + 1,
+                    max_charts,
+                    max_bridges,
+                ) {
+                    Ok(rec) => {
+                        if rec.charts_upgraded_to_multi_rank > 0 || rec.empty_space_bridges_minted > 0 {
+                            cached_map_state_json = runtime.server.render_map_state_json();
+                        }
+                        serde_json::json!({
+                            "status": "ok",
+                            "dream_epoch": rec.dream_epoch,
+                            "elapsed_us": t_dream.elapsed().as_micros() as u64,
+                            "charts_upgraded_to_multi_rank": rec.charts_upgraded_to_multi_rank,
+                            "tangent_ranks_accreted": rec.tangent_ranks_accreted,
+                            "empty_space_bridges_minted": rec.empty_space_bridges_minted,
+                            "macro_spans_folded": rec.macro_spans_folded,
+                            "holonomy_verified": rec.holonomy_verified,
+                            "total_atoms_before": rec.total_atoms_before,
+                            "total_atoms_after": rec.total_atoms_after,
+                            "total_arcs_before": rec.total_arcs_before,
+                            "total_arcs_after": rec.total_arcs_after,
+                            "novel_dream_propositions": rec.novel_dream_propositions,
+                        }).to_string()
+                    }
+                    Err(e) => serde_json::json!({
+                        "status": "error",
+                        "error": e,
+                    }).to_string(),
+                };
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     json_body.len(),

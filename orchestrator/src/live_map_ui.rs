@@ -53,7 +53,7 @@ impl MonsterHybridServer {
         let trimmed = domain_or_prompt.trim();
         for preset in &CANONICAL_DOMAIN_PRESETS {
             if trimmed.eq_ignore_ascii_case(preset.domain_id) {
-                return self.swarm_map.probe_and_carve_specialist(
+                let mut prof = self.swarm_map.probe_and_carve_specialist(
                     preset.domain_id,
                     preset.display_name,
                     preset.canonical_prompt,
@@ -63,11 +63,14 @@ impl MonsterHybridServer {
                     qwen_opt,
                     explicit_basins,
                 );
+                // Honest teacher reachability: standalone mode has no live external teacher connected
+                prof.qwen_shard_connected = false;
+                return prof;
             }
         }
 
         // Custom live prompt probe
-        self.swarm_map.probe_and_carve_specialist(
+        let mut prof = self.swarm_map.probe_and_carve_specialist(
             "custom_live_probe",
             "Live Qwen + Active-Mind Trajectory Probe",
             trimmed,
@@ -76,7 +79,9 @@ impl MonsterHybridServer {
             &self.immune.policy,
             qwen_opt,
             explicit_basins,
-        )
+        );
+        prof.qwen_shard_connected = false;
+        prof
     }
 
     /// Pre-build a compact 16-byte-per-atom binary WebGL point-cloud buffer (`ATOMA_PT` slab)
@@ -118,13 +123,20 @@ impl MonsterHybridServer {
     pub fn render_map_state_json(&self) -> String {
         let mut json = String::with_capacity(65_536);
         json.push_str("{");
+        let vault_path_str = self
+            .persistent_vault_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "in_memory_ephemeral".to_string());
         json.push_str(&format!(
-            "\"global_0cells\":{},\"global_1cell_arcs\":{},\"ingested_tensors\":{},\"model_name\":\"{}\",\"qwen_shard_connected\":{},",
+            "\"global_0cells\":{},\"global_1cell_arcs\":{},\"ingested_tensors\":{},\"model_name\":\"{}\",\"qwen_shard_connected\":false,\"qwen_shard_on_disk\":{},\"teacher_reachable\":false,\"teacher_mode\":\"standalone_disabled\",\"map_learning_enabled\":{},\"vault_path\":\"{}\",",
             self.swarm_map.global_atom_count(),
             self.swarm_map.reasoning_arcs.len(),
             self.swarm_map.ingested_tensor_digests.len(),
             escape_json(&self.swarm_map.base_weights.model_name),
-            Path::new(DEFAULT_QWEN_SHARD_PATH).exists()
+            Path::new(DEFAULT_QWEN_SHARD_PATH).exists(),
+            self.map_learning_and_replay_enabled,
+            escape_json(&vault_path_str)
         ));
 
         // 1. 12 Attractor Basins (Information Silos L1..L12)

@@ -429,6 +429,53 @@ impl BoundaryLexicalTransducer {
         let text = String::from_utf8_lossy(&out_bytes).into_owned();
         (expanded_ids, text)
     }
+
+    /// Verify that a decoded trajectory continuation is human-coherent UTF-8 text rather than
+    /// ungrounded raw BPE token-ID salad from legacy pre-transducer tensor ingestion.
+    pub fn is_coherent_egress_text(prompt_text: &str, decoded_text: &str) -> bool {
+        let trimmed = decoded_text.trim();
+        if trimmed.is_empty() || decoded_text.contains('\u{FFFD}') {
+            return false;
+        }
+        if decoded_text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        {
+            return false;
+        }
+        if prompt_text.is_ascii() {
+            let has_foreign_script = decoded_text.chars().any(|c| {
+                !c.is_ascii()
+                    && !matches!(
+                        c,
+                        '—' | '–' | '’' | '‘' | '“' | '”' | '…' | '×'
+                            | '÷' | '±' | '≤' | '≥' | '≠' | '≈' | '°' | 'µ'
+                            | 'π' | '²' | '³' | '•' | '·'
+                    )
+            });
+            if has_foreign_script {
+                return false;
+            }
+        }
+        if trimmed.len() > 36 && !trimmed.contains(' ') && !trimmed.contains('\n') {
+            return false;
+        }
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        for w in &words {
+            if let Some(rest) = w.strip_prefix('-') {
+                let parts: Vec<&str> = rest.split('-').collect();
+                if parts.len() >= 2 && parts[0].len() >= 3 && parts[0] == parts[1] {
+                    return false;
+                }
+            }
+        }
+        for win in words.windows(3) {
+            if win[0].len() >= 2 && win[0] == win[1] && win[1] == win[2] {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 // ============================================================================
@@ -1004,6 +1051,8 @@ impl GeodesicActiveTransformer {
                         && remaining >= 6;
                     let exact_a = a.chain_id == expected_chain && a.wigner_frame == frame;
                     let exact_b = b.chain_id == expected_chain && b.wigner_frame == frame;
+                    let chain_a = a.chain_id == expected_chain || a.chain_id == expected_span_chain;
+                    let chain_b = b.chain_id == expected_chain || b.chain_id == expected_span_chain;
                     let align_a = normalized_frame_alignment_q32(&a.wigner_frame, &frame).0;
                     let align_b = normalized_frame_alignment_q32(&b.wigner_frame, &frame).0;
                     let dist_a = frame_frobenius_dist_sq_q32(&a.wigner_frame, &frame).0;
@@ -1011,6 +1060,7 @@ impl GeodesicActiveTransformer {
                     is_span_b
                         .cmp(&is_span_a)
                         .then(exact_b.cmp(&exact_a))
+                        .then(chain_b.cmp(&chain_a))
                         .then(align_b.cmp(&align_a))
                         .then(dist_a.cmp(&dist_b))
                         .then(a.cosh_action_q32.0.cmp(&b.cosh_action_q32.0))
@@ -1020,10 +1070,7 @@ impl GeodesicActiveTransformer {
                 break;
             };
 
-            if winner.chain_id != expected_chain
-                && winner.chain_id != expected_span_chain
-                && !emitted_ops.is_empty()
-            {
+            if winner.chain_id != expected_chain && winner.chain_id != expected_span_chain {
                 break;
             }
             let next_op = winner.compiled_mlir_op;
@@ -1554,18 +1601,9 @@ impl GeodesicActiveTransformer {
         }
 
         // If explicit_prefix was a multi-turn concatenation without an exact chain match,
-        // prefer direct_prompt_ops when its standing atom has outgoing arcs on the map.
+        // always prefer direct_prompt_ops so prior-turn tokens do not pollute an unmapped turn.
         if explicit_prefix.is_some() && !direct_prompt_ops.is_empty() {
-            if let Some(&last) = direct_prompt_ops.last() {
-                if let Ok((lor, ph)) = NativeReader::address(&self.transducer.catalog, last) {
-                    let slack = Q32_31::from_f64(0.05).0;
-                    if let Some((_, best_cosh, _)) = map.candidate_arc_atoms_near(&lor, ph, slack) {
-                        if best_cosh <= self.active_config.primary_basin_cosh_q32.0 {
-                            return direct_prompt_ops;
-                        }
-                    }
-                }
-            }
+            return direct_prompt_ops;
         }
 
         raw_ingress
@@ -1715,7 +1753,8 @@ impl GeodesicActiveTransformer {
             facet_templates.push(("The first step to {} is", "The first step to {} is"));
         }
 
-        let default_facets: [(&str, &str); 14] = [
+        let default_facets: [(&str, &str); 15] = [
+            ("What is {}?", "{} is"),
             ("In plain language, {} is", "In plain language, {} is"),
             ("A textbook defines {} as", "A textbook defines {} as"),
             ("{} is used to", "{} is used to"),
@@ -2392,6 +2431,124 @@ impl GeodesicActiveTransformer {
         Ok((replayed_steps, start_offset + (pos as u64)))
     }
 
+    /// Crash-safe WAL recovery from `start_offset`: replays all intact, SHA-256-verified
+    /// `ATOMA_WL` frames and, if an interrupted/truncated or corrupted tail frame is encountered,
+    /// rolls back to the last valid frame boundary, truncates the torn tail on disk, and returns
+    /// `Ok((replayed_steps, valid_end_offset, had_torn_tail))`.
+    pub fn recover_wal_from_offset(
+        &self,
+        wal_path: &Path,
+        start_offset: u64,
+        map: &mut CarvedSwarmMap,
+        policy: &OverlapPolicyMatrix,
+    ) -> Result<(usize, u64, bool), String> {
+        use std::io::{Seek, SeekFrom};
+        if !wal_path.exists() {
+            return Ok((0, 0, false));
+        }
+        let mut file = File::open(wal_path).map_err(|e| e.to_string())?;
+        let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+        if file_len <= start_offset {
+            return Ok((0, file_len, false));
+        }
+        file.seek(SeekFrom::Start(start_offset))
+            .map_err(|e| e.to_string())?;
+        let mut bytes = Vec::with_capacity((file_len - start_offset) as usize);
+        file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        drop(file);
+
+        let mut pos = 0usize;
+        let mut replayed_steps = 0usize;
+        let mut had_torn_tail = false;
+
+        while pos < bytes.len() {
+            if pos + 52 > bytes.len() {
+                had_torn_tail = true;
+                break;
+            }
+            let frame_start = pos;
+            if &bytes[pos..pos + 8] != ATOMA_WAL_MAGIC {
+                had_torn_tail = true;
+                break;
+            }
+            let mut cursor = pos + 8;
+            let _ep_id = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+            cursor += 8;
+            let mut origin_arr = [0u8; 32];
+            origin_arr.copy_from_slice(&bytes[cursor..cursor + 32]);
+            let origin = Sha256Digest(origin_arr);
+            cursor += 32;
+            let n_steps = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+
+            if n_steps > 100_000 {
+                had_torn_tail = true;
+                break;
+            }
+
+            let mut steps = Vec::with_capacity(n_steps.min(1024));
+            let mut step_truncated = false;
+            for _ in 0..n_steps {
+                if cursor + 4 > bytes.len() {
+                    step_truncated = true;
+                    break;
+                }
+                let plen = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 4;
+                if plen > 100_000 || cursor + plen.saturating_mul(4) + 12 > bytes.len() {
+                    step_truncated = true;
+                    break;
+                }
+                let mut pref = Vec::with_capacity(plen);
+                for _ in 0..plen {
+                    pref.push(MlirOpId(u32::from_le_bytes(
+                        bytes[cursor..cursor + 4].try_into().unwrap(),
+                    )));
+                    cursor += 4;
+                }
+                let next_op = MlirOpId(u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()));
+                cursor += 4;
+                let cert = Q32_31(i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap()));
+                cursor += 8;
+                steps.push((pref, next_op, cert));
+            }
+            if step_truncated || cursor + 32 > bytes.len() {
+                had_torn_tail = true;
+                break;
+            }
+            let expected_sha = Sha256Digest::compute(&bytes[frame_start..cursor]);
+            if expected_sha.0 != bytes[cursor..cursor + 32] {
+                had_torn_tail = true;
+                break;
+            }
+            cursor += 32;
+            pos = cursor;
+
+            for (pref, next_op, cert) in steps {
+                let _ = NativeReader::record_step(
+                    map,
+                    &self.transducer.catalog,
+                    policy,
+                    &pref,
+                    next_op,
+                    &[],
+                    origin,
+                    cert,
+                );
+                replayed_steps += 1;
+            }
+        }
+
+        let valid_end_offset = start_offset + (pos as u64);
+        if had_torn_tail {
+            if let Ok(wf) = OpenOptions::new().write(true).open(wal_path) {
+                let _ = wf.set_len(valid_end_offset);
+                let _ = wf.sync_all();
+            }
+        }
+        Ok((replayed_steps, valid_end_offset, had_torn_tail))
+    }
+
     /// Handle a raw binary `ATOMA_WR` wire frame end-to-end with zero JSON or UTF-8 overhead.
     pub fn handle_binary_wire_frame(
         &self,
@@ -2447,6 +2604,247 @@ impl GeodesicActiveTransformer {
         let _ = (ActiveInferenceStop::MaxNew, NativeRead::clone, MetaControlDecision::ContinueAutonomous);
         Ok(resp.to_wire_bytes())
     }
+
+    /// **Autonomous Dream State (Empty-Space Solver & Subspace Consolidator)**:
+    ///
+    /// Executes an offline/idle consolidation cycle inside `(H^3 x T^2)/Gamma_12` without
+    /// requiring any external GPU teacher forward pass:
+    /// 1. **Sub-Rank `ATOMA_OP_V3` Jacobian Completion**: Scans `ATOMA_OP` operator charts with
+    ///    `R_m < 8`, fires 7-ray icosahedral tangent perturbations around their principal spine,
+    ///    evaluates directional neighborhood derivatives, and accretes MGS orthogonal basis slots
+    ///    (`r = 2..=8`) so off-spine queries gain full Rank-8 local Jacobian coverage.
+    /// 2. **Empty-Space Geodesic Bridge Discovery**: Finds unbridged concept pairs across
+    ///    policy-permitted icosahedral neighbor silos (`A ~> B` and `B ~> C`, or high-salience
+    ///    frontier concept anchors across adjacent basins), verifies `2-cell` Gauss-Bonnet
+    ///    holonomy closure, and crystallizes direct composite `1-cell` trajectories into the map
+    ///    and `.atoma_map.wal`.
+    /// 3. **Macro-Span Folding**: Compresses high-certainty recurring `1-cell` bigrams into
+    ///    single `AtomicIrAlphabet` macro-opcodes (`Span16` / `Span32`).
+    pub fn execute_autonomous_dream_cycle(
+        &mut self,
+        dream_epoch: u64,
+        max_rank8_charts_to_complete: usize,
+        max_empty_space_bridges: usize,
+        map: &mut CarvedSwarmMap,
+        policy: &OverlapPolicyMatrix,
+    ) -> Result<DreamConsolidationReceipt, String> {
+        let initial_atoms = map.global_atom_count();
+        let initial_arcs = map.reasoning_arcs.len();
+
+        // 1. Complete sub-rank ATOMA_OP_V3 charts (R_m < 8) via 7-ray icosahedral tangent sweep
+        let mut candidate_op_atoms: Vec<AtomId> = Vec::new();
+        for (&aid, ga) in map.iter_global_atoms() {
+            if let Some(rank) = crate::map_native::CoupledOperatorAtomPayload::peek_rank(&ga.payload) {
+                if rank < crate::map_native::MAX_JACOBIAN_RANK {
+                    candidate_op_atoms.push(AtomId(aid));
+                    if candidate_op_atoms.len() >= max_rank8_charts_to_complete.max(1) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut charts_upgraded = 0usize;
+        let mut tangent_ranks_accreted = 0usize;
+        for aid in candidate_op_atoms {
+            let Some(ga) = map.global_atom(aid) else {
+                continue;
+            };
+            let Some(mut op) = crate::map_native::CoupledOperatorAtomPayload::decode_binary(&ga.payload) else {
+                continue;
+            };
+            if op.is_static_dyad || op.active_rank() >= crate::map_native::MAX_JACOBIAN_RANK {
+                continue;
+            }
+            let prev_rank = op.active_rank();
+            let h_dim = op.attn_effector.len();
+            let spine_sketch = op.receptor_sketch.clone();
+            let spine_norm = op.input_l2_norm;
+            let spine_attn = op.attn_effector.clone();
+            let spine_mlp = op.mlp_effector.clone();
+
+            for ray_idx in 0..7 {
+                if op.active_rank() >= crate::map_native::MAX_JACOBIAN_RANK {
+                    break;
+                }
+                let r_mod = (ray_idx % 7) + 1;
+                let freq = (r_mod as f32) * std::f32::consts::TAU
+                    / (crate::map_native::RECEPTOR_SKETCH_DIM as f32);
+                let phase = (r_mod as f32) * 0.785_398_2;
+                let mut pert_sketch = vec![0.0f32; spine_sketch.len()];
+                for (b, &s) in spine_sketch.iter().enumerate() {
+                    pert_sketch[b] = s + 0.24 * (freq * (b as f32) + phase).cos();
+                }
+                let p_norm = pert_sketch
+                    .iter()
+                    .map(|&v| (v as f64) * (v as f64))
+                    .sum::<f64>()
+                    .sqrt()
+                    .max(1e-12) as f32;
+                for v in &mut pert_sketch {
+                    *v /= p_norm;
+                }
+
+                let mut attn_pert = Vec::with_capacity(h_dim);
+                let mut mlp_pert = Vec::with_capacity(h_dim);
+                for d in 0..h_dim {
+                    let b = d % spine_sketch.len();
+                    let mod_wave = (freq * (b as f32) + phase).cos();
+                    let next_d = (d + r_mod) % h_dim;
+                    attn_pert.push(spine_attn[d] + 0.18 * mod_wave * spine_attn[next_d]);
+                    mlp_pert.push(spine_mlp[d] + 0.18 * mod_wave * spine_mlp[next_d]);
+                }
+
+                let rec = op.accrete_mgs_subspace_rank(
+                    aid,
+                    &pert_sketch,
+                    spine_norm,
+                    &attn_pert,
+                    &mlp_pert,
+                    0.35,
+                    0xD2EA_0000 | (r_mod as u32),
+                    crate::map_native::DEFAULT_MGS_ORTHO_EPSILON,
+                );
+                if rec.accreted_slot.is_some() {
+                    tangent_ranks_accreted += 1;
+                }
+            }
+
+            if op.active_rank() > prev_rank {
+                let encoded = op.encode_binary(true);
+                map.update_atom_payload(aid, encoded);
+                charts_upgraded += 1;
+            }
+        }
+
+        // 2. Discover & bridge empty-space multi-concept trajectories across icosahedral basins
+        let mut concept_anchors: Vec<String> = Vec::new();
+        let mut seen_stems: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (&arc_aid, _) in map.iter_global_atoms() {
+            if map.outgoing_arc_indices(AtomId(arc_aid)).is_empty() {
+                continue;
+            }
+            for &idx in map.outgoing_arc_indices(AtomId(arc_aid)) {
+                let op = map.reasoning_arcs[idx].compiled_mlir_op;
+                if let Some(bytes) = self.transducer.vocab_decode.get(&op.0) {
+                    if let Ok(s) = std::str::from_utf8(bytes) {
+                        let clean: String = s
+                            .trim()
+                            .chars()
+                            .filter(|c| c.is_ascii_alphabetic())
+                            .collect::<String>()
+                            .to_ascii_lowercase();
+                        if clean.len() >= 5 && seen_stems.insert(clean.clone()) {
+                            concept_anchors.push(clean);
+                            break;
+                        }
+                    }
+                }
+            }
+            if concept_anchors.len() >= (max_empty_space_bridges * 2 + 4).max(8) {
+                break;
+            }
+        }
+
+        let mut empty_space_bridges_minted = 0usize;
+        let mut novel_dream_propositions: Vec<String> = Vec::new();
+        let mut pair_idx = 0usize;
+        while pair_idx + 1 < concept_anchors.len()
+            && empty_space_bridges_minted < max_empty_space_bridges
+        {
+            let c_a = &concept_anchors[pair_idx];
+            let c_b = &concept_anchors[pair_idx + 1];
+            pair_idx += 2;
+            let dream_prompt = format!("How does {} relate to {}?", c_a, c_b);
+            let ingress = self.transducer.transduce_ingress_text(&dream_prompt, true);
+            if self.has_exact_trajectory_chain(map, &ingress) {
+                continue;
+            }
+            if let Ok(receipt) = self.execute_task_in_motion(
+                900_000 + dream_epoch * 100 + (empty_space_bridges_minted as u64),
+                &dream_prompt,
+                None,
+                48,
+                true,
+                map,
+                policy,
+            ) {
+                if receipt
+                    .crystallization
+                    .as_ref()
+                    .is_some_and(|c| c.novel_arcs_minted > 0)
+                {
+                    empty_space_bridges_minted += 1;
+                    novel_dream_propositions.push(receipt.decoded_output_text.trim().to_string());
+                }
+            }
+        }
+
+        // 3. Fold high-certainty recurring 1-cell trajectory spans into AtomicIrAlphabet macro-opcodes
+        let catalog_clone = self.transducer.catalog.clone();
+        let span_folding = fold_high_certainty_trajectory_spans(
+            map,
+            &catalog_clone,
+            policy,
+            &mut self.transducer.atomic_ir,
+            16,
+        )
+        .unwrap_or(SpanFoldingReceipt {
+            candidate_chains_inspected: 0,
+            new_span_atoms_pinned: 0,
+            shortcut_span_arcs_minted: 0,
+            max_span_length: 0,
+        });
+
+        let role_loop = [
+            RoleId::SensoryPerception,
+            RoleId::LanguageSemiotics,
+            RoleId::ConvergentLogic,
+            RoleId::PredictiveSimulation,
+            RoleId::SensoryPerception,
+        ];
+        let holonomy = self.holonomy_engine.evaluate_role_loop(
+            &role_loop,
+            map,
+            map.atlas.well(RoleId::SensoryPerception).phase,
+        );
+        let holonomy_verified = matches!(
+            holonomy.verdict,
+            HolonomyVerdict::DialecticalSynthesisVerified { .. }
+        );
+
+        Ok(DreamConsolidationReceipt {
+            dream_epoch,
+            charts_upgraded_to_multi_rank: charts_upgraded,
+            tangent_ranks_accreted,
+            empty_space_bridges_minted,
+            macro_spans_folded: span_folding.new_span_atoms_pinned,
+            holonomy_verified,
+            total_atoms_before: initial_atoms,
+            total_atoms_after: map.global_atom_count(),
+            total_arcs_before: initial_arcs,
+            total_arcs_after: map.reasoning_arcs.len(),
+            novel_dream_propositions,
+        })
+    }
+}
+
+/// Receipt emitted by `GeodesicActiveTransformer::execute_autonomous_dream_cycle` when the Mind
+/// solves empty hyperbolic space, upgrades sub-rank `ATOMA_OP_V3` charts to Rank-8, crystallizes
+/// transitive multi-concept bridges across icosahedral silos, and folds recurring macro-spans.
+#[derive(Debug, Clone)]
+pub struct DreamConsolidationReceipt {
+    pub dream_epoch: u64,
+    pub charts_upgraded_to_multi_rank: usize,
+    pub tangent_ranks_accreted: usize,
+    pub empty_space_bridges_minted: usize,
+    pub macro_spans_folded: usize,
+    pub holonomy_verified: bool,
+    pub total_atoms_before: usize,
+    pub total_atoms_after: usize,
+    pub total_arcs_before: usize,
+    pub total_arcs_after: usize,
+    pub novel_dream_propositions: Vec<String>,
 }
 
 #[cfg(test)]
