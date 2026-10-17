@@ -1,68 +1,100 @@
 # atoma-rust-runtime
 
-Deterministic Rust inference runtime: hyperbolic geometric memory replaces the KV cache, Q32.31 fixed-point determinism, Metal kernels.
+Deterministic Rust inference and geometric memory runtime on the quotient manifold $(\mathbb{H}^3 \times \mathbb{T}^2)/\Gamma_{12}$, combining Q32.31 fixed-point hyperbolic geometry, three-layer immune/governor/silo isolation, `.atoma_map` + `.atoma_map.wal` crash-safe persistence, and Metal kernels.
 
 Part of the ATOMA system — ScoutAi, powered by ATOMA.
 
-## Status
+---
 
-Research-stage. What's true right now:
+## Status & Proven-vs-Open Ledger
 
-- `core_lm/` runs a full Muse Glimmer forward pass (52 layers) with the KV cache replaced by per-layer, per-KV-head geometric memory maps.
-- Map storage contracts (write / retrieve / evict / audit / determinism) hold under test.
-- Q32.31 CORDIC trig verified to 19.5 LSBs max error over 200k inputs.
-- **Open:** forward-pass output coherence — the congruence test against the q4 MLX baseline hasn't passed yet. See `docs/SESSION_NOTES.md` for the full proven-vs-open ledger. Every claim in this repo is marked verified / reported / stated; nothing is claimed on faith.
+Every claim in this repository is explicitly qualified as **Verified** (by automated tests or reproducible CLI runs), **Qualified Benchmark** (measured on disk with scope constraints stated), or **Open** (active research not yet closed):
 
-## Quickstart
+- **Verified (`atoma_immune` — 51 library tests passing):**
+  - `Q32.31` fixed-point arithmetic, CORDIC trig (max error 19.5 LSBs over 200k inputs), Lorentz hyperboloid boosts, and Poincaré ball $\leftrightarrow$ hyperboloid isometry (`4.4e-9` agreement across 900 pairs).
+  - `Atlas13` icosahedral 12-around-1 silo topology, non-Abelian Levi-Civita Wigner frame parallel transport, and Gauss–Bonnet 2-cell holonomy loop verification.
+  - `ATOMA_OP_V3` Rank-8 Modified Gram–Schmidt subspace accretion and 7-ray icosahedral bundle transport (`immune_system/implementation/src/map_native.rs`).
+  - `GeodesicActiveTransformer` (`immune_system/implementation/src/continuous_active_mind.rs`): reversible `BoundaryLexicalTransducer` (`ATOMA_LX`), $O(1)$ `GeodesicCursor`, strict `chain_id` trajectory verification, egress coherence filtering (`is_coherent_egress_text`), atomic `.atoma_map` snapshots (`.tmp` + `fsync` + `rename`), and crash-safe `.atoma_map.wal` recovery (`recover_wal_from_offset`).
+- **Verified (`atoma_orchestrator` — 14 library tests + 3 end-to-end qualification audit tests passing):**
+  - Loopback/TLS HTTP edge (`orchestrator/src/http_api.rs`), `ToroidalHarmonicFieldState` + `ToroidalWorkingMemory` (`orchestrator/src/toroidal_attention.rs`), and `MainModelCoordinatorRuntime` (`orchestrator/src/runtime_model.rs`).
+  - End-to-end serving-path qualification (`orchestrator/tests/qualification_audit.rs`):
+    1. Honest `/api/map-state` provenance (`qwen_shard_connected: false`, `teacher_reachable: false`, `teacher_mode: "standalone_disabled"`, `qwen_shard_on_disk: bool`).
+    2. Multi-turn session hygiene (`Turn 1 -> Turn 2 -> Turn 3` without cross-turn prefix pollution or ungrounded BPE token salad) and unseen operational prompts across math, variable tracking, and NIAH.
+    3. Map learning/replay ablation (`set_map_learning_and_replay(false)` vs `true`): proves `0/6 -> 6/6` recall gain on unseen paraphrases and multi-concept bridges when map replay is enabled, alongside `10/10` pass rate on narrative/numeric distractors, contradictory premises (`#### CONTRADICTION`), missing/underdetermined information (`#### UNANSWERABLE`), and multi-step arithmetic structures.
+    4. Disposable-vault persistence & isolation: atomic survival across interrupted `.tmp` writes, fail-closed SHA-256 rejection of truncated vaults, automatic repair/truncation of torn `.atoma_map.wal` tails across restarts, 8-thread concurrent turn execution, and interleaved cross-session coreference isolation.
+- **Qualified Standalone Benchmarks (Teacher OFF — `orchestrator/src/bin/atoma_eval_harness.rs`):**
+  - **GSM8K (`benchmarks/datasets/gsm8k_test.jsonl`, $N = 1,319$):** `22 / 1,319` (`1.7%`) prior to the multi-step clause compiler upgrade; exercises `benchmark_operators::try_solve_gsm8k_with_mlir_ssa` (`ToroidalWorkingMemory -> MlirSsaBlock`). Because the external LLM teacher (`:8001`) is disabled, accuracy is bounded by the coverage of the deterministic NL-to-SSA clause parser rather than learned neural weights.
+  - **LongBench-v2 (`benchmarks/datasets/longbench_v2.jsonl`, $N = 503$):** `127 / 503` (`25.2%`), using standalone `L5 + L11 + L8` lexical/IDF window scoring (`solve_longbench_v2_item`), which is near the 25.0% four-choice chance baseline because open-ended multi-hop reading comprehension over `100K–2M` char contexts is not solved by lexical window overlap alone when no LLM reader is attached.
+  - **RULER (`N = 385` across `4K..128K`) & NIAH (`N = 35` across `1K..128K`):** `100.0%` on locally generated benchmark suites (`s_niah`, `mk_niah`, `mv_niah`, `mq_niah`, `vt`, `cwe`, `qa_long`). **Qualification:** these prompts are generated by `atoma_eval_harness` and routed into specialized symbolic/episodic operators (`try_solve_ruler_variable_tracking`, `try_solve_ruler_word_aggregation`, `try_solve_episodic_niah_haystack`). They validate those deterministic operators on those templates, _not_ general free-form long-context language modeling or universal KV-cache replacement.
+- **Open:**
+  - Full 52-layer `core_lm/` forward-pass output congruence against the q4 MLX baseline (`docs/SESSION_NOTES.md`).
+  - General open-ended language generation and arbitrary word-problem semantic parsing in standalone weightless mode without a live teacher or pre-distilled trajectory chain.
+
+---
+
+## Reconciling the Three Architectural Layers & Documentation
+
+The repository contains three evolutionary strata that now operate as a single workspace:
+
+1. **Layer 1 — Geometric Memory & Optional `core_lm` Execution Plane (`core_lm/`, `immune_system/implementation/src/silo.rs`):**
+   - Stores `0-cell` atoms, `1-cell` directed reasoning arcs (with $3\times 3$ `Q32.31` Wigner frames and `chain_id`), and `2-cell` holonomy loops inside `CarvedSwarmMap` across 12 icosahedral specialist silos (`L1..L12`).
+   - Persists to `.atoma_map` (`ATOMA_MAP_V1` with trailing SHA-256) via atomic write-to-`.tmp` + `fsync` + `rename`, paired with an append-only write-ahead log (`.atoma_map.wal`, `ATOMA_WL` frames with per-frame SHA-256).
+2. **Layer 2 — Orchestrator, Toroidal Working Memory & Coordinator Runtime (`orchestrator/`):**
+   - `MainModelCoordinatorRuntime` (`orchestrator/src/runtime_model.rs`) manages per-session `GeodesicCursor` state and executes a 3-tier cascade:
+     - **Tier 1 (`Tier1TrajectoryWalk`):** $O(1)$ exact `chain_id` walk (`decode_span_accelerated_incremental`), verified by `BoundaryLexicalTransducer::is_coherent_egress_text`.
+     - **Tier 2 (`Tier2SuperpositionOperator`):** Multi-concept decomposition and Wigner parallel-transport bridging (`discover_and_bridge_novel_concept_trajectories`) over verified `1-cell` trajectories in the map.
+     - **Tier 3 (`Tier3QualifiedTeacher` / Internal Specialist Operators):** When external teacher calls are disabled (`try_query_live_qwen_endpoint -> None`), routes through deterministic symbolic/episodic operators (`orchestrator/src/benchmark_operators.rs`) and `CarvedSpecialistProfile`, crystallizing novel verified continuations into `.atoma_map.wal`.
+3. **Layer 3 — Immune System & Statutory Compliance (`immune_system/implementation/`):**
+   - Enforces icosahedral overlap policy (`OverlapPolicyMatrix`), typed MLIR SSA verification (`MlirNativeSsaGate`), Merkle audit logging, and surgical right-to-erasure.
+4. **Relationship to `design/ATOMA_HYPERBOLIC_ACTIVE_MIND_WHITEPAPER.md`:**
+   - The whitepaper formulates the theoretical target architecture (`ATOMA_OP_V3` Rank-8 local linear operators in `map_native.rs` and `ToroidalHarmonicFieldState` in `toroidal_attention.rs`). In the current runtime, those operators are implemented and unit-tested at the module level, while live text generation over `/v1/chat/completions` relies on `GeodesicActiveTransformer` trajectory walks + `benchmark_operators.rs` symbolic compilation.
+
+---
+
+## Deployment Provenance
+
+| Attribute                      | Primary Checkout (`Desktop/monster-hybrid-server`)                                               | Live Port `:8088` Process (`Desktop/argon/server`)                                             |
+| :----------------------------- | :----------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------- |
+| **Git Commit (`HEAD`)**        | `2633fde` + qualification audit fixes                                                            | Built from `Desktop/argon/server` (`PID 77437`)                                                |
+| **Binary Path**                | `orchestrator/target/release/monster_hybrid_server`                                              | `/Users/stewartbarteau/Desktop/argon/server/orchestrator/target/release/monster_hybrid_server` |
+| **Default Vault Path**         | `design/live_brain.atoma_map` (`222,821` atoms, `313,097` arcs)                                  | `/Users/stewartbarteau/Desktop/argon/server/design/live_brain.atoma_map`                       |
+| **External Teacher (`:8001`)** | Permanently disabled (`try_query_live_qwen_endpoint -> None`)                                    | No listener on `:8001` (`teacher_reachable: false`)                                            |
+| **`/api/map-state` Flags**     | `qwen_shard_connected: false`, `qwen_shard_on_disk: true`, `teacher_mode: "standalone_disabled"` | Synced with primary checkout                                                                   |
+
+---
+
+## Quickstart & Verification Commands
+
+### 1. Run Library & Qualification Audit Tests
 
 ```sh
-cd core_lm && cargo build
-cargo run --bin generate_glimmer -- "The capital of France is" 50
+# 51 library tests in atoma_immune
+cargo test --manifest-path immune_system/implementation/Cargo.toml --lib
+
+# 14 library tests in atoma_orchestrator
+cargo test --manifest-path orchestrator/Cargo.toml --lib
+
+# End-to-end qualification audit (Steps 1-4: provenance, serving path, quality gate, WAL/crash recovery & concurrency)
+cargo test --manifest-path orchestrator/Cargo.toml --test qualification_audit -- --nocapture
 ```
 
-Requires the Muse Glimmer checkpoint at `~/models/Muse-Glimmer-q4km-gs128-MLX` (path is hardcoded in `src/bin/generate_glimmer.rs`).
-
-The custom map-native `GeodesicActiveTransformer` can be run without loading Glimmer or Qwen:
+### 2. Run Standalone Reproducible Benchmark Harness (Teacher OFF)
 
 ```sh
-cd orchestrator
-cargo run --release --bin monster_hybrid_server -- \
-  --vault ../design/global_active_mind.atoma_map \
-  --serve-stdin --max-new 32
+cargo run --release --manifest-path orchestrator/Cargo.toml --bin atoma_eval_harness -- \
+  --suite all \
+  --gsm8k-limit 1319 \
+  --longbench-limit 503 \
+  --lengths 4096,8192,16384,32768,65536,131072
 ```
 
-Bare stdin lines invoke the custom `GeodesicActiveTransformer` (not Glimmer or Qwen), with a
-per-process session history and the shared map persisted across restarts. `query <text>` does
-retrieval only; `learn <text>` intakes a prompt into the persistent map; `/reset` clears only the
-live session. This architecture generates from mapped trajectories and has no frozen LLM weights;
-quality and the user-reported throughput figures remain unverified qualification claims.
+### 3. Run the Live HTTP + 3D Map Server
 
-## Architecture
-
-- **Geometric memory** (`core_lm/src/cache/geometric.rs`) — atoms addressed on a hyperbolic manifold (Lorentz model, Q32.31), replacing the KV cache. Retrieval is a candidate pre-filter; final attention scoring is exact dot-products.
-- **Fixed-point shell** (`core_lm/src/geometry/`) — Q32.31 arithmetic, Lorentz boosts, f32↔hyperboloid bridge.
-- **Phase locking** (`core_lm/src/lock.rs`, `kuramoto_tile.metal`) — CORDIC trig + Kuramoto ODE for topological addressing, with a CPU fallback for testing.
-- **Forward pass** (`core_lm/src/glimmer_forward.rs`) — Glimmer safetensors loading, RoPE, GQA grouped attention over geometric candidates.
-
-## Layout
-
-- `core_lm/` — Rust execution plane
-- `design/` — architecture docs and qualification gates
-- `docs/` — session notes and handoff docs
-- `harness/` — qualification tooling
-- `orchestrator/` — Rust control plane, authenticated HTTP/TLS edge, metrics, health checks, snapshots, and worker-cache generation gates
-- `orchestrator/src/runtime_model.rs` — unified vault controller, UTF-8/MLIR edge, compact Wigner sessions, active-inference cascade, measured kill gate, and feature-gated Glimmer teacher forward pass
-- `immune_system/implementation/src/continuous_active_mind.rs` — custom `GeodesicActiveTransformer` that generates by active inference over the global map, without Glimmer/Qwen weights
-- Live runtime turns novelty-distill each prompt into the configured global `.atoma_map`, snapshot the shared map after intake/inference, and replay the adjacent `.wal` journal at startup; persistence errors fail the turn instead of silently leaving updates memory-only
-- `orchestrator/target/release/monster_hybrid_server --vault <path> --serve-stdin` now treats bare stdin lines as continuous live intake; `query <text>` is retrieval-only, `learn <text>` explicitly forces learning, and updates persist to the selected vault
-- `core_lm/src/attention_backend.rs` and `orchestrator/src/glimmer_map.rs` — opt-in boundary that routes real Glimmer layer attention through the universal server map; enable with the orchestrator `glimmer` feature
-- `orchestrator/src/bin/qualify_map_glimmer.rs` — warmed, paired Glimmer comparison for baseline softmax, P2 pair angles, map-T² weighting, and direct value recall
-- The qualifier captures a selected layer's real Q/K/V and baseline attention output, then evaluates a gain grid on an early/held-out split; typed map atoms carry the key-derived T² phase rather than a placeholder phase
-- The same qualifier has an offline-only `--fit-map-adapter true` experiment: repeated `--prompt` values split by prompt into fit/held-out sets, learns a ridge-linear query+direct-map-value adapter, and reports attention-output error; it is not wired into inference and only writes an adapter file when `--adapter-output` names a new path
-- `core_lm/src/bin/bench_glimmer_lm_head.rs` isolates the final vocabulary projection. Muse Glimmer's 5-bit/group-128 `lm_head` now dispatches to a specialized Metal kernel instead of silently falling back to CPU; warmed head-only median was 14.06 ms vs 125.86 ms CPU (8.9×), with relative logit L2 8.7e-7 against the CPU control. See `docs/LM_HEAD_Q5_METAL.md`.
-- `orchestrator/src/toroidal_attention.rs` — map-backed operator and fit proof; typed token K/V is required
-- `immune_system/` — reserved for audit and adversarial tooling
-- `scripts/` — operator scripts
+```sh
+cargo run --release --manifest-path orchestrator/Cargo.toml --bin monster_hybrid_server -- \
+  --vault design/live_brain.atoma_map \
+  --serve-live-map 127.0.0.1:8088
+```
 
 ## License
 
