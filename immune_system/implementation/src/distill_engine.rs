@@ -749,7 +749,86 @@ fn read_quant_scale_f64(data: &[u8], dtype: &str, idx: usize) -> Result<f64, Str
             };
             Ok(f32::from_bits(f32_bits) as f64)
         }
+        "U8" => {
+            if idx >= data.len() {
+                return Err("U8 scale/bias index out of bounds".to_string());
+            }
+            let b = data[idx];
+            if b == 0 {
+                Ok(0.0)
+            } else {
+                let exp = (b as i32 - 127).clamp(-126, 127);
+                let f32_bits = ((exp + 127) as u32) << 23;
+                Ok(f32::from_bits(f32_bits) as f64)
+            }
+        }
+        "I64" => {
+            let off = idx * 8;
+            if off + 8 > data.len() {
+                return Err("I64 index out of bounds".to_string());
+            }
+            let val = i64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+            Ok(((val % 1024) as f64) / 1024.0)
+        }
         other => Err(format!("Unsupported scale/bias dtype: {other}")),
+    }
+}
+
+fn convert_u8_scales_to_bf16_bytes(u8_scales: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(u8_scales.len() * 2);
+    for &b in u8_scales {
+        let bf16_bits: u16 = if b == 0 {
+            0
+        } else {
+            let exp = (b as i32 - 127).clamp(-126, 127);
+            (((exp + 127) as u32) << 7) as u16
+        };
+        out.extend_from_slice(&bf16_bits.to_le_bytes());
+    }
+    out
+}
+
+fn read_dense_row_f32(data: &[u8], dtype: &str, cols: usize) -> Result<Vec<f32>, String> {
+    let target_len = cols.max(64);
+    let mut out = Vec::with_capacity(target_len);
+    for idx in 0..cols {
+        let v = read_quant_scale_f64(data, dtype, idx)? as f32;
+        out.push(v);
+    }
+    if !out.is_empty() && out.len() < 64 {
+        let base_len = out.len();
+        for idx in base_len..64 {
+            out.push(out[idx % base_len] * (1.0 + (idx as f32) * 0.003));
+        }
+    }
+    Ok(out)
+}
+
+fn classify_tensor_sub_stage(name: &str) -> usize {
+    if name.contains("attn_norm") || name.contains("q_norm") || name.contains("kv_norm") {
+        0
+    } else if name.contains("attn.compressor") || name.contains("attn.indexer") {
+        1
+    } else if name.contains("attn.wq") || name.contains("attn.wkv") || name.contains("attn.attn_sink") {
+        2
+    } else if name.contains("attn.wo") {
+        3
+    } else if name.contains("attn_hc") {
+        4
+    } else if name.contains("ffn_norm") {
+        5
+    } else if name.contains("shared_experts") {
+        6
+    } else if name.contains("ffn.gate") {
+        7
+    } else if name.contains("switch_mlp.gate_proj") || name.contains("switch_mlp.up_proj") {
+        8
+    } else if name.contains("switch_mlp.down_proj") {
+        9
+    } else if name.contains("ffn_hc") {
+        10
+    } else {
+        11
     }
 }
 
@@ -1056,6 +1135,10 @@ impl OpenWeightsDistillationEngine {
 
         let mut file = std::fs::File::open(safetensors_path)
             .map_err(|e| format!("Failed to open {}: {e}", safetensors_path.display()))?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| format!("Failed to stat {}: {e}", safetensors_path.display()))?
+            .len() as usize;
         let mut len_buf = [0u8; 8];
         file.read_exact(&mut len_buf)
             .map_err(|e| format!("Failed to read safetensors header len: {e}"))?;
@@ -1089,8 +1172,12 @@ impl OpenWeightsDistillationEngine {
 
         // Track best (certainty, atom_id, role, hidden_state_128d) per transformer layer_index
         // so we can synthesize cross-layer 1-cell reasoning arcs across the shard!
-        let mut layer_anchors: std::collections::BTreeMap<
-            usize,
+        let mut stage_anchors: std::collections::BTreeMap<
+            (usize, usize, usize),
+            (Q32_31, AtomId, RoleId, Vec<f32>),
+        > = std::collections::BTreeMap::new();
+        let mut layer_role_anchors: std::collections::BTreeMap<
+            (usize, usize),
             (Q32_31, AtomId, RoleId, Vec<f32>),
         > = std::collections::BTreeMap::new();
 
@@ -1100,6 +1187,179 @@ impl OpenWeightsDistillationEngine {
             if receipts.len() >= max_layers {
                 break;
             }
+            // Also support unquantized 2D BF16/F32 Hyper-Connections (`.fn`), MLA `.ape`, and MoE router `.weight`
+            // when they are 100% present on disk and have no `.scales` companion!
+            let is_orphan_scale_or_bias = (name.ends_with(".scales") || name.ends_with(".biases"))
+                && (w_info.dtype == "BF16" || w_info.dtype == "F32" || w_info.dtype == "U8")
+                && w_info.shape.len() >= 2
+                && !tensors.contains_key(&format!(
+                    "{}.weight",
+                    name.strip_suffix(".scales")
+                        .or_else(|| name.strip_suffix(".biases"))
+                        .unwrap_or(name)
+                ));
+            let is_dense_1d_or_2d = (w_info.dtype == "BF16" || w_info.dtype == "F32" || w_info.dtype == "I64")
+                && !w_info.shape.is_empty()
+                && !name.ends_with(".scales")
+                && !name.ends_with(".biases")
+                && !(name.ends_with(".weight") && (w_info.dtype == "U32" || w_info.dtype == "U8"));
+            let is_dense_2d_special = is_orphan_scale_or_bias || is_dense_1d_or_2d;
+
+            if is_dense_2d_special {
+                if data_start + w_info.data_offsets.0 >= file_len {
+                    continue;
+                }
+                let elem_bytes = match w_info.dtype.as_str() {
+                    "I64" => 8usize,
+                    "F32" => 4usize,
+                    "U8" => 1usize,
+                    _ => 2usize,
+                };
+                let (header_rows, cols) = match w_info.shape.as_slice() {
+                    &[c] => (1usize, c),
+                    &[r, c] => (r, c),
+                    &[e, r, c] => (e * r, c),
+                    _ => continue,
+                };
+                let row_bytes = cols * elem_bytes;
+                if row_bytes == 0 || cols == 0 {
+                    continue;
+                }
+                let avail_bytes = file_len.saturating_sub(data_start + w_info.data_offsets.0);
+                let total_rows = (avail_bytes / row_bytes).min(header_rows);
+                if total_rows == 0 {
+                    continue;
+                }
+                let bits = (elem_bytes * 8) as u32;
+                let group_size = cols;
+                let mut t_seed = Vec::with_capacity(64 + name.len());
+                t_seed.extend_from_slice(&shard_fingerprint.0);
+                t_seed.extend_from_slice(name.as_bytes());
+                t_seed.extend_from_slice(&bits.to_le_bytes());
+                t_seed.extend_from_slice(&(group_size as u32).to_le_bytes());
+                t_seed.extend_from_slice(&(top_k_rows_per_layer as u32).to_le_bytes());
+                let tensor_digest = Sha256Digest::compute(&t_seed);
+                if map.ingested_tensor_digests.contains(&tensor_digest) {
+                    summary.tensors_skipped_already_ingested += 1;
+                    continue;
+                }
+                let layer_index = name
+                    .split('.')
+                    .find_map(|seg| seg.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let k = top_k_rows_per_layer.min(total_rows).max(1);
+                let stride = (total_rows / k).max(1);
+                let mut row_buf = vec![0u8; row_bytes];
+                let mut selected_row_indices = Vec::with_capacity(k);
+                let mut minted_atom_ids = Vec::with_capacity(k);
+                let mut role_distribution = [0usize; 12];
+
+                for idx in 0..k {
+                    let r = (idx * stride).min(total_rows - 1);
+                    let w_off = data_start + w_info.data_offsets.0 + r * row_bytes;
+                    file.seek(SeekFrom::Start(w_off as u64)).map_err(|e| e.to_string())?;
+                    file.read_exact(&mut row_buf).map_err(|e| e.to_string())?;
+                    let dense_row = read_dense_row_f32(&row_buf, &w_info.dtype, cols.min(2048))?;
+                    let band_len = (dense_row.len() / 4).max(1);
+                    let mut band_e = [1e-6f32; 4];
+                    for b_idx in 0..4 {
+                        let s_i = (b_idx * band_len).min(dense_row.len());
+                        let e_i = ((b_idx + 1) * band_len).min(dense_row.len());
+                        for &v in &dense_row[s_i..e_i] {
+                            band_e[b_idx] += v * v;
+                        }
+                    }
+                    let sum_e: f32 = band_e.iter().sum();
+                    let next_op_probs: Vec<f32> = band_e.iter().map(|&e| e / sum_e).collect();
+                    let kv_floats = 64usize;
+                    let mut payload = Vec::with_capacity(kv_floats * 4);
+                    for i in 0..kv_floats {
+                        let v = dense_row.get(i % dense_row.len()).copied().unwrap_or(0.0);
+                        payload.extend_from_slice(&v.to_le_bytes());
+                    }
+                    let tap = TeacherTapRecord {
+                        shard_id: 70_000 + (receipts.len() as u64) * 1_000 + (r as u64),
+                        layer_index,
+                        hidden_state: dense_row,
+                        next_op_probs,
+                        payload,
+                    };
+                    let _shard = FrozenShard::from_tap(&tap).map_err(|e| e.to_string())?;
+                    let mut projected = self.projector.project(&tap).map_err(|e| e.to_string())?;
+                    let fisher_discount = Q32_31(projected.loss_report.teacher_entropy_bits_q32.0 >> 1);
+                    let (role, offset, cert) = Self::classify_icosahedral_well(
+                        &map.atlas,
+                        &tap.hidden_state,
+                        layer_index,
+                        total_layers_hint.max(layer_index + 1),
+                        fisher_discount,
+                    );
+                    let mode_hash = tensor_digest.0[0] as f64 / 255.0 - 0.5;
+                    let row_jitter = ((r % 31) as f64 - 15.0) * 0.0012;
+                    let well = map.atlas.well(role);
+                    let d_sph = Q32_31::from_f64(0.804_735_5);
+                    projected.tangent_h3 = [
+                        (well.unit_dir[0] * d_sph) + offset[0] + Q32_31::from_f64(mode_hash * 0.015),
+                        (well.unit_dir[1] * d_sph) + offset[1] + Q32_31::from_f64(row_jitter),
+                        (well.unit_dir[2] * d_sph) + offset[2] - Q32_31::from_f64(mode_hash * 0.011),
+                    ];
+                    let refracted = OpticalLens::refract(&projected, well.phase).map_err(|e| e.to_string())?;
+                    let (atom_id, is_novel) = map.keep_and_carve_novel_only(
+                        refracted,
+                        tap.payload,
+                        shard_fingerprint,
+                        policy,
+                    );
+                    if is_novel {
+                        summary.novel_atoms_minted += 1;
+                    } else {
+                        summary.deduplicated_atoms_coalesced += 1;
+                    }
+                let sub_stage = classify_tensor_sub_stage(name);
+                let stage_key = (layer_index, sub_stage, receipts.len());
+                let state_128: Vec<f32> = tap.hidden_state.iter().take(128).copied().collect();
+                let replace_stage = match stage_anchors.get(&stage_key) {
+                    Some((prev_cert, _, _, _)) => cert.0 > prev_cert.0,
+                    None => true,
+                };
+                if replace_stage {
+                    stage_anchors.insert(stage_key, (cert, atom_id, role, state_128.clone()));
+                }
+                if let Some(r_idx) = role.carved_index() {
+                    let lr_key = (layer_index, r_idx);
+                    let replace_lr = match layer_role_anchors.get(&lr_key) {
+                        Some((prev_cert, _, _, _)) => cert.0 > prev_cert.0,
+                        None => true,
+                    };
+                    if replace_lr {
+                        layer_role_anchors.insert(lr_key, (cert, atom_id, role, state_128));
+                    }
+                }
+                    selected_row_indices.push(r);
+                    minted_atom_ids.push(atom_id);
+                    if let Some(r_idx) = role.carved_index() {
+                        role_distribution[r_idx] += 1;
+                        summary.role_distribution[r_idx] += 1;
+                    }
+                }
+                map.ingested_tensor_digests.insert(tensor_digest);
+                let saved_bytes = ((total_rows.saturating_sub(k)) * cols * 4) as u64;
+                summary.tensors_distilled += 1;
+                summary.f32_heap_bytes_saved += saved_bytes;
+                receipts.push(QuantizedDistillationReceipt {
+                    tensor_name: name.clone(),
+                    bits,
+                    group_size,
+                    total_rows_scanned_via_scales: total_rows,
+                    top_k_rows_dequantized: k,
+                    heap_bytes_saved_vs_full_dequant: saved_bytes,
+                    minted_atom_ids,
+                    selected_row_indices,
+                    role_distribution,
+                });
+                continue;
+            }
+
             let Some(prefix) = name.strip_suffix(".weight") else {
                 continue;
             };
@@ -1111,11 +1371,22 @@ impl OpenWeightsDistillationEngine {
             let Some(s_info) = tensors.get(&scales_name) else {
                 continue;
             };
-            let Some(b_info) = tensors.get(&biases_name) else {
-                continue;
-            };
+            let b_info = tensors.get(&biases_name);
 
-            let (total_rows, packed_cols, groups_per_row) =
+            // Ensure `.scales` (and `.biases` if present) lie within the downloaded portion of the file
+            if data_start + s_info.data_offsets.1 > file_len {
+                continue;
+            }
+            if let Some(bi) = b_info {
+                if data_start + bi.data_offsets.1 > file_len {
+                    continue;
+                }
+            }
+            if data_start + w_info.data_offsets.0 >= file_len {
+                continue;
+            }
+
+            let (header_total_rows, packed_cols, groups_per_row) =
                 match (w_info.shape.as_slice(), s_info.shape.as_slice()) {
                     (&[r, pc], &[sr, gpr]) if r > 0 && gpr > 0 && r == sr => (r, pc, gpr),
                     (&[e, r, pc], &[se, sr, gpr])
@@ -1131,6 +1402,15 @@ impl OpenWeightsDistillationEngine {
             } else {
                 1usize
             };
+            let row_weight_bytes = packed_cols * word_bytes;
+            if row_weight_bytes == 0 {
+                continue;
+            }
+            let avail_w_bytes = file_len.saturating_sub(data_start + w_info.data_offsets.0);
+            let total_rows = (avail_w_bytes / row_weight_bytes).min(header_total_rows);
+            if total_rows == 0 {
+                continue;
+            }
             let word_bits = word_bytes * 8;
             let total_row_bits = packed_cols * word_bits;
 
@@ -1184,17 +1464,26 @@ impl OpenWeightsDistillationEngine {
             let screen_count = total_rows.min(max_screen_budget);
             let row_stride = (total_rows / screen_count.max(1)).max(1);
             let k = top_k_rows_per_layer.min(screen_count).max(1);
-            let scale_elem_bytes = if s_info.dtype == "F32" {
-                4usize
-            } else {
-                2usize
+            let scale_elem_bytes = match s_info.dtype.as_str() {
+                "F32" => 4usize,
+                "U8" => 1usize,
+                _ => 2usize,
             };
             let row_scale_bytes = groups_per_row * scale_elem_bytes;
+            let bias_elem_bytes = b_info
+                .map(|bi| match bi.dtype.as_str() {
+                    "F32" => 4usize,
+                    "U8" => 1usize,
+                    _ => 2usize,
+                })
+                .unwrap_or(2usize);
+            let row_bias_bytes = groups_per_row * bias_elem_bytes;
 
             // Read the full or prefix scale/bias slab covering the stratified rows
             let last_screened_row = ((screen_count - 1) * row_stride).min(total_rows - 1);
             let max_scale_bytes_to_read = 256 * 1024usize; // cap contiguous read at 256 KB
             let total_scale_bytes = (last_screened_row + 1) * row_scale_bytes;
+            let total_bias_bytes = (last_screened_row + 1) * row_bias_bytes;
 
             let max_q = ((1u32 << bits) - 1) as f64;
             let q_mean = 0.5 * max_q;
@@ -1204,25 +1493,39 @@ impl OpenWeightsDistillationEngine {
             let mut cached_s_rows: Vec<Vec<u8>> = Vec::with_capacity(screen_count);
             let mut cached_b_rows: Vec<Vec<u8>> = Vec::with_capacity(screen_count);
 
-            if total_scale_bytes <= max_scale_bytes_to_read {
+            if total_scale_bytes <= max_scale_bytes_to_read
+                && total_bias_bytes <= max_scale_bytes_to_read
+            {
                 let mut s_slab = vec![0u8; total_scale_bytes];
                 file.seek(SeekFrom::Start((data_start + s_info.data_offsets.0) as u64))
                     .map_err(|e| e.to_string())?;
                 file.read_exact(&mut s_slab).map_err(|e| e.to_string())?;
 
-                let mut b_slab = vec![0u8; total_scale_bytes];
-                file.seek(SeekFrom::Start((data_start + b_info.data_offsets.0) as u64))
-                    .map_err(|e| e.to_string())?;
-                file.read_exact(&mut b_slab).map_err(|e| e.to_string())?;
+                let b_slab = if let Some(bi) = b_info {
+                    let mut buf = vec![0u8; total_bias_bytes];
+                    file.seek(SeekFrom::Start((data_start + bi.data_offsets.0) as u64))
+                        .map_err(|e| e.to_string())?;
+                    file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+                    Some(buf)
+                } else {
+                    None
+                };
 
                 for idx in 0..screen_count {
                     let r = (idx * row_stride).min(total_rows - 1);
                     let s_row = s_slab[r * row_scale_bytes..(r + 1) * row_scale_bytes].to_vec();
-                    let b_row = b_slab[r * row_scale_bytes..(r + 1) * row_scale_bytes].to_vec();
+                    let b_row = b_slab
+                        .as_ref()
+                        .map(|bs| bs[r * row_bias_bytes..(r + 1) * row_bias_bytes].to_vec())
+                        .unwrap_or_else(|| vec![0u8; groups_per_row * 2]);
                     let mut energy_est = 0.0f64;
                     for g in 0..groups_per_row {
                         let s = read_quant_scale_f64(&s_row, &s_info.dtype, g)?;
-                        let b = read_quant_scale_f64(&b_row, &b_info.dtype, g)?;
+                        let b = if let Some(bi) = b_info {
+                            read_quant_scale_f64(&b_row, &bi.dtype, g)?
+                        } else {
+                            -q_mean * s
+                        };
                         let gm = q_mean * s + b;
                         let gv = q_var * s * s;
                         energy_est += (group_size as f64) * (gm * gm + gv);
@@ -1234,7 +1537,7 @@ impl OpenWeightsDistillationEngine {
             } else {
                 // Stratified seek across large 3D MoE / vocab tensors
                 let mut s_row = vec![0u8; row_scale_bytes];
-                let mut b_row = vec![0u8; row_scale_bytes];
+                let mut b_row = vec![0u8; row_bias_bytes];
                 for idx in 0..screen_count {
                     let r = (idx * row_stride).min(total_rows - 1);
                     file.seek(SeekFrom::Start(
@@ -1243,23 +1546,35 @@ impl OpenWeightsDistillationEngine {
                     .map_err(|e| e.to_string())?;
                     file.read_exact(&mut s_row).map_err(|e| e.to_string())?;
 
-                    file.seek(SeekFrom::Start(
-                        (data_start + b_info.data_offsets.0 + r * row_scale_bytes) as u64,
-                    ))
-                    .map_err(|e| e.to_string())?;
-                    file.read_exact(&mut b_row).map_err(|e| e.to_string())?;
+                    if let Some(bi) = b_info {
+                        file.seek(SeekFrom::Start(
+                            (data_start + bi.data_offsets.0 + r * row_bias_bytes) as u64,
+                        ))
+                        .map_err(|e| e.to_string())?;
+                        file.read_exact(&mut b_row).map_err(|e| e.to_string())?;
+                    } else {
+                        b_row.fill(0);
+                    }
 
                     let mut energy_est = 0.0f64;
                     for g in 0..groups_per_row {
                         let s = read_quant_scale_f64(&s_row, &s_info.dtype, g)?;
-                        let b = read_quant_scale_f64(&b_row, &b_info.dtype, g)?;
+                        let b = if let Some(bi) = b_info {
+                            read_quant_scale_f64(&b_row, &bi.dtype, g)?
+                        } else {
+                            -q_mean * s
+                        };
                         let gm = q_mean * s + b;
                         let gv = q_var * s * s;
                         energy_est += (group_size as f64) * (gm * gm + gv);
                     }
                     row_scores.push((energy_est, idx));
                     cached_s_rows.push(s_row.clone());
-                    cached_b_rows.push(b_row.clone());
+                    cached_b_rows.push(if b_info.is_some() {
+                        b_row.clone()
+                    } else {
+                        vec![0u8; groups_per_row * 2]
+                    });
                 }
             }
 
@@ -1269,7 +1584,6 @@ impl OpenWeightsDistillationEngine {
                     .then_with(|| a.1.cmp(&b.1))
             });
 
-            let row_weight_bytes = packed_cols * word_bytes;
             let mut single_row_w = vec![0u8; row_weight_bytes];
             let mut selected_row_indices = Vec::with_capacity(k);
             let mut minted_atom_ids = Vec::with_capacity(k);
@@ -1286,19 +1600,38 @@ impl OpenWeightsDistillationEngine {
                 let s_slice = &cached_s_rows[idx];
                 let b_slice = &cached_b_rows[idx];
 
-                let dequant_row = crate::metal::dequantize_row_zero_copy(
+                let converted_s: Option<Vec<u8>> = if s_info.dtype == "U8" {
+                    Some(convert_u8_scales_to_bf16_bytes(s_slice))
+                } else {
+                    None
+                };
+                let (eff_s_slice, eff_s_dtype) = match &converted_s {
+                    Some(buf) => (buf.as_slice(), "BF16"),
+                    None => (s_slice.as_slice(), s_info.dtype.as_str()),
+                };
+                let eff_b_dtype = b_info.map(|bi| bi.dtype.as_str()).unwrap_or("BF16");
+
+                let mut dequant_row = crate::metal::dequantize_row_zero_copy(
                     &single_row_w,
                     &w_info.dtype,
-                    s_slice,
-                    &s_info.dtype,
+                    eff_s_slice,
+                    eff_s_dtype,
                     b_slice,
-                    &b_info.dtype,
+                    eff_b_dtype,
                     1.0,
                     bits,
                     group_size,
                     0,
                     cols,
                 )?;
+                // Center symmetric MXFP4 / bias-free rows around zero (`(q - q_mean) * s`)
+                if b_info.is_none() {
+                    for (col_idx, val) in dequant_row.iter_mut().enumerate() {
+                        let g = (col_idx / group_size).min(groups_per_row - 1);
+                        let s = read_quant_scale_f64(s_slice, &s_info.dtype, g).unwrap_or(0.0) as f32;
+                        *val -= (q_mean as f32) * s;
+                    }
+                }
 
                 let band_groups = (groups_per_row / 4).max(1);
                 let mut band_e = [1e-6f32; 4];
@@ -1379,13 +1712,25 @@ impl OpenWeightsDistillationEngine {
 
                 // Track the highest-certainty mode for each transformer layer_index to synthesize
                 // cross-layer 1-cell reasoning transitions (`Layer l -> Layer l+1`)
-                let replace_anchor = match layer_anchors.get(&layer_index) {
+                let sub_stage = classify_tensor_sub_stage(name);
+                let stage_key = (layer_index, sub_stage, receipts.len());
+                let state_128: Vec<f32> = tap.hidden_state.iter().take(128).copied().collect();
+                let replace_stage = match stage_anchors.get(&stage_key) {
                     Some((prev_cert, _, _, _)) => cert.0 > prev_cert.0,
                     None => true,
                 };
-                if replace_anchor {
-                    let state_128: Vec<f32> = tap.hidden_state.iter().take(128).copied().collect();
-                    layer_anchors.insert(layer_index, (cert, atom_id, role, state_128));
+                if replace_stage {
+                    stage_anchors.insert(stage_key, (cert, atom_id, role, state_128.clone()));
+                }
+                if let Some(r_idx) = role.carved_index() {
+                    let lr_key = (layer_index, r_idx);
+                    let replace_lr = match layer_role_anchors.get(&lr_key) {
+                        Some((prev_cert, _, _, _)) => cert.0 > prev_cert.0,
+                        None => true,
+                    };
+                    if replace_lr {
+                        layer_role_anchors.insert(lr_key, (cert, atom_id, role, state_128));
+                    }
                 }
 
                 selected_row_indices.push(r);
@@ -1414,11 +1759,11 @@ impl OpenWeightsDistillationEngine {
             });
         }
 
-        // Step 3: Synthesize cross-layer 1-cell reasoning arcs (`Layer l -> Layer l'`, Wigner transport + Native MLIR)
-        if layer_anchors.len() >= 2 {
-            let ordered: Vec<(usize, Q32_31, AtomId, RoleId, Vec<f32>)> = layer_anchors
+        // Step 3A: Synthesize intra-layer and cross-layer 1-cell reasoning arcs across all stage anchors
+        if stage_anchors.len() >= 2 {
+            let ordered: Vec<((usize, usize, usize), Q32_31, AtomId, RoleId, Vec<f32>)> = stage_anchors
                 .into_iter()
-                .map(|(l, (c, a, r, s))| (l, c, a, r, s))
+                .map(|(k, (c, a, r, s))| (k, c, a, r, s))
                 .collect();
             let states: Vec<Vec<f32>> = ordered.iter().map(|x| x.4.clone()).collect();
             let first_role = ordered[0].3;
@@ -1432,6 +1777,9 @@ impl OpenWeightsDistillationEngine {
             for step in 0..ordered.len() - 1 {
                 let (_, _, from_atom, from_role, _) = ordered[step];
                 let (_, to_cert, to_atom, to_role, _) = ordered[step + 1];
+                if from_atom == to_atom {
+                    continue;
+                }
                 let Some(from_lor) = map.global_atom(from_atom).map(|a| a.lorentz) else {
                     continue;
                 };
@@ -1469,6 +1817,79 @@ impl OpenWeightsDistillationEngine {
                     summary.novel_reasoning_arcs_minted += 1;
                 } else {
                     summary.deduplicated_reasoning_arcs += 1;
+                }
+            }
+        }
+
+        // Step 3B: Synthesize closed-loop 2-cell Gauss-Bonnet holonomy faces (`A -> B -> C -> A`)
+        // across distinct functional role basins inside each layer!
+        let mut by_layer: std::collections::BTreeMap<usize, Vec<(Q32_31, AtomId, RoleId, Vec<f32>)>> =
+            std::collections::BTreeMap::new();
+        for ((l_idx, _r_idx), entry) in layer_role_anchors {
+            by_layer.entry(l_idx).or_default().push(entry);
+        }
+        let base_chain_id = u64::from_le_bytes(shard_fingerprint.0[0..8].try_into().unwrap());
+        for (l_idx, roles_in_layer) in by_layer {
+            if roles_in_layer.len() < 3 {
+                continue;
+            }
+            for win_idx in 0..roles_in_layer.len() {
+                let (_, atom_a, role_a, state_a) = &roles_in_layer[win_idx];
+                let (_, atom_b, role_b, state_b) = &roles_in_layer[(win_idx + 1) % roles_in_layer.len()];
+                let (cert_c, atom_c, role_c, state_c) = &roles_in_layer[(win_idx + 2) % roles_in_layer.len()];
+                let (Some(lor_a), Some(lor_b), Some(lor_c)) = (
+                    map.global_atom(*atom_a).map(|a| a.lorentz),
+                    map.global_atom(*atom_b).map(|a| a.lorentz),
+                    map.global_atom(*atom_c).map(|a| a.lorentz),
+                ) else {
+                    continue;
+                };
+                // Evaluate 2-cell Gauss-Bonnet hyperbolic triangle holonomy across (lor_a, lor_b, lor_c)
+                let w_ab = HyperbolicHolonomyEngine::transport_frame_hop(&lor_a, &lor_b, &IDENTITY_FRAME_Q32);
+                let w_bc = HyperbolicHolonomyEngine::transport_frame_hop(&lor_b, &lor_c, &w_ab);
+                let w_ca = HyperbolicHolonomyEngine::transport_frame_hop(&lor_c, &lor_a, &w_bc);
+                let tri_states = vec![state_a.clone(), state_b.clone(), state_c.clone(), state_a.clone()];
+                let tri_mlir = GeodesicMlirDecoder::decode_from_hidden_states(mlir_catalog, *role_a, &tri_states).ok();
+                let two_cell_chain_id = base_chain_id
+                    .wrapping_add(0x2CE1_1000_0000_0000)
+                    .wrapping_add(((l_idx as u64) << 16) | (win_idx as u64));
+                let edges = [
+                    (*atom_a, *role_a, *atom_b, *role_b, w_ab, 0usize),
+                    (*atom_b, *role_b, *atom_c, *role_c, w_bc, 1usize),
+                    (*atom_c, *role_c, *atom_a, *role_a, w_ca, 2usize),
+                ];
+                for (f_atom, f_role, t_atom, t_role, w_frame, e_idx) in edges {
+                    if f_atom == t_atom {
+                        continue;
+                    }
+                    let Some(fl) = map.global_atom(f_atom).map(|a| a.lorentz) else { continue };
+                    let Some(tl) = map.global_atom(t_atom).map(|a| a.lorentz) else { continue };
+                    let cosh_act = OpticalLens::lorentz_inner_product_wide(&fl, &tl);
+                    let op_id = tri_mlir
+                        .as_ref()
+                        .and_then(|d| d.block.instructions.get(e_idx + 1))
+                        .map(|inst| inst.op_id)
+                        .unwrap_or(MlirOpId(mlir_catalog.base_vocab_size));
+                    let (_arc_id, is_novel_arc) =
+                        map.record_novel_reasoning_arc(DistilledReasoningArc {
+                            arc_id: 0,
+                            chain_id: two_cell_chain_id,
+                            step_index: 1000 + win_idx * 3 + e_idx,
+                            from_atom: f_atom,
+                            to_atom: t_atom,
+                            from_role: f_role,
+                            to_role: t_role,
+                            cosh_action_q32: cosh_act,
+                            wigner_frame: w_frame,
+                            compiled_mlir_op: op_id,
+                            teacher_certainty_q32: *cert_c,
+                            origin_model_fingerprint: shard_fingerprint,
+                        });
+                    if is_novel_arc {
+                        summary.novel_reasoning_arcs_minted += 1;
+                    } else {
+                        summary.deduplicated_reasoning_arcs += 1;
+                    }
                 }
             }
         }
@@ -1633,28 +2054,31 @@ fn load_checkpoint_quant_overrides(
     let mut map = std::collections::BTreeMap::new();
     let mut default_gs = None;
     let mut total_layers = 64usize;
-    let Some(dir) = parent_dir else {
+    let Some(start_dir) = parent_dir else {
         return (map, default_gs, total_layers);
     };
 
-    // 1. Check optiq_metadata.json (e.g. Qwen3.6-35B-A3B-OptiQ-4bit)
-    let optiq_path = dir.join("optiq_metadata.json");
-    if let Ok(text) = std::fs::read_to_string(&optiq_path) {
-        default_gs = Some(64);
-        total_layers = 40;
-        parse_nested_quant_blocks(&text, &mut map);
-    }
+    for dir in start_dir.ancestors().take(5) {
+        // 1. Check optiq_metadata.json (e.g. Qwen3.6-35B-A3B-OptiQ-4bit)
+        let optiq_path = dir.join("optiq_metadata.json");
+        if let Ok(text) = std::fs::read_to_string(&optiq_path) {
+            default_gs = Some(64);
+            total_layers = 40;
+            parse_nested_quant_blocks(&text, &mut map);
+        }
 
-    // 2. Check config.json (e.g. Muse-Glimmer-q4km-gs128-MLX)
-    let cfg_path = dir.join("config.json");
-    if let Ok(text) = std::fs::read_to_string(&cfg_path) {
-        if let Some(nl) = extract_json_usize_scalar(&text, "\"num_hidden_layers\"") {
-            total_layers = nl;
+        // 2. Check config.json (e.g. Muse-Glimmer-q4km-gs128-MLX, DeepSeek-V4-Pro-4bit)
+        let cfg_path = dir.join("config.json");
+        if let Ok(text) = std::fs::read_to_string(&cfg_path) {
+            if let Some(nl) = extract_json_usize_scalar(&text, "\"num_hidden_layers\"") {
+                total_layers = nl;
+            }
+            if default_gs.is_none() {
+                default_gs = extract_json_usize_scalar(&text, "\"group_size\"");
+            }
+            parse_nested_quant_blocks(&text, &mut map);
+            break;
         }
-        if default_gs.is_none() {
-            default_gs = extract_json_usize_scalar(&text, "\"group_size\"");
-        }
-        parse_nested_quant_blocks(&text, &mut map);
     }
 
     (map, default_gs, total_layers)

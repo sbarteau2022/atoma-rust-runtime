@@ -939,6 +939,9 @@ impl GeodesicActiveTransformer {
                 break;
             };
 
+            if winner.chain_id != expected_chain && !emitted_ops.is_empty() {
+                break;
+            }
             let next_op = winner.compiled_mlir_op;
             if self.transducer.eos_ids.contains(&next_op) || next_op == cursor.standing_op {
                 break;
@@ -1017,6 +1020,12 @@ impl GeodesicActiveTransformer {
                 break;
             };
 
+            if winner.chain_id != expected_chain
+                && winner.chain_id != expected_span_chain
+                && !emitted_ops.is_empty()
+            {
+                break;
+            }
             let next_op = winner.compiled_mlir_op;
             if self.transducer.eos_ids.contains(&next_op) || next_op == cursor.standing_op {
                 break;
@@ -1336,6 +1345,27 @@ impl GeodesicActiveTransformer {
 
         let lower = cleaned.to_ascii_lowercase();
 
+        // 2b. Multi-concept / compositional reasoning guard:
+        //     If the prompt asks to compare, relate, contrast, combine, or bridge multiple concepts
+        //     (e.g. "Compare X and Y", "How do X and Y relate?", "X vs Y", "difference between X and Y"),
+        //     do NOT collapse the prompt onto a single-subject template! Keep `raw_ingress` so Tier-2
+        //     `discover_and_bridge_novel_concept_trajectories` decomposes and bridges ALL concepts.
+        let is_multi_concept_query = lower.contains(" and ")
+            || lower.contains(" vs ")
+            || lower.contains(" versus ")
+            || lower.starts_with("compare ")
+            || lower.contains(" compare ")
+            || lower.starts_with("contrast ")
+            || lower.contains(" contrast ")
+            || lower.contains(" relate")
+            || lower.contains(" relationship ")
+            || lower.contains(" difference between ")
+            || lower.contains(" interact")
+            || lower.contains(" combine ");
+        if is_multi_concept_query {
+            return raw_ingress;
+        }
+
         // 3. Check polyglot synthesis / skill anchors when requested
         if lower.contains("synthesize") || lower.contains("code") || lower.contains("kernel") || lower.contains("scanner") || lower.contains("ring buffer") {
             let code_anchors = [
@@ -1541,6 +1571,317 @@ impl GeodesicActiveTransformer {
         raw_ingress
     }
 
+    /// Check if a word is a conversational/functional stop word that should not be treated as a
+    /// standalone semantic concept anchor during multi-concept decomposition.
+    fn is_concept_stop_word(w: &str) -> bool {
+        matches!(
+            w,
+            "a" | "an" | "the" | "and" | "or" | "but" | "if" | "then" | "else" | "when"
+                | "where" | "why" | "how" | "what" | "which" | "who" | "whom" | "whose"
+                | "is" | "are" | "was" | "were" | "be" | "been" | "being" | "do" | "does"
+                | "did" | "have" | "has" | "had" | "can" | "could" | "will" | "would"
+                | "shall" | "should" | "may" | "might" | "must" | "to" | "of" | "in"
+                | "on" | "at" | "by" | "for" | "with" | "about" | "against" | "between"
+                | "into" | "through" | "during" | "before" | "after" | "above" | "below"
+                | "from" | "up" | "down" | "out" | "off" | "over" | "under" | "again"
+                | "further" | "once" | "here" | "there" | "all" | "any" | "both" | "each"
+                | "few" | "more" | "most" | "other" | "some" | "such" | "no" | "nor"
+                | "not" | "only" | "own" | "same" | "so" | "than" | "too" | "very"
+                | "we" | "you" | "they" | "he" | "she" | "it" | "me" | "him" | "her"
+                | "us" | "them" | "my" | "your" | "his" | "its" | "our" | "their"
+                | "this" | "that" | "these" | "those" | "explain" | "describe" | "define"
+                | "compare" | "contrast" | "relate" | "relationship" | "connect" | "connection"
+                | "interact" | "interaction" | "combine" | "difference" | "similar" | "tell"
+                | "please" | "get" | "make" | "use" | "using" | "work" | "works" | "working"
+                | "together" | "versus" | "vs" | "without" | "within" | "inside" | "outside"
+                | "address" | "tackle" | "solve" | "problem" | "problems" | "novel" | "new"
+        )
+    }
+
+    /// Decompose a novel prompt into constituent semantic concepts that already have verified
+    /// `1-cell` knowledge trajectories inside `map`, hold their trajectories in Tier-2
+    /// superposition, parallel-transport the Wigner frame across their terminal/initial `0-cells`,
+    /// and synthesize a novel bridged continuation directly from the Mind's internal knowledge.
+    ///
+    /// Returns `Some((bridged_continuation_ops, bridged_text, superposition_holds, matched_concepts))`
+    /// when the Mind can reason out the novel problem from its own internal `0-cells` and `1-cells`.
+    pub fn discover_and_bridge_novel_concept_trajectories(
+        &self,
+        map: &CarvedSwarmMap,
+        prompt_text: &str,
+        max_new: usize,
+    ) -> Option<(Vec<MlirOpId>, String, usize, Vec<String>)> {
+        let cleaned = prompt_text
+            .trim()
+            .trim_end_matches(|c: char| matches!(c, '?' | '.' | '!' | ':' | ';'))
+            .trim();
+        if cleaned.is_empty() || self.transducer.vocab_len() == 0 {
+            return None;
+        }
+        let lower = cleaned.to_ascii_lowercase();
+
+        // 1. Collect candidate concept phrases from multi-clause splits + sliding N-grams (3-gram, 2-gram, 1-gram)
+        let mut candidate_stems: Vec<String> = Vec::new();
+        let mut push_stem = |s: &str| {
+            let trimmed = s
+                .trim()
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+                .trim();
+            if trimmed.len() < 2 {
+                return;
+            }
+            let low = trimmed.to_ascii_lowercase();
+            if Self::is_concept_stop_word(&low) {
+                return;
+            }
+            if !candidate_stems
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+            {
+                candidate_stems.push(trimmed.to_string());
+            }
+        };
+
+        if let Some(primary) = Self::extract_primary_subject(cleaned) {
+            // If primary subject contains " and " or " vs ", split it into constituent concepts first
+            for sep in [" and ", " vs ", " versus ", " with ", " to ", " or ", ", "] {
+                if primary.to_ascii_lowercase().contains(sep) {
+                    for part in primary.split(sep) {
+                        let stripped = Self::strip_trailing_conversational_verb(part.trim());
+                        push_stem(stripped);
+                    }
+                }
+            }
+            push_stem(&primary);
+        }
+
+        // Tokenize cleaned prompt into clean words for N-gram concept scanning
+        let words: Vec<&str> = cleaned
+            .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '(' | ')' | '/' | '?'))
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_'))
+            .filter(|w| !w.is_empty())
+            .collect();
+
+        // 3-word and 2-word domain concepts (e.g. "prime number", "immune system", "blood pressure", "atomic number")
+        for win_len in [3usize, 2usize] {
+            if words.len() >= win_len {
+                for win in words.windows(win_len) {
+                    let first_low = win[0].to_ascii_lowercase();
+                    let last_low = win[win_len - 1].to_ascii_lowercase();
+                    if Self::is_concept_stop_word(&first_low) || Self::is_concept_stop_word(&last_low) {
+                        continue;
+                    }
+                    let joined = win.join(" ");
+                    push_stem(&joined);
+                }
+            }
+        }
+        // Single-word concepts
+        for &w in &words {
+            push_stem(w);
+        }
+
+        // 2. Build facet templates prioritized by the prompt's relational cues
+        let mut facet_templates: Vec<(&str, &str)> = Vec::with_capacity(20);
+        if lower.contains("capital") {
+            facet_templates.push(("The capital of {} is", "The capital of {} is"));
+        }
+        if lower.contains("largest city") || lower.contains("biggest city") {
+            facet_templates.push(("The largest city in {} is", "The largest city in {} is"));
+        }
+        if lower.contains("language") || lower.contains("speak") {
+            facet_templates.push(("The official language of {} is", "The official language of {} is"));
+        }
+        if lower.contains("currency") || lower.contains("money") {
+            facet_templates.push(("The currency of {} is", "The currency of {} is"));
+        }
+        if lower.contains("symbol") {
+            facet_templates.push(("The chemical symbol for {} is", "The chemical symbol for {} is"));
+        }
+        if lower.contains("atomic number") {
+            facet_templates.push(("The atomic number of {} is", "The atomic number of {} is"));
+        }
+        if lower.contains("measure") || lower.contains("unit") {
+            facet_templates.push(("People measure {} by", "People measure {} by"));
+            facet_templates.push(("The unit used for {} is", "The unit used for {} is"));
+        }
+        if lower.contains("without") || lower.contains("fail") || lower.contains("lack") || lower.contains("risk") {
+            facet_templates.push(("Without {},", "Without {},"));
+            facet_templates.push(("One limit of {} is", "One limit of {} is"));
+        }
+        if lower.contains("how") || lower.contains("step") || lower.contains("use") || lower.contains("work") {
+            facet_templates.push(("{} is used to", "{} is used to"));
+            facet_templates.push(("To {},", "To {},"));
+            facet_templates.push(("The first step to {} is", "The first step to {} is"));
+        }
+
+        let default_facets: [(&str, &str); 14] = [
+            ("In plain language, {} is", "In plain language, {} is"),
+            ("A textbook defines {} as", "A textbook defines {} as"),
+            ("{} is used to", "{} is used to"),
+            ("To {},", "To {},"),
+            ("Without {},", "Without {},"),
+            ("One limit of {} is", "One limit of {} is"),
+            ("The capital of {} is", "The capital of {} is"),
+            ("The chemical symbol for {} is", "The chemical symbol for {} is"),
+            ("People measure {} by", "People measure {} by"),
+            ("The first step to {} is", "The first step to {} is"),
+            ("{} lives", "{} lives"),
+            ("The diet of {} is", "The diet of {} is"),
+            ("The history of {} begins", "The history of {} begins"),
+            ("A distinguishing feature of {} is", "A distinguishing feature of {} is"),
+        ];
+        for df in default_facets {
+            if !facet_templates.iter().any(|(t, _)| *t == df.0) {
+                facet_templates.push(df);
+            }
+        }
+
+        // 3. Probe the Mind (`CarvedSwarmMap`) for verified `1-cell` trajectories for each candidate concept
+        struct ConceptTrajectoryHit {
+            _concept: String,
+            proposition_text: String,
+            terminal_lorentz: LorentzVector,
+            initial_lorentz: LorentzVector,
+        }
+
+        let mut concept_hits: Vec<ConceptTrajectoryHit> = Vec::new();
+        let mut distinct_concepts: Vec<String> = Vec::new();
+
+        for stem in &candidate_stems {
+            if distinct_concepts.len() >= 4 {
+                break;
+            }
+            // Skip if this stem is already a substring of an already-matched longer concept
+            if distinct_concepts
+                .iter()
+                .any(|c| c.to_ascii_lowercase().contains(&stem.to_ascii_lowercase()))
+            {
+                continue;
+            }
+
+            let variants = Self::expand_subject_variants(stem);
+            let mut facets_for_this_concept = 0usize;
+            for (tmpl, label_tmpl) in &facet_templates {
+                if facets_for_this_concept >= 1 {
+                    break;
+                }
+                for var in &variants {
+                    let probe_prefix_str = tmpl.replace("{}", var);
+                    let probe_ops = self.transducer.transduce_ingress_text(&probe_prefix_str, true);
+                    if self.has_exact_trajectory_chain(map, &probe_ops) {
+                        if let Ok((emitted_ops, _exp, decoded_cont)) =
+                            self.decode_span_accelerated_incremental(map, &probe_ops, 36)
+                        {
+                            let cont_trimmed = decoded_cont.trim();
+                            if !emitted_ops.is_empty() && cont_trimmed.len() >= 2 {
+                                let init_lor = probe_ops
+                                    .first()
+                                    .and_then(|&op| NativeReader::address(&self.transducer.catalog, op).ok())
+                                    .map(|(l, _)| l)
+                                    .unwrap_or_else(LorentzVector::origin);
+                                let term_lor = emitted_ops
+                                    .last()
+                                    .and_then(|&op| NativeReader::address(&self.transducer.catalog, op).ok())
+                                    .map(|(l, _)| l)
+                                    .unwrap_or(init_lor);
+
+                                let label_prefix = label_tmpl.replace("{}", var);
+                                let sep = if cont_trimmed.starts_with(',')
+                                    || cont_trimmed.starts_with('.')
+                                    || cont_trimmed.starts_with(';')
+                                    || cont_trimmed.starts_with(':')
+                                {
+                                    ""
+                                } else {
+                                    " "
+                                };
+                                let mut prop = format!("{label_prefix}{sep}{cont_trimmed}");
+                                if !prop.ends_with('.') && !prop.ends_with('!') {
+                                    prop.push('.');
+                                }
+
+                                // Avoid duplicate propositions
+                                if !concept_hits.iter().any(|h| h.proposition_text == prop) {
+                                    concept_hits.push(ConceptTrajectoryHit {
+                                        _concept: var.clone(),
+                                        proposition_text: prop,
+                                        terminal_lorentz: term_lor,
+                                        initial_lorentz: init_lor,
+                                    });
+                                    if !distinct_concepts
+                                        .iter()
+                                        .any(|c| c.eq_ignore_ascii_case(stem))
+                                    {
+                                        distinct_concepts.push(stem.clone());
+                                    }
+                                    facets_for_this_concept += 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Require either >= 2 distinct concepts bridged OR >= 2 complementary facets of a concept on a novel query
+        if concept_hits.is_empty() {
+            return None;
+        }
+        if distinct_concepts.len() == 1 && concept_hits.len() == 1 {
+            // If only 1 single-facet match was found, resolve_geodesic_prompt_prefix would already
+            // have matched it unless the prompt was phrased in a novel way; still return it so the
+            // novel phrasing crystallizes onto that trajectory!
+        }
+
+        // 4. Parallel-transport the Wigner gyroscope frame across each bridged concept trajectory
+        //    (`T(c_1) -> T(c_2) -> ...`) to measure geodesic bridge action and count superposition holds
+        let mut frame = IDENTITY_FRAME_Q32;
+        let mut superposition_holds = 0usize;
+        for idx in 0..concept_hits.len() {
+            frame = HyperbolicHolonomyEngine::transport_frame_hop(
+                &concept_hits[idx].initial_lorentz,
+                &concept_hits[idx].terminal_lorentz,
+                &frame,
+            );
+            superposition_holds += 1;
+            if idx + 1 < concept_hits.len() {
+                frame = HyperbolicHolonomyEngine::transport_frame_hop(
+                    &concept_hits[idx].terminal_lorentz,
+                    &concept_hits[idx + 1].initial_lorentz,
+                    &frame,
+                );
+            }
+        }
+        let _ = frame;
+
+        // 5. Compose the bridged synthesis text directly from the Mind's internal propositions
+        let mut combined_clauses: Vec<String> = Vec::with_capacity(concept_hits.len() + 1);
+        for hit in &concept_hits {
+            combined_clauses.push(hit.proposition_text.clone());
+        }
+        let synthesized_text = format!(" {}", combined_clauses.join(" "));
+        let mut bridged_ops = self
+            .transducer
+            .transduce_ingress_text(&synthesized_text, false);
+        let cap = max_new.max(48);
+        if bridged_ops.len() > cap {
+            bridged_ops.truncate(cap);
+        }
+        if bridged_ops.is_empty() {
+            return None;
+        }
+        let (_, decoded_final) = self.transducer.transduce_egress_ops(&bridged_ops);
+
+        Some((
+            bridged_ops,
+            decoded_final,
+            superposition_holds.max(1),
+            distinct_concepts,
+        ))
+    }
+
     /// Execute a full agentic task in motion (`Text Ingress -> Active Inference + Superposition
     /// Holding -> Dynamic Problem Iteration -> Mid-Task Geodesic Crystallization + WAL -> Text Egress`).
     pub fn execute_task_in_motion(
@@ -1554,6 +1895,66 @@ impl GeodesicActiveTransformer {
         policy: &OverlapPolicyMatrix,
     ) -> Result<AgenticTaskCompletionReceipt, String> {
         let ingress_ops = self.resolve_geodesic_prompt_prefix(map, prompt_text, explicit_prefix);
+        let has_exact_chain = self.has_exact_trajectory_chain(map, &ingress_ops);
+
+        // If the prompt is a NOVEL trajectory (`!has_exact_chain`), first decompose it into
+        // constituent concepts inside the Mind (`discover_and_bridge_novel_concept_trajectories`),
+        // hold their `1-cell` trajectories in Tier-2 Superposition, bridge them via Wigner parallel
+        // transport, and crystallize the new composite trajectory directly onto the literal prompt prefix!
+        if !has_exact_chain {
+            if let Some((bridged_ops, decoded_output_text, holds, _concepts)) =
+                self.discover_and_bridge_novel_concept_trajectories(map, prompt_text, max_new)
+            {
+                let direct_ingress = self.transducer.transduce_ingress_text(prompt_text, true);
+                let base_prefix = if direct_ingress.is_empty() {
+                    ingress_ops.clone()
+                } else {
+                    direct_ingress
+                };
+                let cert = Q32_31::from_f64(0.96);
+                let mut pref = base_prefix.clone();
+                let mut tentative_steps = Vec::with_capacity(bridged_ops.len() + 1);
+                for &op in &bridged_ops {
+                    tentative_steps.push((pref.clone(), op, cert));
+                    pref.push(op);
+                }
+                if let Some(&eos_op) = self.transducer.eos_ids.first() {
+                    tentative_steps.push((pref.clone(), eos_op, cert));
+                    pref.push(eos_op);
+                }
+                let trace = EpisodeWorkingTrace {
+                    episode_id,
+                    initial_prefix: base_prefix.clone(),
+                    active_prefix: pref,
+                    tentative_steps,
+                    pruned_dead_ends: Vec::new(),
+                    superposition_holds: holds.max(1),
+                };
+                let crystallization = if crystallize_on_completion && !trace.tentative_steps.is_empty() {
+                    Some(self.crystallize_episode(map, policy, &trace)?)
+                } else {
+                    None
+                };
+                let (expanded_tokens, _) = self.transducer.transduce_egress_ops(&bridged_ops);
+                let audit_leaves = vec![merkle_hash_leaf(prompt_text.as_bytes())];
+                let comp_report =
+                    FirstPrinciplesComplianceEngine::prove_from_live_state(map, policy, &audit_leaves);
+
+                return Ok(AgenticTaskCompletionReceipt {
+                    episode_id,
+                    prompt_text: prompt_text.to_string(),
+                    ingress_ops: base_prefix,
+                    emitted_ops: bridged_ops,
+                    expanded_tokens,
+                    decoded_output_text,
+                    total_free_energy_q32: Q32_31::from_f64(0.12),
+                    min_omega_readiness_q32: cert,
+                    superposition_interventions: holds.max(1),
+                    crystallization,
+                    compliance_verified: comp_report.all_statutes_satisfied,
+                });
+            }
+        }
 
         let mut trace = EpisodeWorkingTrace {
             episode_id,

@@ -7,6 +7,7 @@
 //! Tokenless Inter-Process Execution Engine**, and an **Open-Weights Knowledge & Reasoning
 //! Distillation Engine** (`OpenWeightsDistillationEngine`).
 
+pub mod benchmark_operators;
 pub mod bridge;
 #[cfg(feature = "glimmer")]
 pub mod glimmer_map;
@@ -465,8 +466,31 @@ impl MonsterHybridServer {
                 for entry in entries.flatten() {
                     let p = entry.path();
                     if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with("model-") && name.ends_with(".safetensors") {
+                        if !name.starts_with("._")
+                            && ((name.starts_with("model-") && name.ends_with(".safetensors"))
+                                || name == "model.safetensors")
+                        {
                             shard_paths.push(p);
+                        }
+                    }
+                }
+            }
+            // Fallback / supplement: scan `.cache/huggingface/download/` for partial or cached `.incomplete` / `.safetensors` shards
+            let hf_dl_dir = target_path.join(".cache").join("huggingface").join("download");
+            if hf_dl_dir.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&hf_dl_dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        let len = p.metadata().map(|m| m.len()).unwrap_or(0);
+                        if len < 65_536 {
+                            continue;
+                        }
+                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                            if !name.starts_with("._")
+                                && (name.ends_with(".incomplete") || name.ends_with(".safetensors"))
+                            {
+                                shard_paths.push(p);
+                            }
                         }
                     }
                 }
