@@ -1,0 +1,6 @@
+# Pin the toolchain used by every contributor and by CI.
+# Edition 2024 (used by atoma_immune / atoma_orchestrator / core_lm) requires
+# Rust >= 1.85; 1.88 is chosen as a known-good stable baseline.
+[toolchain]
+channel = "1.88.0"
+components = ["rustfmt", "clippy"]

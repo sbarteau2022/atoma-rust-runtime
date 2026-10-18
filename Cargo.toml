@@ -1,0 +1,48 @@
+# Root Cargo workspace for the ATOMA Rust runtime.
+#
+# Unifies the previously independent crates into a single build graph so that
+# `cargo build`, `cargo test`, and `cargo clippy` work from the repository root
+# with one shared lockfile (`Cargo.lock`) and one shared `target/` directory.
+#
+# Crates:
+#   - atoma_immune      (immune_system/implementation) — Layer 3 immune system / map runtime
+#   - atoma_orchestrator (orchestrator)                — Layer 2 governor + HTTP edge
+#   - core_lm           (core_lm)                      — Native execution plane (Apple Metal; macOS only)
+#   - atoma_bridge_harness (harness/bridge)            — FLAG-01 qualification harness
+#
+# Note: `core_lm` links Apple's Metal framework and is therefore only buildable
+# on macOS. On other hosts, scope commands to the portable crates, e.g.:
+#   cargo build -p atoma_immune -p atoma_orchestrator -p atoma_bridge_harness
+
+[workspace]
+resolver = "2"
+members = [
+    "immune_system/implementation",
+    "orchestrator",
+    "core_lm",
+    "harness/bridge",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Single source of truth for shared third-party dependency versions.
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rustls = "0.23"
+rustls-pemfile = "2.2"
+fancy-regex = "0.14"
+memmap2 = "0.9"
+byteorder = "1.5"
+metal = "0.27"
+
+atoma_immune = { path = "immune_system/implementation" }
+core_lm = { path = "core_lm" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16

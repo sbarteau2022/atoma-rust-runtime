@@ -17,8 +17,69 @@ pub mod cache {
 #[path = "../../../core_lm/src/lock.rs"]
 pub mod lock;
 
+// Apple Silicon Metal / Accelerate compute backend: only compiled when the
+// `metal` feature is enabled (macOS-only dependency). Portable consumers build
+// with default features and never see this module.
+#[cfg(feature = "metal")]
 #[path = "../../../core_lm/src/metal/mod.rs"]
 pub mod metal;
+
+/// Portable fallback for row dequantization when the `metal` feature is off.
+#[cfg(not(feature = "metal"))]
+pub mod portable_dequant;
+
+/// Single-row zero-copy dequantization, dispatched to the tuned Metal/Accelerate
+/// backend (`crate::metal`) when the `metal` feature is enabled, or to the
+/// portable, bounds-checked implementation otherwise. Both paths implement the
+/// identical affine group contract `(q * s_g + b_g) * row_out_scale`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn dequantize_row_zero_copy(
+    weight_data: &[u8],
+    weight_dtype: &str,
+    scales_data: &[u8],
+    scales_dtype: &str,
+    biases_data: &[u8],
+    biases_dtype: &str,
+    row_out_scale: f32,
+    bits: u32,
+    group_size: usize,
+    row: usize,
+    cols: usize,
+) -> Result<Vec<f32>, String> {
+    #[cfg(feature = "metal")]
+    {
+        metal::dequantize_row_zero_copy(
+            weight_data,
+            weight_dtype,
+            scales_data,
+            scales_dtype,
+            biases_data,
+            biases_dtype,
+            row_out_scale,
+            bits,
+            group_size,
+            row,
+            cols,
+        )
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        portable_dequant::dequantize_row_zero_copy(
+            weight_data,
+            weight_dtype,
+            scales_data,
+            scales_dtype,
+            biases_data,
+            biases_dtype,
+            row_out_scale,
+            bits,
+            group_size,
+            row,
+            cols,
+        )
+    }
+}
 
 #[path = "../../../core_lm/src/ops.rs"]
 pub mod ops;

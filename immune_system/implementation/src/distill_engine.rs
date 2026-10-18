@@ -573,7 +573,7 @@ impl OpenWeightsDistillationEngine {
                 .out_scale
                 .and_then(|s| s.get(r).copied())
                 .unwrap_or(1.0);
-            let dequant_row = crate::metal::dequantize_row_zero_copy(
+            let dequant_row = crate::dequantize_row_zero_copy(
                 desc.weight_data,
                 desc.weight_dtype,
                 desc.scales_data,
@@ -1626,7 +1626,7 @@ impl OpenWeightsDistillationEngine {
                 };
                 let eff_b_dtype = b_info.map(|bi| bi.dtype.as_str()).unwrap_or("BF16");
 
-                let mut dequant_row = crate::metal::dequantize_row_zero_copy(
+                let mut dequant_row = crate::dequantize_row_zero_copy(
                     &single_row_w,
                     &w_info.dtype,
                     eff_s_slice,

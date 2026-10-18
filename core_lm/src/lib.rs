@@ -12,7 +12,12 @@ pub mod cache {
 pub mod glimmer_forward;
 pub mod glimmer_model;
 pub mod lock;
+// Apple Metal / MPS compute backend and its consumers (macOS only). The
+// `metal` feature is enabled by default on macOS hosts (see Cargo.toml);
+// CI on Linux builds core_lm with `--no-default-features`.
+#[cfg(feature = "metal")]
 pub mod metal;
+#[cfg(feature = "metal")]
 pub mod metal_quant;
 pub mod model_config;
 pub mod ops;

@@ -1,7 +1,43 @@
 [package]
 name = "atoma_immune"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Layer 3 Immune System, DHNG II Optical Refraction, and DHNG III 12-Around-1 Carved Silos"
 
+[features]
+default = []
+# Apple Silicon Metal / Accelerate compute backend (macOS only).
+# Off by default so `cargo build/test` works on Linux CI runners.
+metal = ["dep:metal"]
+
 [dependencies]
+metal = { workspace = true, optional = true }
+
+[[bin]]
+name = "atoma_active_transformer"
+path = "src/bin/atoma_active_transformer.rs"
+
+[[bin]]
+name = "atoma_work_engine"
+path = "src/bin/atoma_work_engine.rs"
+
+[[bin]]
+name = "collect_qwen_trajectories"
+path = "src/bin/collect_qwen_trajectories.rs"
+
+[[bin]]
+name = "compile_active_mind"
+path = "src/bin/compile_active_mind.rs"
+
+[[bin]]
+name = "merge_unified_mind"
+path = "src/bin/merge_unified_mind.rs"
+
+[[bin]]
+name = "read_mlir_native"
+path = "src/bin/read_mlir_native.rs"
+
+[[bin]]
+name = "record_mlir_trajectory"
+path = "src/bin/record_mlir_trajectory.rs"
