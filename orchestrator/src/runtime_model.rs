@@ -796,9 +796,10 @@ impl MainModelCoordinatorRuntime {
                 ];
                 let tf = phase.theta_f.to_f64() as f32;
                 let ts = phase.theta_s.to_f64() as f32;
+                let radial_amp = (1.0 + 0.04 * (pos_i as f32 + 1.0)) as f32;
                 for d in 0..x_curr.len() {
-                    let coord_mod = lx[d % 4] * 0.05 + ((d & 1) as f32 * tf + ((1 - (d & 1)) as f32) * ts) * 0.02;
-                    x_curr[d] = (x_curr[d] * 0.90 + coord_mod).clamp(-2.0, 2.0);
+                    let coord_mod = (lx[d % 4] * 0.05 + ((d & 1) as f32 * tf + ((1 - (d & 1)) as f32) * ts) * 0.02) * radial_amp;
+                    x_curr[d] = x_curr[d] + coord_mod;
                 }
             }
             if let Ok(step_rec) = iso_rt.step_token(pos_i, &x_curr, &server.swarm_map) {

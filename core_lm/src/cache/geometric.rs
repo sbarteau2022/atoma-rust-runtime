@@ -1,9 +1,11 @@
 //! Geometric Memory Map (H³/Γ × T² Replacement for KV Cache)
 //! Implements the Atom, Write, Retrieval, and Eviction Contracts.
 //!
-//! FLAG-02 & FLAG-03 Upgrades:
+//! FLAG-02, FLAG-03 & Unbounded Picard Reduction Upgrades:
 //! - Uses wide-accumulator `LorentzVector::inner_product` to prevent `Q32_31` overflow at large
 //!   hyperbolic radii.
+//! - Applies `PicardMapper::map_to_fundamental_domain` consistently in `store()`, `write()`, and
+//!   `retrieve()` when `self.use_picard` is enabled (`true` by default).
 //! - Populates deterministic non-zero `Phase` in `store()` when caller does not supply an explicit
 //!   phase, and adds `retrieve_5d()` for joint `H³ × T²` product-manifold retrieval.
 
@@ -54,6 +56,18 @@ pub struct Phase {
 }
 
 impl Phase {
+    /// Construct a `Phase` coupled with the `PhaseState` amplitude channel.
+    #[inline]
+    pub fn with_amplitude(theta_f: Q32_31, theta_s: Q32_31, amplitude: Q32_31) -> Self {
+        let amp = amplitude.to_f64();
+        let tf = theta_f.to_f64() + 0.15 * amp.sin();
+        let ts = theta_s.to_f64() + 0.15 * amp.cos();
+        Self {
+            theta_f: Q32_31::from_f64(tf),
+            theta_s: Q32_31::from_f64(ts),
+        }
+    }
+
     /// Derives a deterministic toroidal phase `(theta_f, theta_s)` from a `LorentzVector`'s
     /// spatial coordinates so `store()` never leaves `Phase` silently zeroed when `lorentz != origin`.
     #[inline]
@@ -139,19 +153,15 @@ impl GeometricMemoryMap {
         }
     }
 
-    /// Store an address that the caller already reduced. Picard is not applied again.
-    /// Populates `Phase::from_lorentz_spatial(&lorentz)` (`FLAG-03`).
+    /// Store an address, respecting `self.use_picard` (`true` by default for Picard reduction
+    /// of unbounded radii) and populating `Phase::from_lorentz_spatial(&lorentz)`.
     pub fn store(
         &mut self,
         lorentz: LorentzVector,
         payload: PayloadRef,
     ) -> Result<AtomId, MemoryError> {
-        let saved = self.use_picard;
-        self.use_picard = false;
         let phase = Phase::from_lorentz_spatial(&lorentz);
-        let result = self.write(lorentz, phase, payload);
-        self.use_picard = saved;
-        result
+        self.write(lorentz, phase, payload)
     }
 
     /// Build the vantage-point tree used by [`Self::retrieve`].
@@ -240,13 +250,19 @@ impl GeometricMemoryMap {
             return Err(MemoryError::InvalidAddress(e));
         }
 
+        let q_eff = if self.use_picard {
+            PicardMapper::map_to_fundamental_domain(query)
+        } else {
+            *query
+        };
+
         if self.index.is_some() {
-            return Ok(self.retrieve_indexed(query, top_k, exclude_query));
+            return Ok(self.retrieve_indexed(&q_eff, top_k, exclude_query));
         }
 
         let mut results = Vec::new();
         for atom in self.atoms.values() {
-            let dist = LorentzVector::inner_product(query, &atom.lorentz);
+            let dist = LorentzVector::inner_product(&q_eff, &atom.lorentz);
             results.push((dist, atom));
         }
 
@@ -255,7 +271,7 @@ impl GeometricMemoryMap {
 
         let mut final_results = Vec::new();
         for (_, atom) in results {
-            if exclude_query && atom.lorentz == *query {
+            if exclude_query && (atom.lorentz == q_eff || atom.lorentz == *query) {
                 continue;
             }
             final_results.push(atom);
@@ -276,12 +292,17 @@ impl GeometricMemoryMap {
         top_k: usize,
         exclude_query: bool,
     ) -> Result<Vec<&Atom>, MemoryError> {
+        let q_eff = if self.use_picard {
+            PicardMapper::map_to_fundamental_domain(query)
+        } else {
+            *query
+        };
         let oversample = (top_k.saturating_mul(4)).max(top_k);
-        let candidates = self.retrieve(query, oversample, exclude_query)?;
+        let candidates = self.retrieve(&q_eff, oversample, exclude_query)?;
         let mut scored: Vec<(Q32_31, &Atom)> = candidates
             .into_iter()
             .map(|atom| {
-                let h3_ip = LorentzVector::inner_product(query, &atom.lorentz);
+                let h3_ip = LorentzVector::inner_product(&q_eff, &atom.lorentz);
                 let t2_dist = query_phase.torus_distance_sq(&atom.phase);
                 // Weight T^2 phase distance by 0.25 in Q32_31 so H^3 primary topology leads
                 // and T^2 breaks ties among angularly close hyperbolic keys.
@@ -450,17 +471,16 @@ mod tests {
             Q32_31::from_f64(angle.sin()),
             Q32_31::ZERO,
         ];
-        LorentzVector::boost(
+        LorentzVector::boost_rapidity(
             &LorentzVector::origin(),
             &n,
-            Q32_31::from_f64(0.15 + i as f64 * 0.01),
+            Q32_31::from_f64(0.15 + i as f64 * 0.03),
         )
     }
 
     #[test]
     fn vptree_matches_linear_order() {
         let mut map = GeometricMemoryMap::new(80);
-        map.use_picard = false;
         let phase = Phase {
             theta_f: Q32_31::ZERO,
             theta_s: Q32_31::ZERO,
@@ -487,9 +507,12 @@ mod tests {
     }
 
     #[test]
-    fn store_populates_nonzero_phase_and_retrieve_5d_works() {
+    fn store_populates_nonzero_phase_and_retrieve_5d_works_with_picard_enabled() {
         let mut map = GeometricMemoryMap::new(32);
-        map.use_picard = false;
+        assert!(
+            map.use_picard,
+            "Picard reduction must be enabled by default"
+        );
         for i in 1..16 {
             let addr = address(i);
             let id = map.store(addr, vec![i as u8]).unwrap();

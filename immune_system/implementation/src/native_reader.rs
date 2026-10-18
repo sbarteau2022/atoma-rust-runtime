@@ -891,34 +891,34 @@ fn context(
     Ok((lor, frame))
 }
 
-/// Poincaré ball point of an unregistered ID, lifted by the integer optical map.
+/// Carrier address of an unregistered ID with phyllotaxis hyperbolic placement
+/// and `TorPhaseEncoder` amplitude-coupled phase state.
 fn token_carrier_address(id: u32) -> Result<(LorentzVector, Phase), String> {
     const GOLDEN_ANGLE: f64 = 2.399_963_229_728_653;
+    let enc = crate::geometry::torus::TorPhaseEncoder::new();
+    let (df, ds) = enc.project_increments(&id.to_le_bytes());
+    let state = enc.evolve(crate::geometry::torus::PhaseState::ZERO, df, ds);
+
     let n = (id as f64) + 1.0;
     let radius = 0.20 + 0.55 * (n * 0.618_033_988_749_895).fract();
     let theta = n * GOLDEN_ANGLE;
     let z = 0.12 * ((((id.wrapping_mul(0x9E37_79B9)) >> 16) as f64) / 65536.0 - 0.5);
     let x = radius * theta.cos();
     let y = radius * theta.sin();
-    let norm_sq = x * x + y * y + z * z;
-    let scale = if norm_sq > 0.81 {
-        (0.81 / norm_sq).sqrt()
-    } else {
-        1.0
-    };
     let ball = [
-        Q32_31::from_f64(x * scale),
-        Q32_31::from_f64(y * scale),
-        Q32_31::from_f64(z * scale),
+        Q32_31::from_f64(x),
+        Q32_31::from_f64(y),
+        Q32_31::from_f64(z),
     ];
     let lorentz = OpticalLens::ball_to_lorentz(&ball).map_err(|e| e.to_string())?;
     let theta_f = ((id % 2048) as f64) * (std::f64::consts::TAU / 2048.0) - std::f64::consts::PI;
     let theta_s = ((id / 2048) as f64).rem_euclid(2048.0) * (std::f64::consts::TAU / 2048.0)
         - std::f64::consts::PI;
-    let phase = Phase {
-        theta_f: Q32_31::from_f64(theta_f),
-        theta_s: Q32_31::from_f64(theta_s),
-    };
+    let phase = Phase::with_amplitude(
+        Q32_31::from_f64(theta_f),
+        Q32_31::from_f64(theta_s),
+        Q32_31::from_f64(state.amplitude.to_f64() * 0.02),
+    );
     Ok((lorentz, phase))
 }
 

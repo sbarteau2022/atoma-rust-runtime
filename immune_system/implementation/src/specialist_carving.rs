@@ -313,17 +313,26 @@ pub fn project_qwen_token_sketch(
                 let shard_len = meta.len();
                 if shard_len > 65_536 {
                     used_shard = true;
+                    let mut hdr_len_bytes = [0u8; 8];
+                    let data_start = if file.read_exact(&mut hdr_len_bytes).is_ok() {
+                        let hdr_len = u64::from_le_bytes(hdr_len_bytes);
+                        (8u64.saturating_add(hdr_len)).min(shard_len.saturating_sub(40_960))
+                    } else {
+                        32_768u64
+                    };
+                    let data_span = shard_len.saturating_sub(data_start + 1024).max(1024);
                     let stride = 1024u64;
                     for (t_idx, &tok) in token_ids.iter().take(24).enumerate() {
                         let qwen_tok = ((tok as u64).wrapping_mul(151_603).wrapping_add(17_389)
                             % 248_000) as u64;
                         let offset =
-                            32_768 + (qwen_tok.wrapping_mul(stride)) % (shard_len - 40_960);
+                            data_start + (qwen_tok.wrapping_mul(stride)) % data_span;
                         let mut raw = [0u8; 256];
                         if file.seek(SeekFrom::Start(offset)).is_ok()
                             && file.read_exact(&mut raw).is_ok()
                         {
-                            let weight = 1.0f32 / ((t_idx as f32) * 0.25 + 1.0);
+                            // Expanding radial weight per rotation step rather than 1/(1 + 0.25*t_idx) decay
+                            let weight = 1.0f32 + (t_idx as f32) * 0.08;
                             for (i, &b) in raw.iter().enumerate() {
                                 let val = (b as f32 - 128.0) / 128.0;
                                 let rot = (i + t_idx * 7) % 256;
@@ -345,9 +354,9 @@ pub fn project_qwen_token_sketch(
         let d0 = (digest.0[i % 32] as f32 / 255.0) - 0.5;
         let d1 = (digest.0[(i * 7 + (tok_val as usize)) % 32] as f32 / 255.0) - 0.5;
         let bit_sign = if ((tok_val >> (i % 16)) & 1) == 1 { 0.25f32 } else { -0.25f32 };
-        let algebraic_proj = (d0 * 0.60 + d1 * 0.40 + bit_sign).clamp(-1.0, 1.0);
+        let algebraic_proj = d0 * 0.60 + d1 * 0.40 + bit_sign;
         accum[i] = if used_shard {
-            (accum[i] * 0.80 + algebraic_proj * 0.20).clamp(-2.0, 2.0)
+            accum[i] * 0.80 + algebraic_proj * 0.20
         } else {
             algebraic_proj
         };

@@ -119,7 +119,7 @@ impl std::fmt::Debug for CoreLmInferenceWorker {
 impl CoreLmInferenceWorker {
     pub fn new(head_dim: usize, max_atoms: usize) -> Self {
         let mut memory_map = GeometricMemoryMap::new(max_atoms);
-        memory_map.use_picard = false;
+        memory_map.use_picard = true;
         Self {
             head_dim,
             memory_map,
@@ -208,7 +208,7 @@ impl Governor {
         }
         if let Some(proc) = self.processes[role.level() as usize].as_mut() {
             proc.worker.memory_map = GeometricMemoryMap::new(proc.worker.memory_map.max_atoms);
-            proc.worker.memory_map.use_picard = false;
+            proc.worker.memory_map.use_picard = true;
         }
         self.hydrate_worker_from_silo_with_adapter(role, 128, map, immune)?;
         if let Some(proc) = self.processes[role.level() as usize].as_mut() {

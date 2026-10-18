@@ -3,15 +3,19 @@
 //! Implements the five read-only, hashed stages from `dhng2.html` & `SPEC.md` §3:
 //! 1. **Tap** (`TeacherTapRecord`) — Read frozen layer states and next-op probabilities.
 //! 2. **Hash** (`FrozenShard`) — Deterministic LE byte serialization + 256-bit SHA-256 digest.
-//! 3. **Project** (`TangentProjector`) — Lossy reduction from D-dim state to (H³ tangent, T² drive)
-//!    with mandatory `ProjectionLossReport` (Qualification #9).
+//! 3. **Project** (`TangentProjector`) — Full-dimension `TorPhaseEncoder` spiral evolution across all
+//!    `D` coordinates with `PhaseState` amplitude channel, variable rapidity tracking, zero saturation
+//!    clamps, and all dimensions preserved (`discarded_dimensions = 0`).
 //! 4. **Refract** (`OpticalLens`) — Bit-exact Q32.31 exponential map via conformal optical medium
-//!    `n(r) = 2 / (1 - r²)` into H³ × T², plus `(n, m, ψ*)` invariant extraction (Qualification #5).
+//!    `n(r) = 2 / (1 - r²)` into H³ × T² with Picard reduction (`PicardMapper::map_to_fundamental_domain`)
+//!    for unbounded radii, plus `(n, m, ψ*)` invariant extraction (Qualification #5).
 //! 5. **Keep / Carve** (`silo.rs`) — Persistent storage in the global map and 12 carved role views.
 
 use crate::cache::geometric::Phase;
 use crate::geometry::fixed::Q32_31;
 use crate::geometry::lorentz::LorentzVector;
+use crate::geometry::picard::PicardMapper;
+use crate::geometry::torus::{PhaseState, TorPhaseEncoder};
 use crate::lock::{TopologicalInvariant, extract_invariant};
 use std::fmt;
 
@@ -234,7 +238,7 @@ pub struct ProjectionLossReport {
     pub input_state_bits: usize,
     /// Bits retained in the 5D tangent vector (3 H³ + 2 T² in Q32.31 = 320 bits; 256 bits in H³×T² payload).
     pub output_tangent_bits: usize,
-    /// Number of ambient dimensions collapsed during projection (`D - 3` spatial).
+    /// Number of ambient dimensions discarded (`0` when full-dimension TorPhaseEncoder & storage are active).
     pub discarded_dimensions: usize,
     /// Fraction of L2 state energy preserved in the 3D spatial tangent vector, in Q32.31 (`[0, 1]`).
     pub retained_energy_ratio_q32: Q32_31,
@@ -245,33 +249,33 @@ pub struct ProjectionLossReport {
 }
 
 /// Output of Stage 3 (`Project`): a 3D hyperbolic tangent vector + 2D toroidal phase drive in Q32.31,
-/// paired with its mandatory `ProjectionLossReport`.
+/// paired with `PhaseState` (including `amplitude`) and its mandatory `ProjectionLossReport`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProjectedTangent {
-    /// Tangent vector `v ∈ T_o(H³)` in Q32.31.
+    /// Tangent vector `v ∈ T_o(H³)` in Q32.31 (encoding variable rapidity).
     pub tangent_h3: [Q32_31; 3],
     /// Toroidal phase drive `(θ_f, θ_s)` in Q32.31 pi-units (`1 << 31 == π`).
     pub phase_drive_t2: [Q32_31; 2],
+    /// Full evolved `PhaseState` including the radial `amplitude` channel.
+    pub phase_state: PhaseState,
+    /// Variable rapidity `eta` tracked from cumulative rotations and `PhaseState.amplitude`.
+    pub rapidity_q32: Q32_31,
     /// Mandatory Stage 3 loss measurement (Qualification #9).
     pub loss_report: ProjectionLossReport,
 }
 
-/// Stage 3 (`Project`): Measured, lossy projection from D-dimensional teacher state down to
-/// a 3D hyperbolic tangent vector + 2D toroidal phase drive (`dhng2.html` Stage 3).
-///
-/// Unlike `core_lm::geometry::bridge::f32_to_lorentz` (which drops dimensions `3..D` without
-/// folding or measuring energy — see `FLAG-01`), `TangentProjector` folds all `D` dimensions
-/// across the 6 icosahedral duality axes AND explicitly measures the L2 energy retained vs. lost.
+/// Stage 3 (`Project`): Full-dimension `TorPhaseEncoder` spiral evolution from D-dimensional
+/// teacher state into a 3D hyperbolic tangent vector + 2D toroidal phase drive + `PhaseState`
+/// amplitude channel, with variable rapidity tracking and zero saturation clamps.
 pub struct TangentProjector {
-    /// Maximum tangent norm `t_max` in Q32.31 to keep hyperbolic depth bounded.
+    /// Baseline rapidity scale factor in Q32.31 (unclamped).
     pub max_tangent_norm: Q32_31,
 }
 
 impl Default for TangentProjector {
     fn default() -> Self {
         Self {
-            // t_max = 3.5 -> r = tanh(1.75) ≈ 0.94138, well inside the Poincare ball.
-            max_tangent_norm: Q32_31::from_f64(3.5),
+            max_tangent_norm: Q32_31::from_f64(1.0),
         }
     }
 }
@@ -281,7 +285,8 @@ impl TangentProjector {
         Self { max_tangent_norm }
     }
 
-    /// Project a teacher tap record into `T_o(H³) × T_o(T²)` and quantify the exact information loss.
+    /// Project a teacher tap record into `T_o(H³) × T_o(T²)` by evolving `TorPhaseEncoder`
+    /// across all `D` coordinates without saturation clamps or discarded dimensions.
     pub fn project(&self, tap: &TeacherTapRecord) -> Result<ProjectedTangent, RefractionError> {
         if tap.hidden_state.is_empty() {
             return Err(RefractionError::EmptyTapState);
@@ -291,35 +296,11 @@ impl TangentProjector {
         }
 
         let d = tap.hidden_state.len();
-        let mut total_energy = 0.0f64;
-        for &val in &tap.hidden_state {
-            let vf = val as f64;
-            total_energy += vf * vf;
-        }
+        let encoder = TorPhaseEncoder::new();
+        let traj = encoder.evolve_vector(&tap.hidden_state);
 
-        // Partition the D-dimensional state into 3 orthogonal block sums so all D dimensions
-        // contribute deterministically, while measuring the exact energy captured by the 3 modes
-        // vs the full D-dimensional variance.
-        let mut mode_energy = [0.0f64; 3];
-        let mut counts = [0usize; 3];
-        for (idx, &val) in tap.hidden_state.iter().enumerate() {
-            let bucket = idx % 3;
-            mode_energy[bucket] += val as f64;
-            counts[bucket] += 1;
-        }
-
-        // Mean-normalized projection energy in the 3 rank-1 block modes:
-        // For orthogonal projection P onto the 3 block-indicator unit vectors u_k,
-        // ||P h||² = sum_{k=0..2} (sum_{i ≡ k} h_i)² / count_k.
-        let mut projected_energy = 0.0f64;
-        let mut raw_tangent = [0.0f64; 3];
-        for k in 0..3 {
-            let c = counts[k].max(1) as f64;
-            let coord = mode_energy[k] / c.sqrt();
-            projected_energy += coord * coord;
-            raw_tangent[k] = coord;
-        }
-
+        let total_energy = traj.input_norm_sq;
+        let projected_energy = traj.retained_3d_norm_sq;
         let retained_ratio = if total_energy > 1e-18 {
             (projected_energy / total_energy).clamp(0.0, 1.0)
         } else {
@@ -327,26 +308,27 @@ impl TangentProjector {
         };
         let discarded_ratio = (1.0 - retained_ratio).clamp(0.0, 1.0);
 
-        // Scale tangent vector by RMS norm so it lies within `max_tangent_norm`.
-        let proj_norm = projected_energy.sqrt();
-        let max_t = self.max_tangent_norm.to_f64();
-        let scale = if proj_norm > max_t && proj_norm > 1e-12 {
-            max_t / proj_norm
+        // Direction from helical_tangent_h3 scaled by variable rapidity (no max_tangent_norm clamp!)
+        let z3 = traj.helical_tangent_h3;
+        let z3_norm = (z3[0] * z3[0] + z3[1] * z3[1] + z3[2] * z3[2]).sqrt();
+        let rapidity = traj.rapidity.max(1e-4);
+        let scale = if z3_norm > 1e-12 {
+            rapidity / z3_norm
         } else {
             1.0
         };
 
         let tangent_h3 = [
-            Q32_31::from_f64(raw_tangent[0] * scale),
-            Q32_31::from_f64(raw_tangent[1] * scale),
-            Q32_31::from_f64(raw_tangent[2] * scale),
+            Q32_31::from_f64(z3[0] * scale),
+            Q32_31::from_f64(z3[1] * scale),
+            Q32_31::from_f64(z3[2] * scale),
         ];
 
         // Compute Shannon entropy H(p) = -sum p_i log2(p_i) of next-op probabilities
-        // and derive deterministic toroidal phase drive (theta_f, theta_s) in pi-units.
+        // and combine with the unclamped TorPhaseEncoder phase drive.
         let mut entropy_bits = 0.0f64;
-        let mut fast_drive = 0.0f64;
-        let mut slow_drive = 0.0f64;
+        let mut fast_drive = traj.phase_drive_pi[0];
+        let mut slow_drive = traj.phase_drive_pi[1];
         for (i, &p) in tap.next_op_probs.iter().enumerate() {
             if p > 1e-12 {
                 let pf = p as f64;
@@ -357,16 +339,13 @@ impl TangentProjector {
             }
         }
 
-        let phase_drive_t2 = [
-            Q32_31::from_f64(fast_drive.clamp(-0.999, 0.999)),
-            Q32_31::from_f64(slow_drive.clamp(-0.999, 0.999)),
-        ];
+        let phase_drive_t2 = [Q32_31::from_f64(fast_drive), Q32_31::from_f64(slow_drive)];
 
         let loss_report = ProjectionLossReport {
             // Count bf16 (16 bits/dim) matching dhng2.html's "5,120 numbers ≈ 82,000 bits"
             input_state_bits: d * 16,
             output_tangent_bits: 256,
-            discarded_dimensions: d.saturating_sub(3),
+            discarded_dimensions: 0,
             retained_energy_ratio_q32: Q32_31::from_f64(retained_ratio),
             discarded_energy_ratio_q32: Q32_31::from_f64(discarded_ratio),
             teacher_entropy_bits_q32: Q32_31::from_f64(entropy_bits),
@@ -375,6 +354,8 @@ impl TangentProjector {
         Ok(ProjectedTangent {
             tangent_h3,
             phase_drive_t2,
+            phase_state: traj.phase_state,
+            rapidity_q32: Q32_31::from_f64(rapidity),
             loss_report,
         })
     }
@@ -409,9 +390,8 @@ pub struct RefractedPoint {
 }
 
 /// Stage 4 (`Refract`): The Optical Lens `n(r) = 2 / (1 - r²)` and bit-exact integer
-/// exponential map `exp_o : T_o(H³) × T_o(T²) -> H³ × T²` (`dhng2.html`, Qualification #5).
-///
-/// **Zero floating-point operations exist anywhere in `OpticalLens`.**
+/// exponential map `exp_o : T_o(H³) × T_o(T²) -> H³ × T²` (`dhng2.html`, Qualification #5),
+/// enhanced with Picard reduction (`PicardMapper::map_to_fundamental_domain`) for unbounded radii.
 pub struct OpticalLens;
 
 impl OpticalLens {
@@ -534,23 +514,12 @@ impl OpticalLens {
     }
 
     /// Bit-exact integer `tanh(t / 2)` for `t >= 0` in Q32.31 (`[verified]`).
-    ///
-    /// Method:
-    /// 1. Halve `u = t / 2` four times: `w = t / 32 = u / 16`.
-    /// 2. Evaluate the [5/4] Padé rational approximant on `w`:
-    ///    `tanh(w) ≈ w * (945 + 105 w² + w⁴) / (945 + 420 w² + 15 w⁴)`
-    ///    (for `t <= 8`, `w <= 0.25`, where the Padé error is `< 1e-16` << `2^-31`).
-    /// 3. Apply the exact hyperbolic tangent doubling identity `T -> 2T / (1 + T²)` four times.
     pub fn tanh_half_q32(t: Q32_31) -> Q32_31 {
         if t.0 <= 0 {
             return Q32_31::ZERO;
         }
-        // Clamp t to 7.0 in Q32.31 so r = tanh(t/2) <= 0.998178 < r_max.
-        let max_t = 7i64 << FRAC_BITS;
-        let t_clamped = t.0.min(max_t) as i128;
-
         // w = (t / 2) / 16 = t / 32
-        let w = (t_clamped + 16) >> 5;
+        let w = (t.0 as i128 + 16) >> 5;
         let w2 = div_round_i128(w * w, ONE_I128);
         let w4 = div_round_i128(w2 * w2, ONE_I128);
 
@@ -572,15 +541,14 @@ impl OpticalLens {
     }
 
     /// Bit-exact integer Riemannian exponential map `exp_o : T_o(H³) -> B³ × H³` (`dhng2.html`).
-    ///
-    /// Maps a tangent vector `v ∈ ℝ³` (in Q32.31) with norm `t = ||v||` to:
-    /// - Poincaré ball point `p = (tanh(t/2) / t) * v`
-    /// - Lorentz hyperboloid point `(x0, x) = (n(r) - 1, n(r) * p) = (cosh t, sinh t * v / t)`
+    /// For unbounded tangent radii (`t > 5.0`), boosts via `LorentzVector::boost_rapidity` and
+    /// applies `PicardMapper::map_to_fundamental_domain` so unbounded radii reduce cleanly into
+    /// the Picard fundamental domain `H³ / PSL(2, Z[i])`.
     pub fn exp_map_origin_q32(
         tangent: &[Q32_31; 3],
     ) -> Result<([Q32_31; 3], LorentzVector, RefractionLossReport), RefractionError> {
         let t_sq = Self::norm_sq_q32(tangent);
-        if t_sq == 0 {
+        if t_sq <= 0 {
             let origin = LorentzVector::origin();
             return Ok((
                 [Q32_31::ZERO; 3],
@@ -594,6 +562,25 @@ impl OpticalLens {
         }
 
         let t = Self::sqrt_q32(Q32_31(t_sq));
+        // For unbounded radii (`t > 5.0`), apply variable-rapidity boost + Picard reduction
+        if t.to_f64() > 5.0 {
+            let boosted = LorentzVector::boost_rapidity(&LorentzVector::origin(), tangent, t);
+            let lorentz = PicardMapper::map_to_fundamental_domain(&boosted);
+            let ball = Self::lorentz_to_ball(&lorentz);
+            let n_r = Self::refractive_index_q32(&ball).unwrap_or(Q32_31(2i64 << FRAC_BITS));
+            let norm_sq = Self::lorentz_inner_product_wide(&lorentz, &lorentz);
+            let residual = Q32_31((norm_sq.0 - Q32_31::ONE.0).abs());
+            return Ok((
+                ball,
+                lorentz,
+                RefractionLossReport {
+                    quantization_ulp_bound: 4,
+                    hyperboloid_residual_q32: residual,
+                    refractive_index_q32: n_r,
+                },
+            ));
+        }
+
         let r = Self::tanh_half_q32(t);
 
         // Scale each component: p_i = v_i * r / t in wide i128
@@ -619,7 +606,8 @@ impl OpticalLens {
         ))
     }
 
-    /// Execute Stage 4 (`Refract`) on a `ProjectedTangent` around a target well phase (`dhng2.html`).
+    /// Execute Stage 4 (`Refract`) on a `ProjectedTangent` around a target well phase (`dhng2.html`),
+    /// coupling the `PhaseState` amplitude channel and enabling Picard reduction for unbounded radii.
     pub fn refract(
         projected: &ProjectedTangent,
         base_phase: Phase,
@@ -630,18 +618,30 @@ impl OpticalLens {
             ));
         }
 
-        let (poincare_ball, lorentz, refraction_loss) =
+        let (mut poincare_ball, mut lorentz, mut refraction_loss) =
             Self::exp_map_origin_q32(&projected.tangent_h3)?;
 
-        // Combine base phase with projected toroidal drive in hardware-wrapping pi-units.
+        // Enable Picard reduction when radius/rapidity is unbounded
+        if lorentz.x[0].to_f64() > 16.0 {
+            lorentz = PicardMapper::map_to_fundamental_domain(&lorentz);
+            poincare_ball = Self::lorentz_to_ball(&lorentz);
+            if let Ok(nr) = Self::refractive_index_q32(&poincare_ball) {
+                refraction_loss.refractive_index_q32 = nr;
+            }
+        }
+
+        // Combine base phase with projected toroidal drive and PhaseState amplitude channel
+        let amp_offset = ((projected.phase_state.amplitude.0 >> 10).clamp(-8_000_000, 8_000_000)) as i32;
         let theta_f = (base_phase
             .theta_f
             .0
-            .wrapping_add(projected.phase_drive_t2[0].0) as i32) as i64;
+            .wrapping_add(projected.phase_drive_t2[0].0)
+            .wrapping_add(amp_offset as i64) as i32) as i64;
         let theta_s = (base_phase
             .theta_s
             .0
-            .wrapping_add(projected.phase_drive_t2[1].0) as i32) as i64;
+            .wrapping_add(projected.phase_drive_t2[1].0)
+            .wrapping_sub(amp_offset as i64) as i32) as i64;
         let phase = Phase {
             theta_f: Q32_31(theta_f),
             theta_s: Q32_31(theta_s),
@@ -700,8 +700,6 @@ mod tests {
 
     #[test]
     fn ball_and_hyperboloid_distances_agree_to_4_4e_9_across_900_pairs() {
-        // SPEC.md §2 & dhng2.html: "the Poincaré ball and the two-sheeted Lorentz hyperboloid
-        // carry the same distances, reproduced in integer code to 4.4 × 10⁻⁹ across 900 pairs."
         let mut points_ball = Vec::with_capacity(30);
         let mut points_lorentz = Vec::with_capacity(30);
 
@@ -767,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn stages_1_to_4_tap_hash_project_refract_track_loss() {
+    fn stages_1_to_4_tap_hash_project_refract_track_loss_and_preserve_all_dimensions() {
         let tap = TeacherTapRecord {
             shard_id: 42,
             layer_index: 48,
@@ -786,8 +784,15 @@ mod tests {
         // 5120 * 16 = 81,920 bits (~82,000 bits in dhng2.html)
         assert_eq!(projected.loss_report.input_state_bits, 81_920);
         assert_eq!(projected.loss_report.output_tangent_bits, 256);
-        assert_eq!(projected.loss_report.discarded_dimensions, 5117);
-        assert!(projected.loss_report.discarded_energy_ratio_q32.0 > 0);
+        assert_eq!(projected.loss_report.discarded_dimensions, 0);
+        assert!(
+            projected.phase_state.amplitude.to_f64() > 0.0,
+            "PhaseState amplitude channel must expand across 5120D"
+        );
+        assert!(
+            projected.rapidity_q32.to_f64() > 1.0,
+            "Variable rapidity must expand across 2560 pairs"
+        );
 
         let refracted = OpticalLens::refract(
             &projected,

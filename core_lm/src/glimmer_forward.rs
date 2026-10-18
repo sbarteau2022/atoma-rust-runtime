@@ -166,7 +166,7 @@ impl GlimmerModel {
             let mut layer_maps = Vec::new();
             for _ in 0..config.num_key_value_heads {
                 let mut m = GeometricMemoryMap::new(1_000_000);
-                m.use_picard = false;
+                m.use_picard = true;
                 layer_maps.push(m);
             }
             geo_maps.push(layer_maps);
@@ -536,7 +536,7 @@ impl GlimmerModel {
         for layer_maps in self.geo_maps.iter_mut() {
             for geo in layer_maps.iter_mut() {
                 let mut fresh = GeometricMemoryMap::new(1_000_000);
-                fresh.use_picard = false;
+                fresh.use_picard = true;
                 *geo = fresh;
             }
         }

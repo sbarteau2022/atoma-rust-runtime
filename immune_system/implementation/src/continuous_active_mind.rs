@@ -1570,11 +1570,25 @@ impl GeodesicActiveTransformer {
                 }
             }
         }
-        for &w in &ngram_words {
-            let wl = w.to_ascii_lowercase();
-            if wl.len() >= 3 && !Self::is_concept_stop_word(&wl) {
-                if !raw_subjects.iter().any(|s| s.eq_ignore_ascii_case(w)) {
-                    raw_subjects.push(w.to_string());
+        let is_explicit_concept_query = ngram_words.len() <= 3
+            || lower.starts_with("what is ")
+            || lower.starts_with("what are ")
+            || lower.starts_with("define ")
+            || lower.starts_with("explain ")
+            || lower.contains("in plain language")
+            || lower.contains("capital of")
+            || lower.contains("symbol for")
+            || lower.contains("currency of")
+            || lower.contains("diet of")
+            || lower.contains("largest city in")
+            || lower.contains("official language of");
+        if is_explicit_concept_query {
+            for &w in &ngram_words {
+                let wl = w.to_ascii_lowercase();
+                if wl.len() >= 3 && !Self::is_concept_stop_word(&wl) {
+                    if !raw_subjects.iter().any(|s| s.eq_ignore_ascii_case(w)) {
+                        raw_subjects.push(w.to_string());
+                    }
                 }
             }
         }

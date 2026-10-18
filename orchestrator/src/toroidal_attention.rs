@@ -11,13 +11,17 @@
 //! - **Rotary Position Embedding (RoPE) Polar Pair Decomposition**:
 //!   Pairs consecutive hidden dimensions `(x_{2p}, x_{2p+1})` into 2D polar coordinates `(r_p, theta_p)`
 //!   following **Su et al. (2024), *"RoFormer: Enhanced Transformer with Rotary Position Embedding"***.
-//! - **2nd-Order Fourier / Trigonometric Kernel Feature Map**:
-//!   Uses the 5-dimensional trigonometric feature map
-//!   `phi(theta) = [sqrt(3/2), sqrt(2) cos(theta), sqrt(2) sin(theta), (1/sqrt(2)) cos(2*theta), (1/sqrt(2)) sin(2*theta)]^T`
-//!   so `<phi(theta_q), phi(theta_k)> = (1 + cos(theta_q - theta_k))^2 >= 0`.
+//! - **Expanding Radius Accumulator, Variable Rapidity & Picard Reduction**:
+//!   Replaces exponential decay and saturation clamps with a monotonically expanding
+//!   `radius_accumulator` coupled to `PhaseState.amplitude`, variable rapidity tracking via
+//!   `LorentzVector::boost_rapidity`, and `PicardMapper::map_to_fundamental_domain` for unbounded radii.
 
 use atoma_immune::cache::geometric::{AtomId, Phase};
 use atoma_immune::geometry::bridge::f32_to_atom_address;
+use atoma_immune::geometry::fixed::Q32_31;
+use atoma_immune::geometry::lorentz::LorentzVector;
+use atoma_immune::geometry::picard::PicardMapper;
+use atoma_immune::geometry::torus::{PhaseState, TorPhaseEncoder};
 use atoma_immune::{
     CompliancePermit, ModelAdapterLens, OpticalLens, RoleId, SiloAtom, TeacherTapRecord,
 };
@@ -192,7 +196,7 @@ pub fn pair_coherence(query: &[f32], key: &[f32]) -> Result<f64, String> {
     if real.hypot(imag) <= 1e-12 {
         return Ok(1.0);
     }
-    Ok((1.0 + real / real.hypot(imag)).clamp(0.0, 2.0))
+    Ok(1.0 + real / real.hypot(imag))
 }
 
 /// Amplitude-weighted multi-pair RoPE polar phase similarity on `(R_+ × S^1)^(D/2)`:
@@ -296,7 +300,7 @@ pub fn map_phase_coherence(query: Phase, key: Phase) -> f64 {
     if real.hypot(imag) <= 1e-12 {
         1.0
     } else {
-        (1.0 + real / real.hypot(imag)).clamp(0.0, 2.0)
+        1.0 + real / real.hypot(imag)
     }
 }
 
@@ -637,31 +641,38 @@ impl MonsterHybridServer {
     }
 }
 
-/// **Recurrent Linear Attention State with 2nd-Order Trigonometric Kernel Feature Map (`O(1)` State)**
+/// **Recurrent Linear Attention State with Expanding Radius Accumulator, `PhaseState` Amplitude
+/// Channel, Variable Rapidity Tracking, and Picard Reduction (`O(1)` State)**
 ///
 /// ### Prior Work Attribution
 /// Implements the recurrent linear attention formulation of **Katharopoulos, Vyas, Pappas, & Fleuret
 /// (ICML 2020), *"Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention"***,
-/// coupled with polar Rotary Position Embedding pairs (`(R_+ x S^1)^(D/2)`).
-///
-/// By expressing the non-negative 2nd-order trigonometric kernel
-/// `k(theta_q, theta_k) = (1 + cos(theta_q - theta_k))^2 = 3/2 + 2 cos(theta_q - theta_k) + 1/2 cos(2(theta_q - theta_k))`
-/// as an inner product of 5-dimensional trigonometric feature maps
-/// `phi(theta) = [sqrt(3/2), sqrt(2) cos(theta), sqrt(2) sin(theta), (1/sqrt(2)) cos(2*theta), (1/sqrt(2)) sin(2*theta)]^T`
-/// and applying the associative property of matrix multiplication `(phi(Q) phi(K)^T) V = phi(Q) (phi(K)^T V)`,
-/// sequence complexity drops from `O(N^2)` to `O(N)` with a fixed-size `O(1)` recurrent state
-/// (`m_*` numerator accumulators and `z_*` normalizer accumulators) per token.
+/// coupled with `TorPhaseEncoder` spiral evolution on `(R_+ x S^1)^(D/2)` without decay or saturation clamps:
+/// - `phase_state`: carries `(theta_f, theta_s, psi, amplitude)` where `amplitude` grows monotonically.
+/// - `radius_accumulator`: expands monotonically over time with every token and every `2*pi` rotation
+///   instead of decaying (`gamma < 1.0`).
+/// - `rapidity_accumulator`: tracks variable hyperbolic rapidity `eta` and boosts `reduced_lorentz`
+///   via `LorentzVector::boost_rapidity`, followed by `PicardMapper::map_to_fundamental_domain`
+///   for unbounded radii.
 #[derive(Debug, Clone)]
 pub struct ToroidalHarmonicFieldState {
     pub hidden_dim: usize,
     pub tokens_ingested: usize,
-    /// Normalizer accumulators `Z_t = sum_{i<=t} gamma^{t-i} phi(k_i)` for the 5 trigonometric basis terms.
+    /// Full Kuramoto `PhaseState` including the radial `amplitude` channel.
+    pub phase_state: PhaseState,
+    /// Monotonically expanding radius accumulator (grows with every rotation/step rather than decaying).
+    pub radius_accumulator: f64,
+    /// Unbounded variable rapidity accumulator tracked from rotations and `phase_state.amplitude`.
+    pub rapidity_accumulator: f64,
+    /// Current hyperbolic trajectory state reduced into the Picard fundamental domain `H^3 / PSL(2, Z[i])`.
+    pub reduced_lorentz: LorentzVector,
+    /// Normalizer accumulators `Z_t` for the 5 trigonometric basis terms.
     pub z_0: f64,
     pub z_c1: Vec<f64>,
     pub z_s1: Vec<f64>,
     pub z_c2: Vec<f64>,
     pub z_s2: Vec<f64>,
-    /// Recurrent state numerator accumulators `S_t = sum_{i<=t} gamma^{t-i} phi(k_i) (x) v_i`.
+    /// Recurrent state numerator accumulators `S_t` across all preserved dimensions.
     pub m_0: Vec<f64>,
     pub m_c1: Vec<f64>,
     pub m_s1: Vec<f64>,
@@ -675,6 +686,10 @@ impl ToroidalHarmonicFieldState {
         Self {
             hidden_dim,
             tokens_ingested: 0,
+            phase_state: PhaseState::ZERO,
+            radius_accumulator: 1.0,
+            rapidity_accumulator: 0.0,
+            reduced_lorentz: LorentzVector::origin(),
             z_0: 0.0,
             z_c1: vec![0.0; pairs],
             z_s1: vec![0.0; pairs],
@@ -689,33 +704,51 @@ impl ToroidalHarmonicFieldState {
     }
 
     /// Update the `O(1)` recurrent linear attention state (`S_t`, `Z_t`) with a new causal token
-    /// vector `x_in` and compute `<phi(q_t), S_t> / <phi(q_t), Z_t>` in `O(D)` time
-    /// (Katharopoulos et al., ICML 2020, Eq. 5–6).
-    pub fn step_and_readout(&mut self, x_in: &[f32], decay: f64) -> Vec<f32> {
+    /// vector `x_in`, expanding `radius_accumulator`, `phase_state.amplitude`, and
+    /// `rapidity_accumulator` over time without decay or saturation clamps, and applying
+    /// `PicardMapper::map_to_fundamental_domain` to unbounded hyperbolic radii.
+    pub fn step_and_readout(&mut self, x_in: &[f32], _legacy_decay: f64) -> Vec<f32> {
         let d_len = x_in.len().min(self.hidden_dim);
         let pairs = d_len / 2;
         if pairs == 0 {
             return vec![0.0; x_in.len()];
         }
 
-        // Apply gentle exponential horizon decay so recent phase structure stays sharp
-        let gamma = decay.clamp(0.90, 1.0);
-        self.z_0 *= gamma;
-        for p in 0..pairs {
-            self.z_c1[p] *= gamma;
-            self.z_s1[p] *= gamma;
-            self.z_c2[p] *= gamma;
-            self.z_s2[p] *= gamma;
-        }
-        for d in 0..d_len {
-            self.m_0[d] *= gamma;
-            self.m_c1[d] *= gamma;
-            self.m_s1[d] *= gamma;
-            self.m_c2[d] *= gamma;
-            self.m_s2[d] *= gamma;
-        }
+        // Evolve TorPhaseEncoder across all dimensions of x_in to update the PhaseState amplitude
+        // channel, expanding radius accumulator, and variable rapidity
+        let encoder = TorPhaseEncoder::new();
+        let traj = encoder.evolve_vector(&x_in[..d_len]);
+        self.phase_state = encoder.evolve(
+            self.phase_state,
+            traj.phase_state.theta_f,
+            traj.phase_state.theta_s,
+        );
 
-        // Compute isotropic RMS radius across pairs so no outlier dimension dominates
+        let amp_f64 = self.phase_state.amplitude.to_f64().max(1e-4);
+        let radial_step = 0.25 * traj.expanded_ball_radius
+            + 0.18 * traj.cumulative_rotations.max(0.05)
+            + 0.12 * amp_f64;
+        self.radius_accumulator += radial_step;
+        self.rapidity_accumulator += traj.rapidity.max(0.05);
+
+        // Variable-rapidity boost + Picard reduction for unbounded radii
+        let h3 = traj.helical_tangent_h3;
+        let h3_norm = (h3[0] * h3[0] + h3[1] * h3[1] + h3[2] * h3[2])
+            .sqrt()
+            .max(1e-9);
+        let dir = [
+            Q32_31::from_f64(h3[0] / h3_norm),
+            Q32_31::from_f64(h3[1] / h3_norm),
+            Q32_31::from_f64(h3[2] / h3_norm),
+        ];
+        let boosted = LorentzVector::boost_rapidity(
+            &self.reduced_lorentz,
+            &dir,
+            Q32_31::from_f64(traj.rapidity),
+        );
+        self.reduced_lorentz = PicardMapper::map_to_fundamental_domain(&boosted);
+
+        // Compute RMS radius across pairs
         let mut mean_r_sq = 0.0f64;
         for p in 0..pairs {
             let x0 = x_in[2 * p] as f64;
@@ -724,12 +757,15 @@ impl ToroidalHarmonicFieldState {
         }
         let rms_r = (mean_r_sq / (pairs as f64)).sqrt().max(1e-9);
 
+        // Expanding radial shell weight (replaces exponential decay and [0, 4] saturation clamp)
+        let shell_expansion = 1.0 + 0.15 * self.radius_accumulator.ln_1p();
+
         let mut c1_q = vec![0.0f64; pairs];
         let mut s1_q = vec![0.0f64; pairs];
         let mut c2_q = vec![0.0f64; pairs];
         let mut s2_q = vec![0.0f64; pairs];
 
-        self.z_0 += 1.5;
+        self.z_0 += 1.5 * shell_expansion;
         for p in 0..pairs {
             let x0 = x_in[2 * p] as f64;
             let x1 = x_in[2 * p + 1] as f64;
@@ -742,7 +778,8 @@ impl ToroidalHarmonicFieldState {
             // Double-angle identity: cos(2t) = c1^2 - s1^2, sin(2t) = 2*c1*s1
             let c2 = c1 * c1 - s1 * s1;
             let s2 = 2.0 * c1 * s1;
-            let r_iso = (r / rms_r).clamp(0.0, 4.0);
+            // Unclamped radial weight scaled by expanding radius accumulator
+            let r_iso = (r / rms_r) * shell_expansion;
 
             c1_q[p] = c1;
             s1_q[p] = s1;
@@ -757,7 +794,7 @@ impl ToroidalHarmonicFieldState {
             for lane in 0..2 {
                 let idx = 2 * p + lane;
                 let v = x_in[idx] as f64;
-                self.m_0[idx] += 1.5 * v;
+                self.m_0[idx] += 1.5 * shell_expansion * v;
                 self.m_c1[idx] += 2.0 * r_iso * c1 * v;
                 self.m_s1[idx] += 2.0 * r_iso * s1 * v;
                 self.m_c2[idx] += 0.5 * r_iso * c2 * v;
@@ -867,8 +904,7 @@ impl ToroidalWorkingMemory {
         is_rate: bool,
     ) -> u8 {
         let id = self.registers.len() as u16;
-        let q32 =
-            atoma_immune::geometry::fixed::Q32_31::from_f64((val / 10_000.0).clamp(-1.99, 1.99));
+        let q32 = atoma_immune::geometry::fixed::Q32_31::from_f64(val / 10_000.0);
         self.registers.push(WorkingMemoryRegister {
             reg_id: id,
             entity_key: entity.to_string(),
@@ -918,8 +954,7 @@ impl ToroidalWorkingMemory {
             _ => a + b,
         };
         let dst_id = self.registers.len() as u16;
-        let q32 =
-            atoma_immune::geometry::fixed::Q32_31::from_f64((res / 10_000.0).clamp(-1.99, 1.99));
+        let q32 = atoma_immune::geometry::fixed::Q32_31::from_f64(res / 10_000.0);
         self.registers.push(WorkingMemoryRegister {
             reg_id: dst_id,
             entity_key: entity.to_string(),
@@ -941,10 +976,12 @@ impl ToroidalWorkingMemory {
 ///
 /// Combines:
 /// 1. **`O(1)` Recurrent Linear Attention (`ToroidalHarmonicFieldState`)** following
-///    **Katharopoulos et al. (ICML 2020)** on RoPE polar pairs `(R_+ x S^1)^(D/2)`,
+///    **Katharopoulos et al. (ICML 2020)** on RoPE polar pairs `(R_+ x S^1)^(D/2)` with
+///    monotonically expanding `radius_accumulator`, `PhaseState` amplitude channel, variable
+///    rapidity tracking, and Picard reduction,
 /// 2. **`ATOMA_OP_V3` Rank-8 Local Jacobian Function Approximation** over the persistent
 ///    product-manifold `(H^3 x T^2)/Gamma_12` `CarvedSwarmMap`, and
-/// 3. **Pair-wise Polar RMS Normalization** so hidden states remain bounded across layers.
+/// 3. **Unclamped Pair-wise Polar Scaling** preserving all dimensions without saturation clamps.
 pub struct ToroidalIsotropicRuntime {
     pub hidden_dim: usize,
     pub active_layers: Vec<usize>,
@@ -967,41 +1004,21 @@ impl ToroidalIsotropicRuntime {
             active_layers,
             total_model_layers: total_model_layers.max(1),
             toroidal_field_mix: 0.18,
-            horizon_decay: 0.995,
+            horizon_decay: 1.0,
             map_engine: atoma_immune::MapNativeInferenceEngine::default(),
             layer_fields,
             working_memory: ToroidalWorkingMemory::new(),
         }
     }
 
-    /// Apply isotropic pair-wise RMS normalization on `(R_+ x S^1)^(D/2)` while preserving
-    /// the target radial energy `target_l2_norm`.
+    /// Apply pair-wise RMS scaling on `(R_+ x S^1)^(D/2)` without `max_r = 3.0 * mean_pair_r`
+    /// saturation clamps, preserving all pair relative amplitudes and `target_l2_norm`.
     pub fn isotropic_toroidal_rms_normalize(x: &mut [f32], target_l2_norm: f32) {
-        let pairs = x.len() / 2;
-        if pairs == 0 {
+        if x.is_empty() {
             return;
         }
-        let mut sum_sq = 0.0f64;
-        for p in 0..pairs {
-            let r_sq = (x[2 * p] as f64).powi(2) + (x[2 * p + 1] as f64).powi(2);
-            sum_sq += r_sq;
-        }
-        let mean_pair_r = (sum_sq / (pairs as f64)).sqrt().max(1e-9);
-        // Soft-clamp extreme rogue pair radii (> 3.0x RMS) onto the isotropic torus
-        let max_r = 3.0 * mean_pair_r;
-        let mut new_norm_sq = 0.0f64;
-        for p in 0..pairs {
-            let x0 = x[2 * p] as f64;
-            let x1 = x[2 * p + 1] as f64;
-            let r = x0.hypot(x1);
-            if r > max_r {
-                let s = (max_r / r) as f32;
-                x[2 * p] *= s;
-                x[2 * p + 1] *= s;
-            }
-            new_norm_sq += (x[2 * p] as f64).powi(2) + (x[2 * p + 1] as f64).powi(2);
-        }
-        let cur_norm = new_norm_sq.sqrt().max(1e-9) as f32;
+        let norm_sq: f64 = x.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        let cur_norm = norm_sq.sqrt().max(1e-9) as f32;
         let scale = target_l2_norm / cur_norm;
         for v in x.iter_mut() {
             *v *= scale;
@@ -1061,8 +1078,7 @@ impl ToroidalIsotropicRuntime {
                 .max(base_norm as f64) as f32;
             Self::isotropic_toroidal_rms_normalize(&mut x_curr, target_norm);
 
-            let pairs = (x_curr.len() / 2).max(1) as f64;
-            let iso_rms = ((target_norm as f64).powi(2) / pairs).sqrt();
+            let iso_rms = self.layer_fields[idx].radius_accumulator;
 
             rank_sum += active_rank;
             cos_sum += map_rec.max_receptor_cosine;
@@ -1156,5 +1172,44 @@ mod tests {
         assert_eq!(decode_map_kv_payload(&bytes).unwrap().0, identity);
         bytes.pop();
         assert!(decode_map_kv_payload(&bytes).is_none());
+    }
+
+    #[test]
+    fn orchestrator_radius_accumulator_expands_over_time_with_amplitude_and_picard_reduction() {
+        let mut state = ToroidalHarmonicFieldState::new(128);
+        let mut prev_radius = state.radius_accumulator;
+        let mut prev_amp = state.phase_state.amplitude.to_f64();
+        let mut prev_rapidity = state.rapidity_accumulator;
+
+        for step in 0..16 {
+            let x_in: Vec<f32> = (0..128)
+                .map(|i| (((i + step * 7) as f32) * 0.19).cos() * 1.2)
+                .collect();
+            let out = state.step_and_readout(&x_in, 0.995);
+            assert_eq!(out.len(), 128);
+            assert!(out.iter().all(|v| v.is_finite()));
+            assert!(
+                state.radius_accumulator > prev_radius,
+                "radius_accumulator must expand over time: step {step} {} <= {prev_radius}",
+                state.radius_accumulator
+            );
+            assert!(
+                state.phase_state.amplitude.to_f64() > prev_amp,
+                "PhaseState amplitude must expand over time: step {step} {} <= {prev_amp}",
+                state.phase_state.amplitude.to_f64()
+            );
+            assert!(
+                state.rapidity_accumulator > prev_rapidity,
+                "rapidity_accumulator must expand over time: step {step} {} <= {prev_rapidity}",
+                state.rapidity_accumulator
+            );
+            assert!(
+                state.reduced_lorentz.validate().is_ok(),
+                "Picard-reduced hyperbolic state must remain on H^3 at step {step}"
+            );
+            prev_radius = state.radius_accumulator;
+            prev_amp = state.phase_state.amplitude.to_f64();
+            prev_rapidity = state.rapidity_accumulator;
+        }
     }
 }

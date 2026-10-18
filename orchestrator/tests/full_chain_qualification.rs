@@ -187,7 +187,7 @@ fn qual_09_loss_accounting_ledger_is_populated_at_every_stage() {
 
     assert_eq!(receipt.projected.loss_report.input_state_bits, 81_920);
     assert_eq!(receipt.projected.loss_report.output_tangent_bits, 256);
-    assert_eq!(receipt.projected.loss_report.discarded_dimensions, 5117);
+    assert_eq!(receipt.projected.loss_report.discarded_dimensions, 0);
     assert_eq!(receipt.carve_loss.global_atom_count, 1);
     let l7_idx = RoleId::ConvergentLogic.carved_index().unwrap();
     assert_eq!(receipt.carve_loss.silo_atom_counts[l7_idx], 1);

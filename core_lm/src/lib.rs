@@ -28,7 +28,7 @@ use crate::geometry::bridge::BridgeLossReport;
 use crate::geometry::fixed::Q32_31;
 use crate::geometry::lorentz::LorentzVector;
 use crate::geometry::picard::PicardMapper;
-use crate::geometry::torus::TorPhaseEncoder;
+use crate::geometry::torus::{PhaseState, TorPhaseEncoder};
 use crate::projection::ProjectionHead;
 
 /// Unforgeable forward-pass permit issued by `ImmuneForwardGate` (`core_lm -> immune_system`).
@@ -137,7 +137,9 @@ impl ImmuneForwardGate {
         }
         if let Some(rep) = loss {
             if rep.input_dimensions == 0 {
-                return Err("ImmuneForwardGate: silent information loss (0 input dimensions)".into());
+                return Err(
+                    "ImmuneForwardGate: silent information loss (0 input dimensions)".into(),
+                );
             }
             self.last_loss_report = Some(rep);
         }
@@ -166,10 +168,7 @@ impl Engine {
     pub fn seed_knowledge(&mut self, facts: Vec<(&str, &str)>) {
         for (question, answer) in facts {
             let address = address_for_text(&self.encoder, question.as_bytes());
-            if let Ok(id) = self
-                .memory_map
-                .store(address, answer.as_bytes().to_vec())
-            {
+            if let Ok(id) = self.memory_map.store(address, answer.as_bytes().to_vec()) {
                 self.memory_map.pin(id);
             }
         }
@@ -180,7 +179,11 @@ impl Engine {
     pub fn generate(&self, prompt: &str, max_facts: usize) -> Result<String, EngineError> {
         let mut gate = self.immune_gate.clone();
         let permit = gate
-            .authorize_forward_pass(prompt.len() as u32, max_facts, gate.pinned_weight_fingerprint)
+            .authorize_forward_pass(
+                prompt.len() as u32,
+                max_facts,
+                gate.pinned_weight_fingerprint,
+            )
             .map_err(EngineError::ComplianceRejected)?;
         self.generate_with_permit(prompt, max_facts, &permit)
     }
@@ -224,11 +227,16 @@ impl Engine {
 }
 
 fn address_for_text(encoder: &TorPhaseEncoder, data: &[u8]) -> LorentzVector {
-    let (fast, slow) = encoder.project_increments(data);
+    let mut state = PhaseState::ZERO;
+    for chunk in data.chunks(2) {
+        let (df, ds) = encoder.project_increments(chunk);
+        state = encoder.evolve(state, df, ds);
+    }
+    let phi = encoder.phi(state.psi);
     let mut direction = [
-        Q32_31::from_f64(fast.to_f64().cos()),
-        Q32_31::from_f64(slow.to_f64().sin()),
-        Q32_31::from_f64(0.1),
+        Q32_31::from_f64(state.theta_f.to_f64().cos() + 0.35 * phi[0].to_f64()),
+        Q32_31::from_f64(state.theta_s.to_f64().sin() + 0.35 * phi[1].to_f64()),
+        Q32_31::from_f64(0.1 + 0.35 * phi[2].to_f64()),
     ];
     let norm_sq = (direction[0] * direction[0])
         + (direction[1] * direction[1])
@@ -239,11 +247,9 @@ fn address_for_text(encoder: &TorPhaseEncoder, data: &[u8]) -> LorentzVector {
         direction[1] = direction[1] * inv;
         direction[2] = direction[2] * inv;
     }
-    let boosted = LorentzVector::boost(
-        &LorentzVector::origin(),
-        &direction,
-        Q32_31::from_f64(0.5),
-    );
+    // Variable rapidity tracked from PhaseState amplitude channel instead of fixed 0.5 boost
+    let rapidity = Q32_31::from_f64(0.25 + 0.35 * state.amplitude.to_f64());
+    let boosted = LorentzVector::boost_rapidity(&LorentzVector::origin(), &direction, rapidity);
     PicardMapper::map_to_fundamental_domain(&boosted)
 }
 

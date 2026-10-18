@@ -1725,16 +1725,9 @@ impl CarvedSwarmMap {
         let mut novel_atoms = 0usize;
 
         for (&old_id, atom) in &other.global_atoms {
-            let payload_vec: Vec<u8> = if compact_carrier_payloads
-                && atom.payload.len() > 4096
-                && !atom.payload.starts_with(b"ATOMA_OP")
-                && !atom.payload.starts_with(b"ATOMA_KV_V1\0")
-            {
-                // Compress 26.6 KB raw f32 carrier state down to its first 256 floats (1024 B)
-                atom.payload[..1024.min(atom.payload.len())].to_vec()
-            } else {
-                atom.payload.as_ref().to_vec()
-            };
+            // Preserve all dimensions for storage without truncating carrier payloads to 1024 bytes
+            let _ = compact_carrier_payloads;
+            let payload_vec: Vec<u8> = atom.payload.as_ref().to_vec();
 
             let refracted = RefractedPoint {
                 poincare_ball: atom.poincare_ball,
