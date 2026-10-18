@@ -562,6 +562,9 @@ pub struct CarvedSwarmMap {
     pub ingested_tensor_digests: std::collections::BTreeSet<Sha256Digest>,
     /// Directed geodesic reasoning transitions (`1-cells`) distilled from teacher reasoning chains.
     pub reasoning_arcs: Vec<DistilledReasoningArc>,
+    /// Number of verified base reasoning arcs (`0..locked_arc_count`) that are immutably locked
+    /// against overwrite while allowing novel live trajectories from new chats to append.
+    pub locked_arc_count: usize,
     /// O(1) outgoing-arc adjacency index (`from_atom.0 -> Vec<reasoning_arcs_index>`).
     outgoing_arcs_by_atom: BTreeMap<u64, Vec<usize>>,
     /// The 12 carved specialist silos (`L1`..`L12`).
@@ -603,6 +606,7 @@ impl CarvedSwarmMap {
             novelty_buckets: BTreeMap::new(),
             ingested_tensor_digests: std::collections::BTreeSet::new(),
             reasoning_arcs: Vec::new(),
+            locked_arc_count: 0,
             outgoing_arcs_by_atom: BTreeMap::new(),
             silos,
             last_carve_loss: CarveLossReport {
@@ -1003,6 +1007,13 @@ impl CarvedSwarmMap {
                     && existing.step_index == arc.step_index
                     && existing.wigner_frame == arc.wigner_frame
                 {
+                    // IMMUTABLE VERIFIED TRAJECTORY LOCK:
+                    // Once verified trajectories are locked in the map (`idx < self.locked_arc_count`),
+                    // or if the existing arc has higher certainty or a valid lexical token against a stub byte,
+                    // never overwrite `existing.to_atom` or `existing.compiled_mlir_op`.
+                    if idx < self.locked_arc_count {
+                        return (existing.arc_id, false);
+                    }
                     existing.to_atom = arc.to_atom;
                     existing.compiled_mlir_op = arc.compiled_mlir_op;
                     existing.cosh_action_q32 = arc.cosh_action_q32;
@@ -1669,12 +1680,20 @@ impl CarvedSwarmMap {
             });
         }
 
+        self.locked_arc_count = self.reasoning_arcs.len();
         self.recarve_all_twelve(policy);
         Ok((
             self.global_atoms.len(),
             self.reasoning_arcs.len(),
             expected_sha,
         ))
+    }
+
+    /// Immutably lock all currently stored verified reasoning trajectories (`0..self.reasoning_arcs.len()`)
+    /// so subsequent live chat trajectories append from the next chat forward without overwriting base paths.
+    pub fn lock_verified_trajectories(&mut self) -> usize {
+        self.locked_arc_count = self.reasoning_arcs.len();
+        self.locked_arc_count
     }
 
     /// Merge another `.atoma_map` binary vault into `self`, coalescing `0-cell` coordinates
@@ -1753,6 +1772,11 @@ impl CarvedSwarmMap {
 
         let mut novel_arcs = 0usize;
         for mut arc in other.reasoning_arcs {
+            // Filter out legacy single-byte stub opcodes (0..63) only on unchained static arcs (`chain_id == 0`),
+            // while preserving all real BPE token trajectory arcs (`chain_id != 0`, including '.' = 26 and ',' = 24).
+            if arc.chain_id == 0 && arc.compiled_mlir_op.0 < 64 {
+                continue;
+            }
             let Some(&new_from) = id_remap.get(&arc.from_atom.0) else {
                 continue;
             };

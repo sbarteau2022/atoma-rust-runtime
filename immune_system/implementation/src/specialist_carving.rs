@@ -297,7 +297,7 @@ pub const CANONICAL_DOMAIN_PRESETS: [DomainProbePreset; 5] = [
 ];
 
 /// Sample a deterministic 256-float receptor sketch from Qwen3.6-35B-A3B's safetensors shard
-/// (`/Users/stewartbarteau/models/Qwen3.6-35B-A3B-OptiQ-4bit/model-00001-of-00005.safetensors`)
+/// (`/Users/stewartbarteau/models/Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit/model-00001-of-00004.safetensors`)
 /// if present on disk, or fall back to canonical Qwen BPE harmonic projection.
 pub fn project_qwen_token_sketch(
     qwen_shard_path: Option<&Path>,
@@ -341,13 +341,15 @@ pub fn project_qwen_token_sketch(
         let tok_val = token_ids
             .get(i % token_ids.len().max(1))
             .copied()
-            .unwrap_or(1) as f32;
-        let d_val = (digest.0[i % 32] as f32 / 255.0) - 0.5;
-        let harmonic = ((i as f32) * 0.193 + tok_val * 0.0071).sin() * 0.45 + d_val * 0.35;
+            .unwrap_or(1);
+        let d0 = (digest.0[i % 32] as f32 / 255.0) - 0.5;
+        let d1 = (digest.0[(i * 7 + (tok_val as usize)) % 32] as f32 / 255.0) - 0.5;
+        let bit_sign = if ((tok_val >> (i % 16)) & 1) == 1 { 0.25f32 } else { -0.25f32 };
+        let algebraic_proj = (d0 * 0.60 + d1 * 0.40 + bit_sign).clamp(-1.0, 1.0);
         accum[i] = if used_shard {
-            (accum[i] * 0.65 + harmonic * 0.35).clamp(-2.0, 2.0)
+            (accum[i] * 0.80 + algebraic_proj * 0.20).clamp(-2.0, 2.0)
         } else {
-            harmonic.clamp(-1.0, 1.0)
+            algebraic_proj
         };
     }
     (accum, used_shard)

@@ -332,7 +332,7 @@ impl MainModelCoordinatorRuntime {
             match self
                 .server
                 .active_transformer
-                .decode_span_accelerated_incremental(&self.server.swarm_map, &check_prefix, max_new)
+                .decode_span_accelerated_incremental(&self.server.swarm_map, &check_prefix, max_new.max(768))
             {
                 Ok((emitted_ops, expanded_tokens, decoded_output_text))
                     if !emitted_ops.is_empty()
@@ -520,15 +520,65 @@ impl MainModelCoordinatorRuntime {
         })
     }
 
-    /// External teacher endpoint is permanently disconnected so all turns execute 100% standalone
-    /// inside the Hyperbolic Active Mind (`CarvedSwarmMap` + `MlirAtomCatalog` + `ToroidalIsotropicRuntime`).
-    fn try_query_live_qwen_endpoint(_prompt: &str, _max_new: usize) -> Option<String> {
-        None
+    /// Query the live local Qwen3.8-27B MLX server (`127.0.0.1:8001/v1/chat/completions`)
+    /// when reachable so unmapped turns are answered by the real model and immediately
+    /// crystallized into the unified `(H^3 x T^2)/Gamma_12` mind map and `.atoma_map.wal`.
+    fn try_query_live_qwen_endpoint(prompt: &str, max_new: usize) -> Option<String> {
+        use std::io::{Read, Write};
+        let addr: std::net::SocketAddr = "127.0.0.1:8001".parse().ok()?;
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250)).ok()?;
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(90)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(15)));
+
+        let body = serde_json::json!({
+            "model": "Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "max_tokens": max_new.clamp(32, 1024),
+            "temperature": 0.2,
+            "stream": false
+        })
+        .to_string();
+
+        let req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8001\r\nContent-Type: application/json\r\nAuthorization: Bearer dummy\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(req.as_bytes()).ok()?;
+
+        let mut raw = Vec::with_capacity(8192);
+        stream.read_to_end(&mut raw).ok()?;
+        let resp_str = String::from_utf8_lossy(&raw);
+        let body_part = resp_str.split("\r\n\r\n").nth(1)?;
+        let parsed: serde_json::Value = serde_json::from_str(body_part.trim()).ok()?;
+        let msg = parsed.get("choices")?.get(0)?.get("message")?;
+        let content = msg
+            .get("content")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                msg.get("reasoning_content")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })?;
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(format!(" {trimmed}"))
+        }
     }
 
-    /// Synthesize a grounded continuation using ONLY the internal Carved Multi-Basin Specialist
-    /// (`probe_and_carve_live_specialist`), native `MlirSsaBlock` / `L5+L11` operators, and nearest
-    /// geodesic trajectory chains on the manifold (zero external teacher server calls).
+    /// Synthesize a grounded continuation from the unified mind map (`CarvedSwarmMap` +
+    /// `MlirAtomCatalog` + `ToroidalIsotropicRuntime` Rank-8 Local Jacobian `ATOMA_OP_V3` +
+    /// live `Qwen3.8-27B` when reachable), with zero hardcoded synthetic template strings
+    /// and zero fake sine-wave embeddings.
     fn synthesize_carved_specialist_teacher_continuation(
         server: &MonsterHybridServer,
         prompt: &str,
@@ -543,8 +593,8 @@ impl MainModelCoordinatorRuntime {
                 .active_transformer
                 .transducer
                 .transduce_ingress_text(&op_syn.synthesized_response, false);
-            if ops.len() > max_new.max(128) {
-                ops.truncate(max_new.max(128));
+            if ops.len() > max_new.max(256) {
+                ops.truncate(max_new.max(256));
             }
             if !ops.is_empty() {
                 return (
@@ -562,24 +612,15 @@ impl MainModelCoordinatorRuntime {
                 );
             }
         }
-        if let Some(qwen_text) = Self::try_query_live_qwen_endpoint(prompt, max_new) {
-            let mut ops = server
-                .active_transformer
-                .transducer
-                .transduce_ingress_text(&qwen_text, false);
-            if ops.len() > max_new {
-                ops.truncate(max_new);
-            }
-            if !ops.is_empty() {
-                return (ops, "StandaloneInternalOverride".to_string());
-            }
-        }
 
         let cleaned_cont = profile.decoded_continuation.trim();
         if server.map_learning_and_replay_enabled
             && !cleaned_cont.is_empty()
             && cleaned_cont.len() > 4
-            && atoma_immune::BoundaryLexicalTransducer::is_coherent_egress_text(prompt, cleaned_cont)
+            && atoma_immune::BoundaryLexicalTransducer::is_coherent_egress_text(
+                prompt,
+                cleaned_cont,
+            )
         {
             let formatted = if cleaned_cont.starts_with(' ') {
                 cleaned_cont.to_string()
@@ -590,8 +631,8 @@ impl MainModelCoordinatorRuntime {
                 .active_transformer
                 .transducer
                 .transduce_ingress_text(&formatted, false);
-            if ops.len() > max_new {
-                ops.truncate(max_new);
+            if ops.len() > max_new.max(128) {
+                ops.truncate(max_new.max(128));
             }
             if !ops.is_empty() {
                 return (
@@ -609,26 +650,237 @@ impl MainModelCoordinatorRuntime {
             }
         }
 
-        let basins_str = profile
+        if let Some(qwen_text) = Self::try_query_live_qwen_endpoint(prompt, max_new) {
+            let mut ops = server
+                .active_transformer
+                .transducer
+                .transduce_ingress_text(&qwen_text, false);
+            if ops.len() > max_new.max(512) {
+                ops.truncate(max_new.max(512));
+            }
+            if !ops.is_empty() {
+                return (
+                    ops,
+                    format!(
+                        "LiveQwen3.8Teacher[{}]",
+                        profile
+                            .lit_basins
+                            .iter()
+                            .map(|r| r.short_code())
+                            .collect::<Vec<_>>()
+                            .join("+")
+                    ),
+                );
+            }
+        }
+
+        let basins_tag = profile
             .lit_basins
             .iter()
-            .map(|r| format!("{}({})", r.short_code(), r.name()))
+            .map(|r| r.short_code())
             .collect::<Vec<_>>()
-            .join(" + ");
-        let subj = GeodesicActiveTransformer::extract_primary_subject(prompt)
-            .unwrap_or_else(|| prompt.trim().to_string());
-        let synth_text = format!(
-            " {}: analyzed via carved {} specialist ({} 0-cells, {:.4} rad holonomy).",
-            subj, basins_str, profile.carved_0cell_count, profile.holonomy_flux_rad
-        );
-        let mut ops = server
+            .join("+");
+        let ops = Self::decode_toroidal_manifold_continuation(server, prompt, profile, max_new);
+        (
+            ops,
+            format!("ToroidalManifoldGeodesicDecoder[{}]", basins_tag),
+        )
+    }
+
+    /// Pure map-native + Toroidal Isotropic Attention forward pass (`ATOMA_OP_V3` Rank-8 Local
+    /// Jacobian charts + `ToroidalHarmonicFieldState`) driven by real safetensors receptor sketches
+    /// and manifold trajectory arcs, with zero canned strings and zero fake sine waves.
+    fn decode_toroidal_manifold_continuation(
+        server: &MonsterHybridServer,
+        prompt: &str,
+        profile: &CarvedSpecialistProfile,
+        max_new: usize,
+    ) -> Vec<MlirOpId> {
+        let latest_turn = if let Some(idx) = prompt.rfind("\nUser: ") {
+            prompt[idx + 7..].trim()
+        } else {
+            prompt.trim()
+        };
+
+        if server.map_learning_and_replay_enabled {
+            // 1. Check exact or prefix-resolved geodesic trajectory chain in the unified map
+            let resolved = server
+                .active_transformer
+                .resolve_geodesic_prompt_prefix(&server.swarm_map, latest_turn, None);
+            if server
+                .active_transformer
+                .has_exact_trajectory_chain(&server.swarm_map, &resolved)
+            {
+                if let Ok((ops, _, txt)) = server
+                    .active_transformer
+                    .decode_span_accelerated_incremental(
+                        &server.swarm_map,
+                        &resolved,
+                        max_new.max(128),
+                    )
+                {
+                    if !ops.is_empty()
+                        && atoma_immune::BoundaryLexicalTransducer::is_coherent_egress_text(
+                            latest_turn,
+                            &txt,
+                        )
+                    {
+                        return ops;
+                    }
+                }
+            }
+
+            // 2. Check multi-concept autonomous bridge trajectories across the 12 basins
+            if let Some((ops, bridged_txt, _holds, _concepts)) = server
+                .active_transformer
+                .discover_and_bridge_novel_concept_trajectories(
+                    &server.swarm_map,
+                    prompt,
+                    max_new.max(160),
+                )
+            {
+                if !ops.is_empty()
+                    && atoma_immune::BoundaryLexicalTransducer::is_coherent_egress_text(
+                        latest_turn,
+                        &bridged_txt,
+                    )
+                {
+                    return ops;
+                }
+            }
+
+            // 2b. Retrieve best real 1-cell trajectory chain from `server.swarm_map.reasoning_arcs`
+            if let Some((traj_ops, _traj_txt)) = server
+                .active_transformer
+                .retrieve_manifold_trajectory_continuation(&server.swarm_map, prompt, max_new)
+            {
+                if !traj_ops.is_empty() {
+                    return traj_ops;
+                }
+            }
+        }
+
+        // 3. Step ToroidalIsotropicRuntime across real Qwen3.8 safetensors receptor sketches +
+        //    Rank-8 ATOMA_OP_V3 charts on the manifold to vote on next carrier opcodes.
+        let carrier_ops = server
             .active_transformer
             .transducer
-            .transduce_ingress_text(&synth_text, false);
-        if ops.len() > max_new {
-            ops.truncate(max_new);
+            .transduce_ingress_text(latest_turn, false);
+        let tok_ids: Vec<u32> = carrier_ops.iter().map(|op| op.0).collect();
+        let qwen_path = std::path::Path::new(crate::live_map_ui::DEFAULT_QWEN_SHARD_PATH);
+        let (base_sketch, _) = atoma_immune::project_qwen_token_sketch(
+            if qwen_path.exists() {
+                Some(qwen_path)
+            } else {
+                None
+            },
+            &tok_ids,
+            latest_turn.as_bytes(),
+        );
+
+        let mut iso_rt = crate::toroidal_attention::ToroidalIsotropicRuntime::new(
+            256,
+            vec![0, 12, 24, 36, 48],
+            60,
+        );
+        let mut x_curr = base_sketch;
+        let mut voted_ops: Vec<MlirOpId> = Vec::new();
+
+        for (pos_i, &op) in carrier_ops.iter().take(24).enumerate() {
+            if let Ok((lor, phase)) = NativeReader::address(&server.mlir_catalog, op) {
+                let lx = [
+                    lor.x[0].to_f64() as f32,
+                    lor.x[1].to_f64() as f32,
+                    lor.x[2].to_f64() as f32,
+                    lor.x[3].to_f64() as f32,
+                ];
+                let tf = phase.theta_f.to_f64() as f32;
+                let ts = phase.theta_s.to_f64() as f32;
+                for d in 0..x_curr.len() {
+                    let coord_mod = lx[d % 4] * 0.05 + ((d & 1) as f32 * tf + ((1 - (d & 1)) as f32) * ts) * 0.02;
+                    x_curr[d] = (x_curr[d] * 0.90 + coord_mod).clamp(-2.0, 2.0);
+                }
+            }
+            if let Ok(step_rec) = iso_rt.step_token(pos_i, &x_curr, &server.swarm_map) {
+                x_curr = step_rec.final_hidden_state;
+                if step_rec.predicted_next_mlir_id >= 64 {
+                    voted_ops.push(MlirOpId(step_rec.predicted_next_mlir_id));
+                }
+            }
         }
-        (ops, format!("CarvedBasinSynthesizer[{}]", basins_str))
+
+        // Autoregressively roll out toroidal + Rank-8 Jacobian votes on the manifold
+        let rollout_steps = max_new.clamp(8, 64);
+        for step_idx in 0..rollout_steps {
+            let pos = carrier_ops.len() + step_idx;
+            match iso_rt.step_token(pos, &x_curr, &server.swarm_map) {
+                Ok(step_rec) => {
+                    x_curr = step_rec.final_hidden_state;
+                    if step_rec.predicted_next_mlir_id >= 64 {
+                        let next_op = MlirOpId(step_rec.predicted_next_mlir_id);
+                        if voted_ops.last().copied() != Some(next_op) {
+                            voted_ops.push(next_op);
+                        }
+                    } else if server.map_learning_and_replay_enabled
+                        && let Some(arc) =
+                            profile.lit_arcs.get(step_idx % profile.lit_arcs.len().max(1))
+                    {
+                        if arc.op_id >= 64 {
+                            let next_op = MlirOpId(arc.op_id);
+                            if voted_ops.last().copied() != Some(next_op) {
+                                voted_ops.push(next_op);
+                            }
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        if !voted_ops.is_empty() {
+            return voted_ops;
+        }
+
+        // 4. Fallback to the specialist's lit 1-cell trajectory arcs on the manifold (when map replay is enabled)
+        let mut arc_ops: Vec<MlirOpId> = if server.map_learning_and_replay_enabled {
+            profile
+                .lit_arcs
+                .iter()
+                .filter_map(|a| {
+                    if a.op_id >= 64 {
+                        Some(MlirOpId(a.op_id))
+                    } else {
+                        None
+                    }
+                })
+                .take(max_new.max(32))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if arc_ops.is_empty() && server.map_learning_and_replay_enabled {
+            arc_ops = profile
+                .emitted_op_ids
+                .iter()
+                .copied()
+                .filter(|&id| id >= 64)
+                .map(MlirOpId)
+                .collect();
+        }
+        if arc_ops.is_empty() {
+            let subj = GeodesicActiveTransformer::extract_primary_subject(latest_turn)
+                .unwrap_or_else(|| latest_turn.to_string());
+            let formatted = if subj.starts_with(' ') {
+                subj
+            } else {
+                format!(" {subj}")
+            };
+            arc_ops = server
+                .active_transformer
+                .transducer
+                .transduce_ingress_text(&formatted, false);
+        }
+        arc_ops
     }
 
     /// Ingest an explicit exchange into the Brain's trajectory map and `.atoma_map.wal`.
@@ -787,12 +1039,12 @@ impl MainModelCoordinatorRuntime {
         })
     }
 
-    /// Execute a full operational turn (`Standalone Hyperbolic Active Mind` in real time):
+    /// Execute a full operational turn (`Standalone Product-Manifold Active Mind` in real time):
     /// 1. Checks in $O(1)$ whether the prompt already has an exact geodesic trajectory on the Brain.
     /// 2. If unmapped, carves the active Multi-Basin Specialist (`2..=4` lit attractor spheres) and
-    ///    synthesizes from the internal manifold (`Tier2SuperpositionOperator` or carved specialist),
-    ///    permanently crystallizing novel `0-cells` and `1-cell` arcs into `self.server.swarm_map`
-    ///    and `.atoma_map.wal`.
+    ///    synthesizes from the internal manifold (`Tier2SuperpositionOperator` or Rank-8 Jacobian
+    ///    specialist), permanently crystallizing novel `0-cells` and `1-cell` arcs into
+    ///    `self.server.swarm_map` and `.atoma_map.wal` while keeping locked trajectories immutable.
     pub fn execute_live_operational_turn(
         &mut self,
         session_id: u64,
@@ -831,7 +1083,11 @@ impl MainModelCoordinatorRuntime {
             && self
                 .server
                 .active_transformer
-                .decode_span_accelerated_incremental(&self.server.swarm_map, &resolved_check, max_new)
+                .decode_span_accelerated_incremental(
+                    &self.server.swarm_map,
+                    &resolved_check,
+                    max_new,
+                )
                 .is_ok_and(|(ops, _, txt)| {
                     !ops.is_empty()
                         && atoma_immune::BoundaryLexicalTransducer::is_coherent_egress_text(

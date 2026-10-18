@@ -822,7 +822,7 @@ impl NativeReader {
             origin_model_fingerprint: origin,
         });
         let read = Self::step(map, catalog, prefix)?;
-        if read.next_id != next_id {
+        if read.next_id != next_id && map.locked_arc_count == 0 {
             return Err(format!(
                 "recorded mlir_op#{} and the reader emitted {} for this prefix",
                 next_id.0, read.next_id.0

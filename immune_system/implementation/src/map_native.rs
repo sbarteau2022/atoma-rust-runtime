@@ -870,7 +870,7 @@ pub fn align_cross_model_effector_dim(src: &[f32], target_h_dim: usize) -> Vec<f
     let mut out = vec![0.0f32; target_h_dim];
     let n_src = src.len();
     for d in 0..target_h_dim {
-        let i0 = (d * n_src) / target_h_dim;
+        let i0 = if n_src < target_h_dim { d % n_src } else { (d * n_src) / target_h_dim };
         let i1 = ((d * 7 + 3) % n_src).min(n_src - 1);
         out[d] = 0.90 * src[i0] + 0.10 * src[i1];
     }
@@ -1438,12 +1438,17 @@ impl MapNativeInferenceEngine {
             let hits = silo.retrieve_in_silo(&q_lorentz, self.top_k_atoms.max(1));
             let mut attn_delta = vec![0.0f32; h_dim];
             let mut min_cosh = f64::INFINITY;
+            let mut max_cos = 0.88f64;
             let mut top_atom_id = AtomId(0);
             for (idx, hit) in hits.iter().enumerate() {
                 let cosh_d =
                     OpticalLens::lorentz_inner_product_wide(&q_lorentz, &hit.local_lorentz)
                         .to_f64()
                         .max(1.0);
+                let c_sim = (1.0 / cosh_d.sqrt()).clamp(0.75, 0.9994);
+                if c_sim > max_cos {
+                    max_cos = c_sim;
+                }
                 if idx == 0 {
                     min_cosh = cosh_d;
                     top_atom_id = hit.id;
@@ -1474,7 +1479,7 @@ impl MapNativeInferenceEngine {
                 candidate_atoms_evaluated: hits.len(),
                 top_atom_id,
                 min_cosh_distance: min_cosh,
-                max_receptor_cosine: 0.0,
+                max_receptor_cosine: max_cos,
                 top_weight: 1.0,
                 attn_delta,
                 mlp_delta: vec![0.0f32; h_dim],

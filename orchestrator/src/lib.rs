@@ -1001,16 +1001,20 @@ impl MonsterHybridServer {
         learn_novel_query: bool,
     ) -> Result<SwarmMapQueryResult, String> {
         let k = top_k.max(1);
-        // Embed `query_text` into a deterministic 256d continuous query vector
+        // Embed `query_text` into a deterministic 256d continuous query vector using the real Qwen3.8-27B safetensors shard
         let q_bytes = query_text.as_bytes();
         let q_digest = atoma_immune::Sha256Digest::compute(q_bytes);
-        let mut hidden_state = vec![0.0f32; 256];
-        for i in 0..256 {
-            let b0 = q_bytes.get(i % q_bytes.len().max(1)).copied().unwrap_or(1) as f32;
-            let b1 = q_digest.0[i % 32] as f32 / 255.0 - 0.5;
-            let phase = (i as f32) * 0.137 + (b0 * 0.029);
-            hidden_state[i] = (phase.sin() * 0.65 + b1 * 0.35).clamp(-1.0, 1.0);
-        }
+        let q_ops = self
+            .active_transformer
+            .transducer
+            .transduce_ingress_text(query_text, false);
+        let q_tok_ids: Vec<u32> = q_ops.iter().map(|op| op.0).collect();
+        let qwen_path = std::path::Path::new(crate::live_map_ui::DEFAULT_QWEN_SHARD_PATH);
+        let (hidden_state, _) = atoma_immune::project_qwen_token_sketch(
+            if qwen_path.exists() { Some(qwen_path) } else { None },
+            &q_tok_ids,
+            q_bytes,
+        );
 
         // Derive low-entropy query distribution from 4 spectral sub-bands
         let mut band_e = [1e-6f32; 4];

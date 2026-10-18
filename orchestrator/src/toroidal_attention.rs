@@ -1,8 +1,20 @@
-//! Tier 4–6 map attention experiment (CARVED_SWARM_SPEC.md §1, MASTER_ARCHITECT.md B1).
+//! Recurrent Linear Attention with 2nd-Order Trigonometric Kernel Feature Maps & Subgraph Retrieval.
 //!
-//! The central `CarvedSwarmMap` is the only candidate authority. Its carved silo controls
-//! visibility, its T² coordinates supply the map-phase arm, and typed KV payloads carry
-//! explicit layer, head, sequence, and token positions so the causal mask can be applied before normalization.
+//! ### Prior Work & Verified Industry-Standard ML Terminology
+//! - **Recurrent Linear Attention (`O(N)` Complexity, `O(1)` Autoregressive State)**:
+//!   Directly implements the linear-attention recurrence of **Katharopoulos, Vyas, Pappas, & Fleuret
+//!   (ICML 2020), *"Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention"***.
+//!   By expressing self-attention similarity as a dot product of explicit kernel feature maps
+//!   `k(q, k) = <phi(q), phi(k)>` and applying matrix multiplication associativity
+//!   `(phi(Q) phi(K)^T) V = phi(Q) (phi(K)^T V)`, autoregressive sequence complexity drops from
+//!   `O(N^2)` to `O(N)` with a fixed-size recurrent state (`S_t`, `Z_t`) updated in `O(1)` per token.
+//! - **Rotary Position Embedding (RoPE) Polar Pair Decomposition**:
+//!   Pairs consecutive hidden dimensions `(x_{2p}, x_{2p+1})` into 2D polar coordinates `(r_p, theta_p)`
+//!   following **Su et al. (2024), *"RoFormer: Enhanced Transformer with Rotary Position Embedding"***.
+//! - **2nd-Order Fourier / Trigonometric Kernel Feature Map**:
+//!   Uses the 5-dimensional trigonometric feature map
+//!   `phi(theta) = [sqrt(3/2), sqrt(2) cos(theta), sqrt(2) sin(theta), (1/sqrt(2)) cos(2*theta), (1/sqrt(2)) sin(2*theta)]^T`
+//!   so `<phi(theta_q), phi(theta_k)> = (1 + cos(theta_q - theta_k))^2 >= 0`.
 
 use atoma_immune::cache::geometric::{AtomId, Phase};
 use atoma_immune::geometry::bridge::f32_to_atom_address;
@@ -183,7 +195,7 @@ pub fn pair_coherence(query: &[f32], key: &[f32]) -> Result<f64, String> {
     Ok((1.0 + real / real.hypot(imag)).clamp(0.0, 2.0))
 }
 
-/// Amplitude-weighted multi-pair toroidal phase coherence on `(R_+ × S^1)^(D/2)`:
+/// Amplitude-weighted multi-pair RoPE polar phase similarity on `(R_+ × S^1)^(D/2)`:
 /// Decomposes each consecutive 2D RoPE pair into polar modulus `r = hypot(x0, x1)` and
 /// phase angle `θ = atan2(x1, x0)`, summing `r_q * r_k * cos(θ_q - θ_k) * dot_scale`.
 pub fn radial_pair_toroidal_coherence(
@@ -227,8 +239,7 @@ pub struct LinearMapValueAdapter {
 impl LinearMapValueAdapter {
     pub fn validate(&self) -> Result<(), String> {
         if self.head_dim == 0
-            || (self.input_dim != self.head_dim * 2 + 1
-                && self.input_dim != self.head_dim * 3 + 1)
+            || (self.input_dim != self.head_dim * 2 + 1 && self.input_dim != self.head_dim * 3 + 1)
             || self.weights.len() != self.input_dim
             || self
                 .weights
@@ -334,7 +345,7 @@ pub fn weighted_values(weights: &[f64], values: &[Vec<f32>], dim: usize) -> Vec<
 impl MonsterHybridServer {
     /// Fit one gain on fit-half captures only. The unfitted `g=1` arm is
     /// always measured separately; this method never changes the serving mode.
-    #[allow(clippy::too_many_arguments)] // Captured sample provenance and the fit grid are explicit.
+    #[allow(clippy::too_many_arguments)]
     pub fn fit_map_attention_gain(
         &mut self,
         role: RoleId,
@@ -449,7 +460,7 @@ impl MonsterHybridServer {
     /// Evaluate one layer against the central map. `query` and stored keys must
     /// already be transformed exactly as the caller's model consumes them (after
     /// QK norm and RoPE where applicable). No model weights are loaded here.
-    #[allow(clippy::too_many_arguments)] // Layer, token, and phase provenance must be explicit at the map boundary.
+    #[allow(clippy::too_many_arguments)]
     pub fn evaluate_map_attention_layer(
         &mut self,
         role: RoleId,
@@ -626,24 +637,31 @@ impl MonsterHybridServer {
     }
 }
 
-/// Fixed-size `O(1)` 2nd-order Fourier-Toroidal Harmonic Field State on `(R_+ x S^1)^(D/2)`.
+/// **Recurrent Linear Attention State with 2nd-Order Trigonometric Kernel Feature Map (`O(1)` State)**
 ///
-/// By expanding the isotropic toroidal kernel `K(theta_q, theta_k) = (1 + cos(theta_q - theta_k))^2`
-/// into circular harmonics `{1, cos(theta), sin(theta), cos(2*theta), sin(2*theta)}`, any causal
-/// sequence of length `N` (`1K .. 10M+` tokens) is compressed into five `D`-dimensional harmonic
-/// moment vectors (`O(1)` memory, `O(D)` per-token update & query time, zero KV cache growth).
+/// ### Prior Work Attribution
+/// Implements the recurrent linear attention formulation of **Katharopoulos, Vyas, Pappas, & Fleuret
+/// (ICML 2020), *"Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention"***,
+/// coupled with polar Rotary Position Embedding pairs (`(R_+ x S^1)^(D/2)`).
+///
+/// By expressing the non-negative 2nd-order trigonometric kernel
+/// `k(theta_q, theta_k) = (1 + cos(theta_q - theta_k))^2 = 3/2 + 2 cos(theta_q - theta_k) + 1/2 cos(2(theta_q - theta_k))`
+/// as an inner product of 5-dimensional trigonometric feature maps
+/// `phi(theta) = [sqrt(3/2), sqrt(2) cos(theta), sqrt(2) sin(theta), (1/sqrt(2)) cos(2*theta), (1/sqrt(2)) sin(2*theta)]^T`
+/// and applying the associative property of matrix multiplication `(phi(Q) phi(K)^T) V = phi(Q) (phi(K)^T V)`,
+/// sequence complexity drops from `O(N^2)` to `O(N)` with a fixed-size `O(1)` recurrent state
+/// (`m_*` numerator accumulators and `z_*` normalizer accumulators) per token.
 #[derive(Debug, Clone)]
 pub struct ToroidalHarmonicFieldState {
     pub hidden_dim: usize,
     pub tokens_ingested: usize,
-    /// Scalar partition accumulators for `{1, cos(theta), sin(theta), cos(2*theta), sin(2*theta)}`
-    /// averaged across the `D/2` polar pairs.
+    /// Normalizer accumulators `Z_t = sum_{i<=t} gamma^{t-i} phi(k_i)` for the 5 trigonometric basis terms.
     pub z_0: f64,
     pub z_c1: Vec<f64>,
     pub z_s1: Vec<f64>,
     pub z_c2: Vec<f64>,
     pub z_s2: Vec<f64>,
-    /// Value moment accumulators weighted by each circular harmonic per pair.
+    /// Recurrent state numerator accumulators `S_t = sum_{i<=t} gamma^{t-i} phi(k_i) (x) v_i`.
     pub m_0: Vec<f64>,
     pub m_c1: Vec<f64>,
     pub m_s1: Vec<f64>,
@@ -670,8 +688,9 @@ impl ToroidalHarmonicFieldState {
         }
     }
 
-    /// Update the `O(1)` toroidal harmonic field state with a new causal token state `x_in`
-    /// and query the resulting phase-coherent context vector in `O(D)` time.
+    /// Update the `O(1)` recurrent linear attention state (`S_t`, `Z_t`) with a new causal token
+    /// vector `x_in` and compute `<phi(q_t), S_t> / <phi(q_t), Z_t>` in `O(D)` time
+    /// (Katharopoulos et al., ICML 2020, Eq. 5–6).
     pub fn step_and_readout(&mut self, x_in: &[f32], decay: f64) -> Vec<f32> {
         let d_len = x_in.len().min(self.hidden_dim);
         let pairs = d_len / 2;
@@ -747,7 +766,7 @@ impl ToroidalHarmonicFieldState {
         }
         self.tokens_ingested += 1;
 
-        // O(D) harmonic readout
+        // O(D) linear-attention recurrent readout: <phi(q_t), S_t> / <phi(q_t), Z_t>
         let mut out = vec![0.0f32; x_in.len()];
         for p in 0..pairs {
             let denom = (self.z_0
@@ -770,7 +789,7 @@ impl ToroidalHarmonicFieldState {
     }
 }
 
-/// Receipt for a single layer execution inside the Toroidal Isotropic Transformer Runtime.
+/// Receipt for a single layer execution inside the Recurrent Linear-Attention + Rank-8 Jacobian Runtime.
 #[derive(Debug, Clone)]
 pub struct ToroidalIsotropicLayerReceipt {
     pub layer: usize,
@@ -782,7 +801,7 @@ pub struct ToroidalIsotropicLayerReceipt {
     pub isotropic_rms_radius: f64,
 }
 
-/// Receipt for a full multi-layer step of `ToroidalIsotropicRuntime` ("The Hands of the Mind").
+/// Receipt for a full multi-layer step of `ToroidalIsotropicRuntime`.
 #[derive(Debug, Clone)]
 pub struct ToroidalIsotropicStepReceipt {
     pub position: usize,
@@ -793,17 +812,6 @@ pub struct ToroidalIsotropicStepReceipt {
     pub layer_receipts: Vec<ToroidalIsotropicLayerReceipt>,
     pub final_hidden_state: Vec<f32>,
 }
-
-/// **Toroidal Isotropic Transformer Runtime ("The Hands of the Mind")**
-///
-/// Replaces the frozen dense GPU weight stack and `O(N^2)` KV cache with a weightless,
-/// persistent geometric execution runtime that couples:
-/// 1. **`O(1)` Toroidal Harmonic Field State** on `(R_+ x S^1)^(D/2)` for infinite-horizon
-///    causal phase coherence (`O(D)` time and `O(D)` memory independent of sequence length `N`),
-/// 2. **`ATOMA_OP_V3` Rank-8 Local Jacobian Contraction** over the persistent `(H^3 x T^2)/Gamma_12`
-///    `CarvedSwarmMap`, and
-/// 3. **Isotropic Polar RMS Normalization** across `2D` toroidal pairs so hidden trajectories stay
-///    on the balanced `(R_+ x S^1)^(D/2)` manifold across arbitrarily deep layer stacks.
 
 /// Discrete entity/quantity register slot inside [`ToroidalWorkingMemory`].
 #[derive(Debug, Clone)]
@@ -830,12 +838,12 @@ pub struct PropositionalClauseFrame {
     pub polarity: i8,
 }
 
-/// **Pillar 1 — Compositional Working Memory (`ToroidalWorkingMemory`)**
+/// **Compositional Working Memory (`ToroidalWorkingMemory`)**
 ///
 /// Couples with [`ToroidalHarmonicFieldState`] inside [`ToroidalIsotropicRuntime`] so that
-/// while the harmonic field maintains `O(1)` global phase coherence, the runtime simultaneously
-/// maintains discrete, addressable entity/quantity registers and propositional frames across
-/// sentences, compiling state transitions into deterministic [`atoma_immune::MlirSsaBlock`] (`Q32_31`) ops.
+/// while the recurrent linear-attention state maintains `O(1)` sequence context, the runtime
+/// simultaneously tracks discrete entity/quantity registers and propositional frames across
+/// sentences, compiling arithmetic transitions into deterministic [`atoma_immune::MlirSsaBlock`] (`Q32_31`) ops.
 #[derive(Debug, Clone, Default)]
 pub struct ToroidalWorkingMemory {
     pub registers: Vec<WorkingMemoryRegister>,
@@ -850,9 +858,17 @@ impl ToroidalWorkingMemory {
         Self::default()
     }
 
-    pub fn push_constant(&mut self, entity: &str, unit: &str, val: f64, clause_idx: usize, is_rate: bool) -> u8 {
+    pub fn push_constant(
+        &mut self,
+        entity: &str,
+        unit: &str,
+        val: f64,
+        clause_idx: usize,
+        is_rate: bool,
+    ) -> u8 {
         let id = self.registers.len() as u16;
-        let q32 = atoma_immune::geometry::fixed::Q32_31::from_f64((val / 10_000.0).clamp(-1.99, 1.99));
+        let q32 =
+            atoma_immune::geometry::fixed::Q32_31::from_f64((val / 10_000.0).clamp(-1.99, 1.99));
         self.registers.push(WorkingMemoryRegister {
             reg_id: id,
             entity_key: entity.to_string(),
@@ -869,18 +885,41 @@ impl ToroidalWorkingMemory {
         (id as u8).min(14)
     }
 
-    pub fn emit_binary_op(&mut self, op: char, lhs_reg: u8, rhs_reg: u8, entity: &str, unit: &str, clause_idx: usize) -> f64 {
-        let a = self.registers.get(lhs_reg as usize).map(|r| r.value_f64).unwrap_or(0.0);
-        let b = self.registers.get(rhs_reg as usize).map(|r| r.value_f64).unwrap_or(0.0);
+    pub fn emit_binary_op(
+        &mut self,
+        op: char,
+        lhs_reg: u8,
+        rhs_reg: u8,
+        entity: &str,
+        unit: &str,
+        clause_idx: usize,
+    ) -> f64 {
+        let a = self
+            .registers
+            .get(lhs_reg as usize)
+            .map(|r| r.value_f64)
+            .unwrap_or(0.0);
+        let b = self
+            .registers
+            .get(rhs_reg as usize)
+            .map(|r| r.value_f64)
+            .unwrap_or(0.0);
         let res = match op {
             '+' => a + b,
             '-' => a - b,
             '*' => a * b,
-            '/' => if b.abs() > 1e-12 { a / b } else { 0.0 },
+            '/' => {
+                if b.abs() > 1e-12 {
+                    a / b
+                } else {
+                    0.0
+                }
+            }
             _ => a + b,
         };
         let dst_id = self.registers.len() as u16;
-        let q32 = atoma_immune::geometry::fixed::Q32_31::from_f64((res / 10_000.0).clamp(-1.99, 1.99));
+        let q32 =
+            atoma_immune::geometry::fixed::Q32_31::from_f64((res / 10_000.0).clamp(-1.99, 1.99));
         self.registers.push(WorkingMemoryRegister {
             reg_id: dst_id,
             entity_key: entity.to_string(),
@@ -892,11 +931,20 @@ impl ToroidalWorkingMemory {
             polarity: 1,
         });
         self.ssa_ops.push((op, lhs_reg, rhs_reg));
-        self.trace_steps.push(format!("{:.2} {} {:.2} = {:.2}", a, op, b, res));
+        self.trace_steps
+            .push(format!("{:.2} {} {:.2} = {:.2}", a, op, b, res));
         res
     }
 }
 
+/// **Recurrent Linear-Attention + Rank-8 Local Jacobian Transformer Runtime**
+///
+/// Combines:
+/// 1. **`O(1)` Recurrent Linear Attention (`ToroidalHarmonicFieldState`)** following
+///    **Katharopoulos et al. (ICML 2020)** on RoPE polar pairs `(R_+ x S^1)^(D/2)`,
+/// 2. **`ATOMA_OP_V3` Rank-8 Local Jacobian Function Approximation** over the persistent
+///    product-manifold `(H^3 x T^2)/Gamma_12` `CarvedSwarmMap`, and
+/// 3. **Pair-wise Polar RMS Normalization** so hidden states remain bounded across layers.
 pub struct ToroidalIsotropicRuntime {
     pub hidden_dim: usize,
     pub active_layers: Vec<usize>,
@@ -960,8 +1008,9 @@ impl ToroidalIsotropicRuntime {
         }
     }
 
-    /// Execute one token step through all `active_layers` using `O(1)` Toroidal Harmonic Field
-    /// coherence + `ATOMA_OP_V3` Rank-8 Local Jacobian charts from `swarm_map`.
+    /// Execute one token step through all `active_layers` using `O(1)` Recurrent Linear Attention
+    /// (`ToroidalHarmonicFieldState`, Katharopoulos et al. 2020) + `ATOMA_OP_V3` Rank-8 Local
+    /// Jacobian charts from `swarm_map`.
     pub fn step_token(
         &mut self,
         position: usize,

@@ -6,10 +6,10 @@
 
 use atoma_immune::geometry::fixed::Q32_31;
 use atoma_immune::{
-    CANONICAL_DOMAIN_PRESETS, CarvedSpecialistProfile, DualityAxis, FrozenBaseWeights,
-    INV_SQRT5_Q32, OpticalLens, OpticalRiskEngine, PREREGISTERED_KILL_FINGERPRINT,
-    PreregisteredEvaluation, RegulatoryFramework, RoleId, RoleSignalQ32, RunbookTelemetryQ32,
-    TeacherTapRecord, predict_token_envelope,
+    CANONICAL_DOMAIN_PRESETS, CarvedSpecialistProfile, CoupledOperatorAtomPayload, DualityAxis,
+    FrozenBaseWeights, INV_SQRT5_Q32, OpticalLens, OpticalRiskEngine,
+    PREREGISTERED_KILL_FINGERPRINT, PreregisteredEvaluation, RegulatoryFramework, RoleId,
+    RoleSignalQ32, RunbookTelemetryQ32, TeacherTapRecord, predict_token_envelope,
 };
 use atoma_orchestrator::MonsterHybridServer;
 use atoma_orchestrator::live_map_ui::INTERACTIVE_MAP_VISUALIZER_HTML;
@@ -30,13 +30,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             || a == "--serve"
             || a == "--probe-domains"
             || a == "--probe"
+            || a == "--rebuild-clean-rank8-vault"
+            || a == "--distill-safetensors"
+            || a == "--distill-model-dir"
+            || a == "--distill-full"
     });
     let run_boot_demo = !wants_query_or_serve || args.iter().any(|a| a == "--self-test");
 
-    // 1. Freeze shared 52-layer base weights (Qualification #8: Base is never modified)
-    let synthetic_weights: Vec<f32> = (0..16_384).map(|i| ((i as f32) * 0.007).cos()).collect();
-    let frozen_base =
-        FrozenBaseWeights::freeze("Muse-Glimmer-52L-SharedView", 52, synthetic_weights);
+    // 1. Freeze shared 60-layer base weights from real Qwen3.8-27B safetensors shard on disk (Qualification #8)
+    let qwen_shard_path = std::path::Path::new(
+        "/Users/stewartbarteau/models/Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit/model-00001-of-00004.safetensors",
+    );
+    let (base_sketch, _) = atoma_immune::project_qwen_token_sketch(
+        if qwen_shard_path.exists() {
+            Some(qwen_shard_path)
+        } else {
+            None
+        },
+        &[1, 2, 3, 4, 5, 6, 7, 8],
+        b"Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit-Unified-Mind",
+    );
+    let frozen_base = FrozenBaseWeights::freeze(
+        "Qwen3.8-27B+Muse-Glimmer-UnifiedMind",
+        60,
+        base_sketch.iter().copied().cycle().take(16_384).collect(),
+    );
     println!(
         "[verified] Base weights frozen: model={} layers={} sha256={}",
         frozen_base.model_name, frozen_base.num_layers, frozen_base.fingerprint
@@ -786,6 +804,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(std::path::PathBuf::from)
         .unwrap_or(default_vault);
 
+    if args.iter().any(|a| a == "--rebuild-clean-rank8-vault") {
+        rebuild_clean_rank8_vault_on_silicon(&mut server, repo_root, &vault_path)?;
+        return Ok(());
+    }
+
     for (idx, arg) in args.iter().enumerate() {
         if arg == "--distill-safetensors" || arg == "--distill-model-dir" || arg == "--distill-full"
         {
@@ -845,10 +868,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|d| d.to_hex()[..16].to_string())
             .unwrap_or_else(|| "none".to_string());
         println!(
-            "[verified] Pre-Cached Persistent Vault ONCE ({}): global_0cells={} global_1cell_arcs={} ingested_tensors={} sha256={}.. in {:.2}ms",
+            "[verified] Pre-Cached Persistent Vault ONCE ({}): global_0cells={} global_1cell_arcs={} locked_arcs={} ingested_tensors={} sha256={}.. in {:.2}ms",
             vault_path.display(),
             loaded_atoms,
             loaded_arcs,
+            server.swarm_map.locked_arc_count,
             server.swarm_map.ingested_tensor_digests.len(),
             sha_hex,
             load_ms
@@ -878,7 +902,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .position(|a| a == "--max-new")
         .and_then(|idx| args.get(idx + 1))
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(32);
+        .unwrap_or(256);
 
     // Empirical Multi-Basin Specialist Carving Probe (`--probe-domains` or `--probe <domain_or_prompt>`)
     if args.iter().any(|a| a == "--probe-domains") {
@@ -984,9 +1008,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                     .collect();
                 println!(
-                    "[verified] Vault Status: global_0cells={} global_1cell_arcs={} ingested_tensors={} silos=[{}]",
+                    "[verified] Vault Status: global_0cells={} global_1cell_arcs={} locked_arcs={} ingested_tensors={} silos=[{}]",
                     runtime.server.swarm_map.global_atom_count(),
                     runtime.server.swarm_map.reasoning_arcs.len(),
+                    runtime.server.swarm_map.locked_arc_count,
                     runtime.server.swarm_map.ingested_tensor_digests.len(),
                     silo_counts.join(", ")
                 );
@@ -1074,6 +1099,173 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "\n=== ALL THREE LAYERS, 10 QUALIFICATIONS & 5 STATUTORY FRAMEWORKS VERIFIED (audit entries = {}) ===",
         server.immune.audit_log().len()
+    );
+    Ok(())
+}
+
+/// Rebuild a 100% clean, verified Rank-8 `ATOMA_OP_V3` vault on Apple Silicon:
+/// 1. Starts from a clean `CarvedSwarmMap` (zero modulo-hashed `qwen_token_trajectories` and zero `< 64` stub arcs).
+/// 2. Merges the clean `glimmer_52l_map_native.atoma_map` and `glimmer_token_trajectories.atoma_map` vaults.
+/// 3. Runs a real zero-copy safetensors Rank-8 Local Jacobian harvest (`ATOMA_OP_V3` with Two-Pass Modified Gram-Schmidt
+///    `r = 1..=8`) across all 3 local models on disk (`Muse-Glimmer-q4km-gs128-MLX`, `Qwen3-Embedding-8B-4bit-DWQ`,
+///    and `Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit`).
+/// 4. Crystallizes verified multi-turn conversational, coding, and ML architecture trajectories across all 12 silos.
+/// 5. Runs an autonomous Dream State consolidation cycle to verify Rank-8 chart upgrades and empty-space concept bridges.
+/// 6. Locks all verified trajectories (`lock_verified_trajectories()`) and persists `global_active_mind.atoma_map`
+///    with a fresh empty `.wal` so live trajectories record cleanly from the very next chat forward.
+fn rebuild_clean_rank8_vault_on_silicon(
+    server: &mut MonsterHybridServer,
+    repo_root: &std::path::Path,
+    vault_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let t_total = std::time::Instant::now();
+    println!("==========================================================================");
+    println!(" FULL APPLE SILICON RANK-8 ATOMA_OP_V3 HARVEST & CLEAN VAULT REBUILD");
+    println!("==========================================================================");
+
+    // Reset map to a completely clean state (no synthetic boot-demo atoms or stub arcs)
+    server.swarm_map = atoma_immune::CarvedSwarmMap::new(
+        server.swarm_map.atlas.clone(),
+        server.swarm_map.base_weights.clone(),
+        server.swarm_map.default_basin_cosh,
+    );
+    server.persistent_vault_path = Some(vault_path.to_path_buf());
+
+    // Remove any stale WAL file before building the clean base vault
+    let mut wal_os = vault_path.as_os_str().to_os_string();
+    wal_os.push(".wal");
+    let wal_path = std::path::PathBuf::from(wal_os);
+    if wal_path.exists() {
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    // 1. Merge clean Glimmer 52L native operator charts & verified Glimmer token trajectories
+    let glimmer_native = repo_root.join("design/glimmer_52l_map_native.atoma_map");
+    if glimmer_native.exists() {
+        let (ma, marc) =
+            server
+                .swarm_map
+                .merge_vault_from(&glimmer_native, &server.immune.policy, false)?;
+        println!(
+            "[step 1a] Merged glimmer_52l_map_native.atoma_map: +{} 0-cells, +{} 1-cell arcs",
+            ma, marc
+        );
+    }
+    let glimmer_traj = repo_root.join("design/glimmer_token_trajectories.atoma_map");
+    if glimmer_traj.exists() {
+        let (ma, marc) =
+            server
+                .swarm_map
+                .merge_vault_from(&glimmer_traj, &server.immune.policy, true)?;
+        println!(
+            "[step 1b] Merged glimmer_token_trajectories.atoma_map: +{} verified 0-cells, +{} verified 1-cell arcs (filtered <64 stub opcodes)",
+            ma, marc
+        );
+    }
+
+    // 2. Harvest real Rank-8 ATOMA_OP_V3 charts on silicon across all 3 models on disk
+    let models_to_harvest = [
+        (
+            "/Users/stewartbarteau/models/Muse-Glimmer-q4km-gs128-MLX",
+            8usize,
+            320usize,
+        ),
+        (
+            "/Users/stewartbarteau/models/Qwen3-Embedding-8B-4bit-DWQ",
+            8usize,
+            260usize,
+        ),
+        (
+            "/Users/stewartbarteau/models/Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit",
+            6usize,
+            360usize,
+        ),
+    ];
+    for (model_dir_str, top_k, max_layers) in models_to_harvest {
+        let model_dir = std::path::Path::new(model_dir_str);
+        if model_dir.exists() {
+            let t_m = std::time::Instant::now();
+            let summary =
+                server.distill_full_checkpoint_novel_only(model_dir, top_k, max_layers, None)?;
+            println!(
+                "[step 2] Silicon Rank-8 ATOMA_OP_V3 Harvest ({}): shards={} tensors={} novel_0cells=+{} novel_1cells=+{} f32_saved={}MB in {:.2}s",
+                model_dir_str,
+                summary.shards_processed,
+                summary.tensors_distilled,
+                summary.novel_atoms_minted,
+                summary.novel_reasoning_arcs_minted,
+                summary.f32_heap_bytes_saved / (1024 * 1024),
+                t_m.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    // 3. Execute autonomous Dream State consolidation cycle on silicon
+    let dream_rec = server.execute_autonomous_dream_cycle(1, 32, 8)?;
+    println!(
+        "[step 3] Autonomous Dream Consolidation: upgraded_charts={} accreted_ranks={} bridges_minted={} macro_spans={} holonomy_ok={}",
+        dream_rec.charts_upgraded_to_multi_rank,
+        dream_rec.tangent_ranks_accreted,
+        dream_rec.empty_space_bridges_minted,
+        dream_rec.macro_spans_folded,
+        dream_rec.holonomy_verified
+    );
+
+    // 5. Lock all verified trajectories and persist clean base vault
+    let locked_arcs = server.swarm_map.lock_verified_trajectories();
+    let sha = server
+        .swarm_map
+        .save_to_binary_vault(vault_path)
+        .map_err(|e| format!("Failed to save clean vault: {e}"))?;
+    if wal_path.exists() {
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    // Count ATOMA_OP_V3 and Rank-8 charts
+    let mut op_charts = 0usize;
+    let mut rank8_charts = 0usize;
+    let mut stub_arcs = 0usize;
+    for (_id, ga) in server.swarm_map.iter_global_atoms() {
+        if let Some(op) = CoupledOperatorAtomPayload::decode_binary(&ga.payload) {
+            op_charts += 1;
+            if op.active_rank() >= 8 {
+                rank8_charts += 1;
+            }
+        }
+    }
+    for arc in &server.swarm_map.reasoning_arcs {
+        if arc.compiled_mlir_op.0 < 64 {
+            stub_arcs += 1;
+        }
+    }
+    let silo_counts: Vec<String> = RoleId::CARVED_12
+        .iter()
+        .map(|&r| {
+            format!(
+                "{}:{}",
+                r.short_code(),
+                server
+                    .swarm_map
+                    .silo(r)
+                    .map(|s| s.atom_count())
+                    .unwrap_or(0)
+            )
+        })
+        .collect();
+
+    println!(
+        "[verified] Clean Rank-8 Vault Saved ({}) in {:.2}s:\n  -> global_0cells={}\n  -> atoma_op_v3_charts={} (rank8_charts={})\n  -> global_1cell_arcs={} (locked_verified_arcs={}, stub_arcs_<64={})\n  -> ingested_tensors={}\n  -> silos=[{}]\n  -> sha256={}",
+        vault_path.display(),
+        t_total.elapsed().as_secs_f64(),
+        server.swarm_map.global_atom_count(),
+        op_charts,
+        rank8_charts,
+        server.swarm_map.reasoning_arcs.len(),
+        locked_arcs,
+        stub_arcs,
+        server.swarm_map.ingested_tensor_digests.len(),
+        silo_counts.join(", "),
+        sha.2.to_hex()
     );
     Ok(())
 }
@@ -1289,7 +1481,6 @@ fn read_full_http_or_tcp_request(stream: &mut std::net::TcpStream) -> Option<Str
     }
 }
 
-
 /// Lossless Pre-Compaction Session Checkpoint stored in the Brain so Zed's auto-compaction
 /// ("lobotomy") never triggers and, even if manual `/compact` is run, the Brain automatically
 /// restores the exact objective, modified files, tool decisions, and active geodesic coordinates!
@@ -1349,16 +1540,6 @@ impl BrainContinuityCheckpoint {
     }
 }
 
-/// Inspect and bound the incoming OpenAI `messages` array BEFORE forwarding to `:8001` (`Rapid-MLX`)
-/// so:
-/// 1. Before token volume reaches 52% of the window (well before Zed's 85% auto-compact threshold),
-///    older middle turns are losslessly checkpointed into `BrainContinuityCheckpoint` & `.atoma_map.wal`
-///    and replaced by a compact `[ATOMA BRAIN ANTI-LOBOTOMY CHECKPOINT]` message right after `messages[0]`.
-///    This preserves `messages[0]` (keeping Rapid-MLX's Radix prefix cache 100% warm) while capping
-///    KV growth so the 48 GB Mac NEVER OOMs and Zed NEVER lobotomizes the conversation!
-/// 2. If Zed *did* perform an auto-compaction or new-thread summary (`messages.len() <= 4` when
-///    `checkpoint.turn_count > 3`), automatically re-injects the full `BrainContinuityCheckpoint`
-///    into the active user turn so the agent auto-restarts with 100% of its pre-compaction state!
 fn persist_checkpoint_json(ckpt: &BrainContinuityCheckpoint) {
     let payload = serde_json::json!({
         "session_id": ckpt.session_id,
@@ -1371,7 +1552,10 @@ fn persist_checkpoint_json(ckpt: &BrainContinuityCheckpoint) {
         "total_1cell_arcs": ckpt.last_arcs_total,
         "recovery_banner": ckpt.format_recovery_banner(),
     });
-    let _ = std::fs::write("/tmp/atoma_brain_latest_checkpoint.json", payload.to_string());
+    let _ = std::fs::write(
+        "/tmp/atoma_brain_latest_checkpoint.json",
+        payload.to_string(),
+    );
 }
 
 fn apply_anti_lobotomy_brain_checkpoint(
@@ -1389,7 +1573,6 @@ fn apply_anti_lobotomy_brain_checkpoint(
         return;
     }
 
-    // Extract first user message as the pinned objective
     let mut first_user_text = String::new();
     for m in msgs.iter() {
         if m.get("role").and_then(|v| v.as_str()) == Some("user") {
@@ -1402,8 +1585,6 @@ fn apply_anti_lobotomy_brain_checkpoint(
         }
     }
 
-    // Check if Zed just compacted the thread and replaced `messages[1]` with a summary,
-    // which would change `session_id`. If so, inherit the latest active session's Brain checkpoint!
     let all_msg_lower = msgs
         .iter()
         .map(|m| m.to_string().to_lowercase())
@@ -1415,7 +1596,8 @@ fn apply_anti_lobotomy_brain_checkpoint(
         || all_msg_lower.contains("[auto-restart]")
         || all_msg_lower.contains("resume from checkpoint");
 
-    if !checkpoints.contains_key(&session_id) && msgs.len() <= 4 && has_compaction_or_resume_marker {
+    if !checkpoints.contains_key(&session_id) && msgs.len() <= 4 && has_compaction_or_resume_marker
+    {
         if let Some(prev_id) = *latest_session_id {
             if let Some(prev_ckpt) = checkpoints.get(&prev_id).cloned() {
                 let mut inherited = prev_ckpt;
@@ -1444,7 +1626,6 @@ fn apply_anti_lobotomy_brain_checkpoint(
     ckpt.last_arcs_total = total_arcs;
     *latest_session_id = Some(session_id);
 
-    // Harvest any assistant/tool steps already present in `msgs` into the checkpoint ledger
     for m in msgs.iter() {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("unknown");
         if let Some(tcs) = m.get("tool_calls").and_then(|v| v.as_array()) {
@@ -1459,7 +1640,10 @@ fn apply_anti_lobotomy_brain_checkpoint(
                     .and_then(|f| f.get("arguments"))
                     .map(|a| a.to_string())
                     .unwrap_or_default();
-                let summary = format!("tool_call {fname}({})", fargs.chars().take(140).collect::<String>());
+                let summary = format!(
+                    "tool_call {fname}({})",
+                    fargs.chars().take(140).collect::<String>()
+                );
                 if !ckpt.folded_decisions_and_tools.contains(&summary) {
                     ckpt.folded_decisions_and_tools.push(summary);
                 }
@@ -1475,47 +1659,53 @@ fn apply_anti_lobotomy_brain_checkpoint(
         }
     }
 
-    // Detect if Zed just auto-compacted the thread (message count dropped sharply or has compaction marker)
-    let looks_post_compaction = (ckpt.turn_count >= 2 && msgs.len() <= 3 && !ckpt.folded_decisions_and_tools.is_empty())
-        || (has_compaction_or_resume_marker && !ckpt.folded_decisions_and_tools.is_empty());
+    let looks_post_compaction =
+        (ckpt.turn_count >= 2 && msgs.len() <= 3 && !ckpt.folded_decisions_and_tools.is_empty())
+            || (has_compaction_or_resume_marker && !ckpt.folded_decisions_and_tools.is_empty());
 
-    // Estimate total characters across messages (~4 chars/token; pre-checkpoint at 140,000 chars ~ 35K tokens,
-    // well below 52% of the 131K window and well before Zed's 88% auto-compaction trigger!)
-    let total_chars: usize = msgs
-        .iter()
-        .map(|m| m.to_string().len())
-        .sum();
+    let total_chars: usize = msgs.iter().map(|m| m.to_string().len()).sum();
     let force_pre_fold = all_msg_lower.contains("[pre-compact]");
-    let needs_pre_compaction_fold =
-        (total_chars > 140_000 && msgs.len() > 8) || (msgs.len() >= 14 && total_chars > 12_000) || (force_pre_fold && msgs.len() > 4);
+    let needs_pre_compaction_fold = (total_chars > 140_000 && msgs.len() > 8)
+        || (msgs.len() >= 14 && total_chars > 12_000)
+        || (force_pre_fold && msgs.len() > 4);
 
     if needs_pre_compaction_fold {
-        // Keep `msgs[0]` (system prompt) and `msgs[1]` (first user message, so prefix cache & session hash stay warm),
-        // fold the middle turns into `[ATOMA BRAIN ANTI-LOBOTOMY CHECKPOINT]`, and keep the last 4 messages intact!
-        let prefix_keep = if msgs.first().and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("system") && msgs.len() > 2 {
+        let prefix_keep = if msgs
+            .first()
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str())
+            == Some("system")
+            && msgs.len() > 2
+        {
             2usize
         } else {
             1usize
         };
         let keep_tail = 6usize.min(msgs.len().saturating_sub(prefix_keep));
         let mut fold_end = msgs.len().saturating_sub(keep_tail);
-        // Never split a `tool` result from its preceding `assistant` `tool_calls` message!
         while fold_end > prefix_keep
-            && msgs.get(fold_end).and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("tool")
+            && msgs
+                .get(fold_end)
+                .and_then(|m| m.get("role"))
+                .and_then(|r| r.as_str())
+                == Some("tool")
         {
             fold_end -= 1;
         }
-        // If `msgs[fold_end]` is still `tool` (because `prefix_keep` blocked walking back), advance past orphaned `tool` messages.
         while fold_end < msgs.len()
-            && msgs.get(fold_end).and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("tool")
+            && msgs
+                .get(fold_end)
+                .and_then(|m| m.get("role"))
+                .and_then(|r| r.as_str())
+                == Some("tool")
         {
             fold_end += 1;
         }
         let banner = ckpt.format_recovery_banner();
-        let mut new_msgs = Vec::with_capacity(prefix_keep + 1 + msgs.len().saturating_sub(fold_end));
+        let mut new_msgs =
+            Vec::with_capacity(prefix_keep + 1 + msgs.len().saturating_sub(fold_end));
         for i in 0..prefix_keep {
             let mut pm = msgs[i].clone();
-            // Ensure a prefix assistant message does not keep dangling tool_calls whose tool responses were folded away
             if i + 1 == prefix_keep
                 && pm.get("role").and_then(|r| r.as_str()) == Some("assistant")
                 && pm.get("tool_calls").is_some()
@@ -1534,7 +1724,6 @@ fn apply_anti_lobotomy_brain_checkpoint(
         *msgs = new_msgs;
         persist_checkpoint_json(ckpt);
     } else if looks_post_compaction {
-        // Auto-restart after compaction: prepend the Brain checkpoint recovery banner to the latest user message!
         let banner = ckpt.format_recovery_banner();
         if let Some(last_m) = msgs.last_mut() {
             if last_m.get("role").and_then(|v| v.as_str()) == Some("user") {
@@ -1552,9 +1741,6 @@ fn apply_anti_lobotomy_brain_checkpoint(
     }
 }
 
-/// Extract assistant text, `<think>` reasoning, and any tool calls from an OpenAI JSON or SSE
-/// response payload returned by `:8001` (`Rapid-MLX`) so the Brain can transduce and crystallize
-/// 100% of the agent's thought and tool trajectory in real time.
 fn extract_thought_and_response_from_upstream(raw_http_body: &str, is_sse: bool) -> String {
     let mut combined = String::new();
     if is_sse {
@@ -1584,7 +1770,9 @@ fn extract_thought_and_response_from_upstream(raw_http_body: &str, is_sse: bool)
                                         combined.push_str(n);
                                         combined.push(']');
                                     }
-                                    if let Some(a) = fn_obj.get("arguments").and_then(|v| v.as_str()) {
+                                    if let Some(a) =
+                                        fn_obj.get("arguments").and_then(|v| v.as_str())
+                                    {
                                         combined.push_str(a);
                                     }
                                 }
@@ -1610,7 +1798,10 @@ fn extract_thought_and_response_from_upstream(raw_http_body: &str, is_sse: bool)
             if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
                 for tc in tcs {
                     if let Some(fn_obj) = tc.get("function") {
-                        let n = fn_obj.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                        let n = fn_obj
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("tool");
                         let a = fn_obj
                             .get("arguments")
                             .map(|v| v.to_string())
@@ -1624,9 +1815,6 @@ fn extract_thought_and_response_from_upstream(raw_http_body: &str, is_sse: bool)
     combined
 }
 
-/// Forward a chat completion request to the upstream Rapid-MLX (`127.0.0.1:8001`) server,
-/// streaming SSE chunks directly back to the client (`client_stream`) in real time while
-/// accumulating the complete thought + tool + response trajectory for Brain crystallization!
 fn proxy_to_upstream_qwen_and_capture(
     upstream_body: &str,
     stream_mode: bool,
@@ -1703,22 +1891,11 @@ fn proxy_to_upstream_qwen_and_capture(
     ))
 }
 
-/// Universal OpenAI Tool-Call Planner for standalone Brain turns (`:8088` with or without `:8001`).
-///
-/// Inspects any client's `tools` array (`Atoma.app` / `Model Home`, `Zed`, `LangChain`, or custom OpenAI SDKs)
-/// plus the conversation's `messages` history:
-/// - If the most recent message is ALREADY a `role == "tool"` result, returns `(None, Some(tool_output))`
-///   so the Brain synthesizes the final verified answer incorporating the tool result instead of looping!
-/// - If `tool_choice` explicitly names a function (`{"type":"function","function":{"name":"..."}}`),
-///   or if the user prompt clearly requests an action matching one of the client's declared tools
-///   (e.g., `list_files`, `read_file`, `write_file`, `run_python`, `run_shell`, `kb_search`, `memory`,
-///   `journal`, `journal_read`, `plugin_create`, `connector_write`, `skill_read`, `brain_continuity_checkpoint`),
-///   synthesizes a valid OpenAI `WireCall` `(id, name, arguments_json_string)` with required schema arguments populated!
 fn synthesize_universal_standalone_tool_call(
     parsed: &serde_json::Value,
-    user_prompt: &str,
-    session_id: u64,
-    turn_index: u32,
+    _user_prompt: &str,
+    _session_id: u64,
+    _turn_index: u32,
 ) -> (Option<(String, String, String)>, Option<String>) {
     let msgs = parsed.get("messages").and_then(|v| v.as_array());
     if let Some(arr) = msgs {
@@ -1734,149 +1911,7 @@ fn synthesize_universal_standalone_tool_call(
             }
         }
     }
-
-    let Some(tools) = parsed.get("tools").and_then(|v| v.as_array()) else {
-        return (None, None);
-    };
-    if tools.is_empty() {
-        return (None, None);
-    }
-
-    // Check if tool_choice == "none"
-    if parsed.get("tool_choice").and_then(|v| v.as_str()) == Some("none") {
-        return (None, None);
-    }
-
-    // Collect available (tool_name, schema_properties)
-    let mut available: Vec<(String, serde_json::Value)> = Vec::new();
-    for t in tools {
-        let fn_obj = t.get("function").unwrap_or(t);
-        if let Some(name) = fn_obj.get("name").and_then(|v| v.as_str()) {
-            let props = fn_obj
-                .get("parameters")
-                .or_else(|| fn_obj.get("inputSchema"))
-                .and_then(|p| p.get("properties"))
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            available.push((name.to_string(), props));
-        }
-    }
-    if available.is_empty() {
-        return (None, None);
-    }
-
-    let lower = user_prompt.to_lowercase();
-    // Never emit tool calls during summarization prompts
-    if lower.contains("write a summary of this conversation")
-        || lower.contains("do not call tools")
-        || lower.contains("reply with the summary only")
-    {
-        return (None, None);
-    }
-
-    // 1. Explicit tool_choice object: {"type":"function","function":{"name":"..."}}
-    let mut chosen_name: Option<String> = parsed
-        .get("tool_choice")
-        .and_then(|tc| tc.get("function"))
-        .and_then(|f| f.get("name"))
-        .and_then(|n| n.as_str())
-        .map(|s| s.to_string());
-
-    // 2. Check if the user prompt explicitly mentions a tool name or a clear action intent
-    if chosen_name.is_none() {
-        for (tname, _) in &available {
-            if lower.contains(&tname.to_lowercase()) {
-                chosen_name = Some(tname.clone());
-                break;
-            }
-        }
-    }
-    if chosen_name.is_none() {
-        let find_tool = |candidates: &[&str]| -> Option<String> {
-            for &c in candidates {
-                if let Some((n, _)) = available.iter().find(|(n, _)| n == c) {
-                    return Some(n.clone());
-                }
-            }
-            None
-        };
-        if lower.contains("list files") || lower.contains("list_files") || lower.contains("what files") {
-            chosen_name = find_tool(&["list_files"]);
-        } else if lower.contains("read file") || lower.contains("read ") && (lower.contains(".rs") || lower.contains(".py") || lower.contains(".md") || lower.contains(".json") || lower.contains(".toml")) {
-            chosen_name = find_tool(&["read_file", "read_ast_compacted_file"]);
-        } else if lower.contains("search knowledge") || lower.contains("kb_search") {
-            chosen_name = find_tool(&["kb_search"]);
-        } else if lower.contains("journal") && lower.contains("read") {
-            chosen_name = find_tool(&["journal_read"]);
-        } else if lower.contains("checkpoint") {
-            chosen_name = find_tool(&["brain_continuity_checkpoint"]);
-        }
-    }
-
-    // If tool_choice == "required" and none matched yet, pick the first non-destructive tool
-    if chosen_name.is_none() && parsed.get("tool_choice").and_then(|v| v.as_str()) == Some("required") {
-        chosen_name = available.first().map(|(n, _)| n.clone());
-    }
-
-    let Some(tool_name) = chosen_name else {
-        return (None, None);
-    };
-    let props = available
-        .iter()
-        .find(|(n, _)| n == &tool_name)
-        .map(|(_, p)| p.clone())
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    // Extract plausible file path token from user_prompt if present
-    let extracted_path = user_prompt
-        .split_whitespace()
-        .map(|w| w.trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == ',' || c == '.'))
-        .find(|w| {
-            w.contains('/')
-                || w.ends_with(".rs")
-                || w.ends_with(".py")
-                || w.ends_with(".md")
-                || w.ends_with(".json")
-                || w.ends_with(".toml")
-        })
-        .unwrap_or(".");
-
-    let mut args_map = serde_json::Map::new();
-    if let Some(prop_obj) = props.as_object() {
-        for (k, _v) in prop_obj {
-            match k.as_str() {
-                "path" | "relative_path" => {
-                    args_map.insert(k.clone(), serde_json::Value::String(extracted_path.to_string()));
-                }
-                "query" => {
-                    args_map.insert(k.clone(), serde_json::Value::String(user_prompt.chars().take(120).collect()));
-                }
-                "action" => {
-                    args_map.insert(k.clone(), serde_json::Value::String("status".to_string()));
-                }
-                "command" => {
-                    args_map.insert(k.clone(), serde_json::Value::String("ls".to_string()));
-                }
-                "code" => {
-                    args_map.insert(k.clone(), serde_json::Value::String("print('ok')".to_string()));
-                }
-                "text" | "content" => {
-                    args_map.insert(k.clone(), serde_json::Value::String(user_prompt.chars().take(200).collect()));
-                }
-                "name" => {
-                    args_map.insert(k.clone(), serde_json::Value::String("persona".to_string()));
-                }
-                "domain" => {
-                    args_map.insert(k.clone(), serde_json::Value::String("coding_intensive".to_string()));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let call_id = format!("call_atoma_{}_{}", session_id, turn_index);
-    let args_str = serde_json::Value::Object(args_map).to_string();
-    (Some((call_id, tool_name, args_str)), None)
+    (None, None)
 }
 
 fn fnv1a_session_hash(s: &str) -> u64 {
@@ -1904,6 +1939,11 @@ fn run_persistent_tcp_server(
         server,
         sessions: Default::default(),
     };
+    let mut toroidal_runtime = atoma_orchestrator::toroidal_attention::ToroidalIsotropicRuntime::new(
+        256,
+        vec![0, 12, 24, 36, 48],
+        60,
+    );
     let mut brain_checkpoints: HashMap<u64, BrainContinuityCheckpoint> = HashMap::new();
     let mut latest_active_session_id: Option<u64> = None;
 
@@ -1939,10 +1979,11 @@ fn run_persistent_tcp_server(
 
     let listener = std::net::TcpListener::bind(bind_addr)?;
     println!(
-        "[verified] Live Qwen-Connected Map Visualizer & OpenAI-Compatible Live-Learning Daemon listening on http://{} (global_0cells={}, global_1cell_arcs={})",
+        "[verified] Standalone Active-Mind Daemon listening on http://{} (global_0cells={}, global_1cell_arcs={}, locked_arcs={})",
         bind_addr,
         runtime.server.swarm_map.global_atom_count(),
-        runtime.server.swarm_map.reasoning_arcs.len()
+        runtime.server.swarm_map.reasoning_arcs.len(),
+        runtime.server.swarm_map.locked_arc_count
     );
 
     let mut handled = 0usize;
@@ -1994,7 +2035,7 @@ fn run_persistent_tcp_server(
                             "owned_by": "monster-hybrid-server"
                         },
                         {
-                            "id": "Qwen3.6-35B-A3B-OptiQ-4bit",
+                            "id": "Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit",
                             "object": "model",
                             "created": 1760000000u64,
                             "owned_by": "monster-hybrid-server"
@@ -2034,6 +2075,7 @@ fn run_persistent_tcp_server(
 
                 let mut user_prompt = String::new();
                 let mut first_user_msg = String::new();
+                let mut conversation_turns: Vec<String> = Vec::new();
                 if let Some(msgs) = parsed.get("messages").and_then(|v| v.as_array()) {
                     for m in msgs {
                         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -2046,11 +2088,15 @@ fn run_persistent_tcp_server(
                                 .join("\n"),
                             _ => String::new(),
                         };
-                        if role == "user" && !content.trim().is_empty() {
+                        let trimmed_c = content.trim();
+                        if !trimmed_c.is_empty() && (role == "user" || role == "assistant") {
+                            conversation_turns.push(format!("{role}: {trimmed_c}"));
+                        }
+                        if role == "user" && !trimmed_c.is_empty() {
                             if first_user_msg.is_empty() {
-                                first_user_msg = content.trim().to_string();
+                                first_user_msg = trimmed_c.to_string();
                             }
-                            user_prompt = content.trim().to_string();
+                            user_prompt = trimmed_c.to_string();
                         }
                     }
                 }
@@ -2080,7 +2126,6 @@ fn run_persistent_tcp_server(
                         }
                     });
 
-                // 1. Apply Brain-Managed Pre-Compaction Checkpoint & Auto-Recovery before any model call!
                 let cur_atoms = runtime.server.swarm_map.global_atom_count();
                 let cur_arcs = runtime.server.swarm_map.reasoning_arcs.len();
                 apply_anti_lobotomy_brain_checkpoint(
@@ -2092,40 +2137,88 @@ fn run_persistent_tcp_server(
                     cur_arcs,
                 );
 
-                // 2. Check if this is an exact High-Level Benchmark Operator prompt (GSM8K, NIAH, RULER).
-                //    If not, and the client requested Qwen3.6-35B-A3B-OptiQ-4bit (or supplied tools) while :8001
-                //    is online, stream/proxy through :8001 AND crystallize 100% of the thought/tool/response
-                //    trajectory into the Brain in real time!
-                let is_bench_op = atoma_orchestrator::benchmark_operators::try_execute_high_level_operator(
-                    &runtime.server.mlir_catalog,
-                    &user_prompt,
-                )
-                .is_some();
-                // STANDALONE TEACHER-OFF MODE: External :8001 teacher proxy is permanently disabled.
-                let _ = is_bench_op;
-                let _ = &model_name;
-                let wants_upstream_qwen = false;
+                // 1. Step the unified Toroidal Isotropic Attention + Rank-8 Local Jacobian (`ATOMA_OP_V3`)
+                //    runtime across real Qwen3.8 safetensors receptor sketches on every chat turn.
+                let prompt_carrier_ops = runtime
+                    .server
+                    .active_transformer
+                    .transducer
+                    .transduce_ingress_text(&user_prompt, false);
+                let prompt_tok_ids: Vec<u32> = prompt_carrier_ops.iter().map(|op| op.0).collect();
+                let qwen_shard_p = std::path::Path::new(
+                    atoma_orchestrator::live_map_ui::DEFAULT_QWEN_SHARD_PATH,
+                );
+                let (x_in, _) = atoma_immune::project_qwen_token_sketch(
+                    if qwen_shard_p.exists() {
+                        Some(qwen_shard_p)
+                    } else {
+                        None
+                    },
+                    &prompt_tok_ids,
+                    user_prompt.as_bytes(),
+                );
+                let toroidal_step = toroidal_runtime
+                    .step_token(handled, &x_in, &runtime.server.swarm_map)
+                    .ok();
+                if let Some(ref ts) = toroidal_step {
+                    let mut band_e = [1e-6f32; 4];
+                    for b in 0..4 {
+                        for &v in &ts.final_hidden_state[b * 64..(b + 1) * 64] {
+                            band_e[b] += v * v;
+                        }
+                    }
+                    let max_b = band_e
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    band_e[max_b] *= 6.0;
+                    let sum_e: f32 = band_e.iter().sum();
+                    let next_op_probs: Vec<f32> = band_e.iter().map(|&e| e / sum_e).collect();
+                    let mut tap_payload = vec![0u8; 256];
+                    for (i, &f) in ts.final_hidden_state.iter().take(64).enumerate() {
+                        tap_payload[i * 4..(i + 1) * 4].copy_from_slice(&f.to_le_bytes());
+                    }
+                    let t_digest = atoma_immune::Sha256Digest::compute(user_prompt.as_bytes());
+                    let live_tap = TeacherTapRecord {
+                        shard_id: u64::from_le_bytes(t_digest.0[0..8].try_into().unwrap())
+                            .wrapping_add(handled as u64),
+                        layer_index: 36,
+                        hidden_state: ts.final_hidden_state.clone(),
+                        next_op_probs,
+                        payload: tap_payload,
+                    };
+                    let _ = runtime.server.observe_and_distill_live_step(&live_tap);
+                }
+
+                // 2. Route live chat through the attached Qwen3.8-27B model (:8001) when reachable
+                //    (unless executing an explicit deterministic MLIR SSA benchmark operator),
+                //    and immediately upload + crystallize the exchange into `global_active_mind.atoma_map` + `.wal`.
+                let is_bench_op =
+                    atoma_orchestrator::benchmark_operators::try_execute_high_level_operator(
+                        &runtime.server.mlir_catalog,
+                        &user_prompt,
+                    )
+                    .is_some();
+                let wants_upstream_qwen = !is_bench_op;
 
                 if wants_upstream_qwen {
                     let mut upstream_json = parsed.clone();
-                    upstream_json["model"] =
-                        serde_json::Value::String("Qwen3.6-35B-A3B-OptiQ-4bit".to_string());
+                    upstream_json["model"] = serde_json::Value::String(
+                        "Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit".to_string(),
+                    );
                     let upstream_body = upstream_json.to_string();
-                    if let Some(captured_trajectory) = proxy_to_upstream_qwen_and_capture(
-                        &upstream_body,
-                        stream_mode,
-                        &mut stream,
-                    ) {
+                    if let Some(captured_trajectory) =
+                        proxy_to_upstream_qwen_and_capture(&upstream_body, stream_mode, &mut stream)
+                    {
                         if let Ok(op_receipt) = runtime.ingest_live_model_exchange_into_brain(
                             session_id,
                             &user_prompt,
                             &captured_trajectory,
                         ) {
                             print_live_operational_turn(&op_receipt);
-                            if op_receipt.novel_atoms_minted > 0 || op_receipt.novel_arcs_minted > 0
-                            {
-                                cached_map_state_json = runtime.server.render_map_state_json();
-                            }
+                            cached_map_state_json = runtime.server.render_map_state_json();
                             if let Some(ckpt) = brain_checkpoints.get_mut(&session_id) {
                                 ckpt.turn_count += 1;
                                 ckpt.last_lit_basins = op_receipt
@@ -2144,19 +2237,7 @@ fn run_persistent_tcp_server(
                                         ckpt.folded_decisions_and_tools.push(summary);
                                     }
                                 }
-                                let _ = std::fs::write(
-                                    "/tmp/atoma_brain_latest_checkpoint.json",
-                                    serde_json::json!({
-                                        "session_id": ckpt.session_id,
-                                        "turn_count": ckpt.turn_count,
-                                        "pinned_objective": ckpt.pinned_objective,
-                                        "folded_decisions_and_tools": ckpt.folded_decisions_and_tools,
-                                        "last_lit_basins": ckpt.last_lit_basins,
-                                        "total_0cells": ckpt.last_atoms_total,
-                                        "total_1cell_arcs": ckpt.last_arcs_total,
-                                    })
-                                    .to_string(),
-                                );
+                                persist_checkpoint_json(ckpt);
                             }
                         }
                         handled += 1;
@@ -2164,12 +2245,32 @@ fn run_persistent_tcp_server(
                     }
                 }
 
-                match runtime.execute_live_operational_turn(
+                // Seed prior subject from earlier user messages in `messages` if this session is new,
+                // enabling coreference resolution ("What is its largest city?") across stateless HTTP chat calls.
+                if !runtime.sessions.contains_key(&session_id) && conversation_turns.len() > 1 {
+                    for turn_str in conversation_turns[..conversation_turns.len() - 1].iter().rev() {
+                        if let Some(u_prev) = turn_str.strip_prefix("user: ") {
+                            if !atoma_immune::GeodesicActiveTransformer::has_coreference_cue(u_prev) {
+                                if let Some(subj) = atoma_immune::GeodesicActiveTransformer::extract_primary_subject(u_prev) {
+                                    runtime.ingest_human_prompt_at_edge(session_id, u_prev);
+                                    if let Some(sess) = runtime.sessions.get_mut(&session_id) {
+                                        sess.last_subject = Some(subj);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let turn_res = runtime.execute_live_operational_turn(
                     session_id,
                     &user_prompt,
                     req_max_tokens,
                     None,
-                ) {
+                );
+
+                match turn_res {
                     Ok(op_receipt) => {
                         print_live_operational_turn(&op_receipt);
                         if op_receipt.novel_atoms_minted > 0 || op_receipt.novel_arcs_minted > 0 {
@@ -2185,7 +2286,13 @@ fn run_persistent_tcp_server(
                                 .collect();
                             ckpt.last_atoms_total = op_receipt.atoms_after;
                             ckpt.last_arcs_total = op_receipt.arcs_after;
-                            let summary: String = op_receipt.turn.response_text.trim().chars().take(200).collect();
+                            let summary: String = op_receipt
+                                .turn
+                                .response_text
+                                .trim()
+                                .chars()
+                                .take(200)
+                                .collect();
                             if !summary.is_empty() {
                                 ckpt.recent_assistant_outputs.push(summary.clone());
                                 if ckpt.folded_decisions_and_tools.len() < 64 {
@@ -2217,39 +2324,41 @@ fn run_persistent_tcp_server(
                             }
                         }
                         let reasoning_trace = format!(
-                            "12-Basin Specialist [{}] geodesic synthesis (tier={}, 0-cells={}, 1-cells={}, holonomy={:.4}rad).",
+                            "12-Basin Specialist [{}] geodesic synthesis (tier={}, 0-cells={}, 1-cells={}, locked_arcs={}, holonomy={:.4}rad).",
                             basins_vec.join("+"),
                             op_receipt.turn.tier.as_str(),
                             op_receipt.atoms_after,
                             op_receipt.arcs_after,
+                            runtime.server.swarm_map.locked_arc_count,
                             op_receipt.specialist_profile.holonomy_flux_rad
                         );
                         let completion_tokens = op_receipt.turn.emitted_ops.len().max(1);
                         let prompt_tokens = (user_prompt.len() / 4).max(1);
 
                         if stream_mode {
-                            let delta_obj = if let Some((ref cid, ref cname, ref cargs)) = planned_tool_call {
-                                serde_json::json!({
-                                    "role": "assistant",
-                                    "reasoning_content": reasoning_trace,
-                                    "content": "",
-                                    "tool_calls": [{
-                                        "index": 0,
-                                        "id": cid,
-                                        "type": "function",
-                                        "function": {
-                                            "name": cname,
-                                            "arguments": cargs
-                                        }
-                                    }]
-                                })
-                            } else {
-                                serde_json::json!({
-                                    "role": "assistant",
-                                    "reasoning_content": reasoning_trace,
-                                    "content": content_str
-                                })
-                            };
+                            let delta_obj =
+                                if let Some((ref cid, ref cname, ref cargs)) = planned_tool_call {
+                                    serde_json::json!({
+                                        "role": "assistant",
+                                        "reasoning_content": reasoning_trace,
+                                        "content": "",
+                                        "tool_calls": [{
+                                            "index": 0,
+                                            "id": cid,
+                                            "type": "function",
+                                            "function": {
+                                                "name": cname,
+                                                "arguments": cargs
+                                            }
+                                        }]
+                                    })
+                                } else {
+                                    serde_json::json!({
+                                        "role": "assistant",
+                                        "reasoning_content": reasoning_trace,
+                                        "content": content_str
+                                    })
+                                };
                             let finish_reason_str = if planned_tool_call.is_some() {
                                 "tool_calls"
                             } else {
@@ -2276,6 +2385,7 @@ fn run_persistent_tcp_server(
                                     "wal_bytes_appended": op_receipt.wal_bytes_appended,
                                     "total_0cells": op_receipt.atoms_after,
                                     "total_1cell_arcs": op_receipt.arcs_after,
+                                    "locked_1cell_arcs": runtime.server.swarm_map.locked_arc_count,
                                     "latency_us": op_receipt.latency_us
                                 }
                             });
@@ -2304,33 +2414,34 @@ fn run_persistent_tcp_server(
                             );
                             let _ = stream.write_all(resp.as_bytes());
                         } else {
-                            let (msg_obj, finish_reason_str) = if let Some((cid, cname, cargs)) = planned_tool_call {
-                                (
-                                    serde_json::json!({
-                                        "role": "assistant",
-                                        "reasoning_content": reasoning_trace,
-                                        "content": serde_json::Value::Null,
-                                        "tool_calls": [{
-                                            "id": cid,
-                                            "type": "function",
-                                            "function": {
-                                                "name": cname,
-                                                "arguments": cargs
-                                            }
-                                        }]
-                                    }),
-                                    "tool_calls",
-                                )
-                            } else {
-                                (
-                                    serde_json::json!({
-                                        "role": "assistant",
-                                        "reasoning_content": reasoning_trace,
-                                        "content": content_str
-                                    }),
-                                    "stop",
-                                )
-                            };
+                            let (msg_obj, finish_reason_str) =
+                                if let Some((cid, cname, cargs)) = planned_tool_call {
+                                    (
+                                        serde_json::json!({
+                                            "role": "assistant",
+                                            "reasoning_content": reasoning_trace,
+                                            "content": serde_json::Value::Null,
+                                            "tool_calls": [{
+                                                "id": cid,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": cname,
+                                                    "arguments": cargs
+                                                }
+                                            }]
+                                        }),
+                                        "tool_calls",
+                                    )
+                                } else {
+                                    (
+                                        serde_json::json!({
+                                            "role": "assistant",
+                                            "reasoning_content": reasoning_trace,
+                                            "content": content_str
+                                        }),
+                                        "stop",
+                                    )
+                                };
                             let body_json = serde_json::json!({
                                 "id": format!("chatcmpl-atoma-{}-{}", session_id, op_receipt.turn_index),
                                 "object": "chat.completion",
@@ -2357,6 +2468,7 @@ fn run_persistent_tcp_server(
                                     "wal_bytes_appended": op_receipt.wal_bytes_appended,
                                     "total_0cells": op_receipt.atoms_after,
                                     "total_1cell_arcs": op_receipt.arcs_after,
+                                    "locked_1cell_arcs": runtime.server.swarm_map.locked_arc_count,
                                     "latency_us": op_receipt.latency_us
                                 }
                             })
@@ -2395,7 +2507,8 @@ fn run_persistent_tcp_server(
                         serde_json::json!({
                             "status": "no_checkpoint_yet",
                             "total_0cells": runtime.server.swarm_map.global_atom_count(),
-                            "total_1cell_arcs": runtime.server.swarm_map.reasoning_arcs.len()
+                            "total_1cell_arcs": runtime.server.swarm_map.reasoning_arcs.len(),
+                            "locked_1cell_arcs": runtime.server.swarm_map.locked_arc_count
                         })
                         .to_string()
                     });
@@ -2410,6 +2523,7 @@ fn run_persistent_tcp_server(
             }
 
             if route_path == "/api/map-state" || route_path == "/v1/mind/state" {
+                cached_map_state_json = runtime.server.render_map_state_json();
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     cached_map_state_json.len(),
@@ -2505,7 +2619,6 @@ fn run_persistent_tcp_server(
                     }
                 });
 
-                // Serve from O(1) pre-cache if canonical domain preset and no manual basin override
                 let json_body = if manual_basins.is_none() {
                     if let Some(cached) = cached_domain_profiles.get(q_param.trim()) {
                         cached.clone()
@@ -2552,7 +2665,9 @@ fn run_persistent_tcp_server(
                     max_bridges,
                 ) {
                     Ok(rec) => {
-                        if rec.charts_upgraded_to_multi_rank > 0 || rec.empty_space_bridges_minted > 0 {
+                        if rec.charts_upgraded_to_multi_rank > 0
+                            || rec.empty_space_bridges_minted > 0
+                        {
                             cached_map_state_json = runtime.server.render_map_state_json();
                         }
                         serde_json::json!({
@@ -2568,13 +2683,16 @@ fn run_persistent_tcp_server(
                             "total_atoms_after": rec.total_atoms_after,
                             "total_arcs_before": rec.total_arcs_before,
                             "total_arcs_after": rec.total_arcs_after,
+                            "locked_1cell_arcs": runtime.server.swarm_map.locked_arc_count,
                             "novel_dream_propositions": rec.novel_dream_propositions,
-                        }).to_string()
+                        })
+                        .to_string()
                     }
                     Err(e) => serde_json::json!({
                         "status": "error",
                         "error": e,
-                    }).to_string(),
+                    })
+                    .to_string(),
                 };
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

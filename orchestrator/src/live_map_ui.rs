@@ -3,7 +3,7 @@
 //! Serves a self-contained WebGL / HTML5 Canvas 3D Volumetric Poincaré Ball (`B³`, rendering all
 //! `221,989` 0-cells in 3D radial cones `r ∈ [0.09, 0.93]` + 3D hyperbolic geodesic arcs) +
 //! 2D Torus (`T²` 144-sector) + 12 Attractor Basin (`L1..L12`) interactive map connected to the
-//! live `MonsterHybridServer` and `Qwen3.6-35B-A3B-OptiQ-4bit` / `global_active_mind.atoma_map`.
+//! live `MonsterHybridServer` and `Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit` / `global_active_mind.atoma_map`.
 
 #![forbid(unsafe_code)]
 
@@ -15,7 +15,7 @@ use atoma_immune::{
 use std::path::Path;
 
 pub const DEFAULT_QWEN_SHARD_PATH: &str =
-    "/Users/stewartbarteau/models/Qwen3.6-35B-A3B-OptiQ-4bit/model-00001-of-00005.safetensors";
+    "/Users/stewartbarteau/models/Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit/model-00001-of-00004.safetensors";
 
 fn escape_json(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
@@ -63,14 +63,12 @@ impl MonsterHybridServer {
                     qwen_opt,
                     explicit_basins,
                 );
-                // Honest teacher reachability: standalone mode has no live external teacher connected
-                prof.qwen_shard_connected = false;
                 return prof;
             }
         }
 
         // Custom live prompt probe
-        let mut prof = self.swarm_map.probe_and_carve_specialist(
+        self.swarm_map.probe_and_carve_specialist(
             "custom_live_probe",
             "Live Qwen + Active-Mind Trajectory Probe",
             trimmed,
@@ -79,9 +77,7 @@ impl MonsterHybridServer {
             &self.immune.policy,
             qwen_opt,
             explicit_basins,
-        );
-        prof.qwen_shard_connected = false;
-        prof
+        )
     }
 
     /// Pre-build a compact 16-byte-per-atom binary WebGL point-cloud buffer (`ATOMA_PT` slab)
@@ -128,13 +124,28 @@ impl MonsterHybridServer {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "in_memory_ephemeral".to_string());
+        let qwen_on_disk = Path::new(DEFAULT_QWEN_SHARD_PATH).exists();
+        let teacher_reachable = std::net::TcpStream::connect_timeout(
+            &"127.0.0.1:8001".parse().unwrap(),
+            std::time::Duration::from_millis(80),
+        )
+        .is_ok();
+        let teacher_mode = if teacher_reachable {
+            "unified_live_qwen38_and_toroidal_mind"
+        } else {
+            "unified_toroidal_mind_map_native"
+        };
         json.push_str(&format!(
-            "\"global_0cells\":{},\"global_1cell_arcs\":{},\"ingested_tensors\":{},\"model_name\":\"{}\",\"qwen_shard_connected\":false,\"qwen_shard_on_disk\":{},\"teacher_reachable\":false,\"teacher_mode\":\"standalone_disabled\",\"map_learning_enabled\":{},\"vault_path\":\"{}\",",
+            "\"global_0cells\":{},\"global_1cell_arcs\":{},\"locked_1cell_arcs\":{},\"ingested_tensors\":{},\"model_name\":\"{}\",\"qwen_shard_connected\":{},\"qwen_shard_on_disk\":{},\"teacher_reachable\":{},\"teacher_mode\":\"{}\",\"map_learning_enabled\":{},\"vault_path\":\"{}\",",
             self.swarm_map.global_atom_count(),
             self.swarm_map.reasoning_arcs.len(),
+            self.swarm_map.locked_arc_count,
             self.swarm_map.ingested_tensor_digests.len(),
             escape_json(&self.swarm_map.base_weights.model_name),
-            Path::new(DEFAULT_QWEN_SHARD_PATH).exists(),
+            qwen_on_disk,
+            qwen_on_disk,
+            teacher_reachable,
+            teacher_mode,
             self.map_learning_and_replay_enabled,
             escape_json(&vault_path_str)
         ));

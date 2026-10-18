@@ -13,10 +13,27 @@ use crate::qwen_model::{ModelError, WeightManager};
 use crate::{ForwardCompliancePermit, ImmuneForwardGate};
 use std::path::Path;
 
+pub struct LinearAttnLayerState {
+    pub conv_history: [[f32; 3]; 2048],
+    pub s_num: Vec<f32>,
+    pub z_den: Vec<f32>,
+}
+
+impl LinearAttnLayerState {
+    pub fn new(h: usize) -> Self {
+        Self {
+            conv_history: [[0.0; 3]; 2048],
+            s_num: vec![0.0; h],
+            z_den: vec![0.0; h],
+        }
+    }
+}
+
 pub struct QwenModel {
     pub config: ModelConfig,
     pub weights: WeightManager,
     pub geo_maps: Vec<GeometricMemoryMap>,
+    pub linear_states: Vec<LinearAttnLayerState>,
     pub immune_gate: ImmuneForwardGate,
 }
 
@@ -26,15 +43,21 @@ impl QwenModel {
         let weights =
             WeightManager::load(model_dir, &model_dir.join("model.safetensors.index.json"))?;
         let num_full = config.full_attention_layers().len();
-        let mut geo_maps = Vec::new();
-        for _ in 0..num_full {
+        let nkv = config.num_key_value_heads.max(1);
+        let mut geo_maps = Vec::with_capacity(num_full * nkv);
+        for _ in 0..(num_full * nkv) {
             geo_maps.push(GeometricMemoryMap::new(1_000_000));
+        }
+        let mut linear_states = Vec::with_capacity(config.num_hidden_layers);
+        for _ in 0..config.num_hidden_layers {
+            linear_states.push(LinearAttnLayerState::new(config.hidden_size));
         }
         let fp = (config.hidden_size as u64) << 32 | (config.num_hidden_layers as u64);
         Ok(Self {
             config,
             weights,
             geo_maps,
+            linear_states,
             immune_gate: ImmuneForwardGate::new(fp),
         })
     }
@@ -61,7 +84,7 @@ impl QwenModel {
     ) -> Result<Vec<f32>, ModelError> {
         let h = self.config.hidden_size;
         let nh = self.config.num_attention_heads;
-        let nkv = self.config.num_key_value_heads;
+        let nkv = self.config.num_key_value_heads.max(1);
         let hd = self.config.head_dim;
         let eps = self.config.rms_norm_eps;
         let theta = self.config.rope_theta;
@@ -101,13 +124,14 @@ impl QwenModel {
         apply_rope(&mut q, hd, rotary_dim, pos, theta)?;
         apply_rope(&mut k, hd, rotary_dim, pos, theta)?;
 
-        let geo = &mut self.geo_maps[geo_idx];
-
-        // FLAG-03 & FLAG-04 Resolution:
-        // 1. Project k_head via f32_to_atom_address to populate non-zero T^2 Phase.
-        // 2. Store both k_head and v_head (2 * hd * 4 bytes) in atom.payload so retrieved
+        // FLAG-03 & FLAG-04 Resolution + Per-KV-Head Isolation:
+        // 1. Each (full_attention_layer, kv_head) owns its own GeometricMemoryMap at `geo_idx * nkv + kv_h`.
+        // 2. Project k_head via f32_to_atom_address to populate non-zero T^2 Phase.
+        // 3. Store both k_head and v_head (2 * hd * 4 bytes) in atom.payload so retrieved
         //    candidates are scored via exact hd-dimensional q·k dot products (matching glimmer_forward.rs).
         for kv_h in 0..nkv {
+            let map_slot = geo_idx * nkv + kv_h;
+            let geo = &mut self.geo_maps[map_slot];
             let k_head = &k[kv_h * hd..(kv_h + 1) * hd];
             let v_head = &v[kv_h * hd..(kv_h + 1) * hd];
             let (lv, phase, _loss) = f32_to_atom_address(k_head)?;
@@ -121,12 +145,14 @@ impl QwenModel {
             geo.write(lv, phase, kv_bytes)?;
         }
 
-        let repeat = nh / nkv;
+        let repeat = (nh / nkv).max(1);
         let mut attn_out = vec![0.0f32; nh * hd];
         let top_k = 64;
         let inv_sqrt_hd = 1.0 / (hd as f32).sqrt();
 
         for qh in 0..nh {
+            let kv_h = (qh / repeat).min(nkv - 1);
+            let geo = &self.geo_maps[geo_idx * nkv + kv_h];
             let q_head = &q[qh * hd..(qh + 1) * hd];
             let q_lv = f32_to_lorentz(q_head)?;
 
@@ -173,7 +199,6 @@ impl QwenModel {
                 }
                 attn_out[qh * hd + d] = acc;
             }
-            let _ = repeat;
         }
 
         let o = self.weights.matvec_weight(
@@ -307,11 +332,50 @@ impl QwenModel {
             h,
             &xn,
         )?;
+
+        // Causal short depthwise conv1d + Recurrent Linear Attention state update (S_t, Z_t)
+        let mut recurrent_context = vec![0.0f32; h];
+        if let Some(state) = self.linear_states.get_mut(layer) {
+            let gamma = 0.96f32;
+            for d in 0..h {
+                let q_raw = qkv[d];
+                let k_raw = qkv[h + d];
+                let v_raw = qkv[2 * h + d];
+
+                let h_slot = d % 2048;
+                let prev0 = state.conv_history[h_slot][0];
+                let prev1 = state.conv_history[h_slot][1];
+                let prev2 = state.conv_history[h_slot][2];
+                let conv_q = 0.55 * q_raw + 0.25 * prev0 + 0.12 * prev1 + 0.08 * prev2;
+                let conv_k = 0.55 * k_raw + 0.25 * prev0 + 0.12 * prev1 + 0.08 * prev2;
+                state.conv_history[h_slot] = [q_raw, prev0, prev1];
+
+                // Positive ELU+1 feature map phi(x) (Katharopoulos et al., ICML 2020)
+                let phi_q = if conv_q >= 0.0 {
+                    conv_q + 1.0
+                } else {
+                    conv_q.exp()
+                };
+                let phi_k = if conv_k >= 0.0 {
+                    conv_k + 1.0
+                } else {
+                    conv_k.exp()
+                };
+
+                state.s_num[d] = gamma * state.s_num[d] + phi_k * v_raw;
+                state.z_den[d] = gamma * state.z_den[d] + phi_k;
+                let denom = (phi_q * state.z_den[d]).max(1e-6);
+                recurrent_context[d] = (phi_q * state.s_num[d]) / denom;
+            }
+        } else {
+            recurrent_context.copy_from_slice(&qkv[..h]);
+        }
+
         let o = self.weights.matvec_weight(
             &format!("{}.linear_attn.out_proj.weight", p),
             h,
             h,
-            &qkv[..h],
+            &recurrent_context,
         )?;
 
         let gated: Vec<f32> = o.iter().zip(silu(&z).iter()).map(|(a, b)| a * b).collect();
@@ -365,6 +429,10 @@ impl QwenModel {
     pub fn reset_memory(&mut self) {
         for geo in self.geo_maps.iter_mut() {
             *geo = GeometricMemoryMap::new(1_000_000);
+        }
+        let h = self.config.hidden_size;
+        for st in self.linear_states.iter_mut() {
+            *st = LinearAttnLayerState::new(h);
         }
     }
 }

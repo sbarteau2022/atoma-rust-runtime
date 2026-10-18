@@ -48,7 +48,7 @@ fn save_progress(progress_path: &Path, next_index: usize, arcs: usize) -> Result
 }
 
 /// Sample a deterministic 256-float (`1024 B`) Qwen carrier sketch directly from
-/// `/Users/stewartbarteau/models/Qwen3.6-35B-A3B-OptiQ-4bit/model-00001-of-00005.safetensors`
+/// `/Users/stewartbarteau/models/Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit/model-00001-of-00004.safetensors`
 /// for a given Qwen token ID `qwen_tok`.
 fn sample_qwen_shard_sketch(shard_file: &mut Option<File>, shard_len: u64, qwen_tok: u32) -> Vec<f32> {
     let mut sketch = vec![0.0f32; 256];
@@ -103,7 +103,7 @@ fn run() -> Result<(), String> {
     let qwen_progress = root.join("qwen_token_trajectories.progress");
     let qwen_log_path = root.join("qwen_trajectory_harvest.log");
     let qwen_shard_path = PathBuf::from(
-        "/Users/stewartbarteau/models/Qwen3.6-35B-A3B-OptiQ-4bit/model-00001-of-00005.safetensors",
+        "/Users/stewartbarteau/models/Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit/model-00001-of-00004.safetensors",
     );
 
     let mut log = OpenOptions::new()
