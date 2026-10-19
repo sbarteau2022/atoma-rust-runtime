@@ -12,7 +12,10 @@ pub mod bridge;
 #[cfg(feature = "glimmer")]
 pub mod glimmer_map;
 pub mod http_api;
+pub mod input_embeddings;
 pub mod live_map_ui;
+pub mod native_output;
+pub mod native_predictor;
 pub mod routing;
 pub mod runtime_model;
 pub mod swarm;
@@ -36,9 +39,9 @@ use atoma_immune::{
     MlirSsaValidationReceipt, ModelHotSwapReceipt, NativeReader, OpenWeightsDistillationEngine,
     OpticalLens, OverlapPolicyMatrix, ProjectedTangent, QuantizedDistillationReceipt,
     QuantizedLayerTapDescriptor, ReasoningChainDistillationReceipt, RefractedPoint, RoleId,
-    SpanFoldingReceipt, SubAgentTaskReceipt, SuperpositionState, SurgicalErasureReceipt,
-    SwarmKnowledgeAndHomeostasis, TangentProjector, TaskCarvedView, TeacherTapRecord,
-    WeightDistillationReceipt, fold_high_certainty_trajectory_spans,
+    SpanFoldingReceipt, SubAgentTaskReceipt, SurgicalErasureReceipt, SwarmKnowledgeAndHomeostasis,
+    TangentProjector, TaskCarvedView, TeacherTapRecord, WeightDistillationReceipt,
+    fold_high_certainty_trajectory_spans,
 };
 use routing::{DeliveredHandoff, HandoffRequest};
 use std::sync::Arc;
@@ -168,7 +171,7 @@ impl MonsterHybridServer {
         max_new_steps: usize,
         auto_crystallize_on_success: bool,
     ) -> Result<AgenticTaskCompletionReceipt, String> {
-        let _ = self.sync_live_wal_if_grown();
+        self.sync_live_wal_if_grown()?;
         self.active_transformer.wal_path = self.persistent_vault_path.as_ref().map(|p| {
             let mut s = p.as_os_str().to_os_string();
             s.push(".wal");
@@ -184,8 +187,10 @@ impl MonsterHybridServer {
             &self.immune.policy,
         )?;
         if let Some(ref wal_path) = self.active_transformer.wal_path {
-            if let Ok(meta) = std::fs::metadata(wal_path) {
-                self.wal_replayed_offset = meta.len();
+            match std::fs::metadata(wal_path) {
+                Ok(meta) => self.wal_replayed_offset = meta.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("stat live WAL {}: {error}", wal_path.display())),
             }
         }
         if receipt.superposition_interventions > 0 || receipt.crystallization.is_some() {
@@ -220,7 +225,7 @@ impl MonsterHybridServer {
         max_new_steps: usize,
         crystallize_to_parent: bool,
     ) -> Result<SubAgentTaskReceipt, String> {
-        let _ = self.sync_live_wal_if_grown();
+        self.sync_live_wal_if_grown()?;
         self.active_transformer.wal_path = self.persistent_vault_path.as_ref().map(|p| {
             let mut s = p.as_os_str().to_os_string();
             s.push(".wal");
@@ -238,8 +243,10 @@ impl MonsterHybridServer {
             &self.immune.policy,
         )?;
         if let Some(ref wal_path) = self.active_transformer.wal_path {
-            if let Ok(meta) = std::fs::metadata(wal_path) {
-                self.wal_replayed_offset = meta.len();
+            match std::fs::metadata(wal_path) {
+                Ok(meta) => self.wal_replayed_offset = meta.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("stat live WAL {}: {error}", wal_path.display())),
             }
         }
         if receipt.compiled_back_arcs > 0 || receipt.task_receipt.superposition_interventions > 0 {
@@ -326,9 +333,25 @@ impl MonsterHybridServer {
 
         let well = self.swarm_map.atlas.well(target_role);
         if let Some(phase) = target_phase {
+            // OpticalLens::refract adds the projected amplitude channel with opposite
+            // signs to theta_f/theta_s. Cancel that contribution here so typed K/V
+            // records land at the requested key phase exactly after refraction.
+            let amp_offset = (projected.phase_state.amplitude.0 >> 10).clamp(-8_000_000, 8_000_000);
             projected.phase_drive_t2 = [
-                Q32_31(phase.theta_f.0.wrapping_sub(well.phase.theta_f.0)),
-                Q32_31(phase.theta_s.0.wrapping_sub(well.phase.theta_s.0)),
+                Q32_31(
+                    phase
+                        .theta_f
+                        .0
+                        .wrapping_sub(well.phase.theta_f.0)
+                        .wrapping_sub(amp_offset),
+                ),
+                Q32_31(
+                    phase
+                        .theta_s
+                        .0
+                        .wrapping_sub(well.phase.theta_s.0)
+                        .wrapping_add(amp_offset),
+                ),
             ];
         }
         let d_sph = Q32_31::from_f64(0.804_735_5);
@@ -483,7 +506,10 @@ impl MonsterHybridServer {
                 }
             }
             // Fallback / supplement: scan `.cache/huggingface/download/` for partial or cached `.incomplete` / `.safetensors` shards
-            let hf_dl_dir = target_path.join(".cache").join("huggingface").join("download");
+            let hf_dl_dir = target_path
+                .join(".cache")
+                .join("huggingface")
+                .join("download");
             if hf_dl_dir.is_dir() {
                 if let Ok(entries) = std::fs::read_dir(&hf_dl_dir) {
                     for entry in entries.flatten() {
@@ -831,7 +857,7 @@ impl MonsterHybridServer {
         &mut self,
         prefix: &[MlirOpId],
         spent_tokens: u64,
-    ) -> Result<ActiveInferenceStepReceipt, SuperpositionState> {
+    ) -> Result<ActiveInferenceStepReceipt, String> {
         let receipt = NativeReader::active_inference_step_mut(
             &mut self.swarm_map,
             &self.mlir_catalog,
@@ -839,10 +865,11 @@ impl MonsterHybridServer {
             prefix,
             &self.active_inference_config,
             spent_tokens,
-        )?;
+        )
+        .map_err(|state| format!("active inference held: {state:?}"))?;
         if receipt.bridge_arc_distilled {
             self.mark_map_updated();
-            let _ = self.persist_global_map_live_turn();
+            self.persist_global_map_live_turn()?;
         }
         Ok(receipt)
     }
@@ -886,9 +913,8 @@ impl MonsterHybridServer {
                 .load_from_binary_vault(vault_path, &self.immune.policy)?;
             let wal_path = Self::wal_path_for(vault_path);
             if wal_path.exists() {
-                let (_steps, new_offset, _had_torn_tail) = self
-                    .active_transformer
-                    .recover_wal_from_offset(
+                let (_steps, new_offset, _had_torn_tail) =
+                    self.active_transformer.recover_wal_from_offset(
                         &wal_path,
                         0,
                         &mut self.swarm_map,
@@ -926,9 +952,8 @@ impl MonsterHybridServer {
         if !wal_path.exists() {
             return Ok(0);
         }
-        let (replayed, new_offset, _had_torn_tail) = self
-            .active_transformer
-            .recover_wal_from_offset(
+        let (replayed, new_offset, _had_torn_tail) =
+            self.active_transformer.recover_wal_from_offset(
                 &wal_path,
                 self.wal_replayed_offset,
                 &mut self.swarm_map,
@@ -1011,7 +1036,11 @@ impl MonsterHybridServer {
         let q_tok_ids: Vec<u32> = q_ops.iter().map(|op| op.0).collect();
         let qwen_path = std::path::Path::new(crate::live_map_ui::DEFAULT_QWEN_SHARD_PATH);
         let (hidden_state, _) = atoma_immune::project_qwen_token_sketch(
-            if qwen_path.exists() { Some(qwen_path) } else { None },
+            if qwen_path.exists() {
+                Some(qwen_path)
+            } else {
+                None
+            },
             &q_tok_ids,
             q_bytes,
         );

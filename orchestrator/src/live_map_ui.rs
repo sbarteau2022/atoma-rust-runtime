@@ -14,8 +14,7 @@ use atoma_immune::{
 };
 use std::path::Path;
 
-pub const DEFAULT_QWEN_SHARD_PATH: &str =
-    "/Users/stewartbarteau/models/Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit/model-00001-of-00004.safetensors";
+pub const DEFAULT_QWEN_SHARD_PATH: &str = "/Users/stewartbarteau/models/Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit/model-00001-of-00004.safetensors";
 
 fn escape_json(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
@@ -53,7 +52,7 @@ impl MonsterHybridServer {
         let trimmed = domain_or_prompt.trim();
         for preset in &CANONICAL_DOMAIN_PRESETS {
             if trimmed.eq_ignore_ascii_case(preset.domain_id) {
-                let mut prof = self.swarm_map.probe_and_carve_specialist(
+                let prof = self.swarm_map.probe_and_carve_specialist(
                     preset.domain_id,
                     preset.display_name,
                     preset.canonical_prompt,
@@ -142,7 +141,7 @@ impl MonsterHybridServer {
             self.swarm_map.locked_arc_count,
             self.swarm_map.ingested_tensor_digests.len(),
             escape_json(&self.swarm_map.base_weights.model_name),
-            qwen_on_disk,
+            qwen_on_disk && teacher_reachable,
             qwen_on_disk,
             teacher_reachable,
             teacher_mode,
@@ -377,13 +376,25 @@ impl MonsterHybridServer {
             .map(|id| id.0.to_string())
             .collect::<Vec<_>>()
             .join(",");
+        let native_output_candidate = op
+            .native_output_candidate
+            .as_ref()
+            .map(|text| format!("\"{}\"", escape_json(text)))
+            .unwrap_or_else(|| "null".to_string());
+        let native_output_error = op
+            .native_output_error
+            .as_ref()
+            .map(|error| format!("\"{}\"", escape_json(error)))
+            .unwrap_or_else(|| "null".to_string());
         base.push_str(&format!(
-            ",\"turn_receipt\":{{\"session_id\":{},\"turn_index\":{},\"tier\":\"{}\",\"teacher_source\":\"{}\",\"response_text\":\"{}\",\"emitted_op_count\":{},\"emitted_ops\":[{}],\"superposition_holds\":{},\"free_energy\":{:.6},\"omega_readiness\":{:.6},\"atoms_before\":{},\"atoms_after\":{},\"novel_atoms_minted\":{},\"arcs_before\":{},\"arcs_after\":{},\"novel_arcs_minted\":{},\"wal_bytes_appended\":{},\"compliance_verified\":{},\"latency_us\":{}}}}}",
+            ",\"turn_receipt\":{{\"session_id\":{},\"turn_index\":{},\"tier\":\"{}\",\"teacher_source\":\"{}\",\"response_text\":\"{}\",\"native_output_kind\":\"prompt_readout\",\"native_output_is_continuation\":false,\"native_output_candidate\":{},\"native_output_error\":{},\"emitted_op_count\":{},\"emitted_ops\":[{}],\"superposition_holds\":{},\"free_energy\":{:.6},\"omega_readiness\":{:.6},\"atoms_before\":{},\"atoms_after\":{},\"novel_atoms_minted\":{},\"arcs_before\":{},\"arcs_after\":{},\"novel_arcs_minted\":{},\"wal_bytes_appended\":{},\"compliance_verified\":{},\"latency_us\":{}}}}}",
             op.session_id,
             op.turn_index,
             op.turn.tier.as_str(),
             escape_json(&op.teacher_source),
             escape_json(&op.turn.response_text),
+            native_output_candidate,
+            native_output_error,
             op.turn.emitted_ops.len(),
             ops_str,
             op.turn.tier2_superposition_interventions,

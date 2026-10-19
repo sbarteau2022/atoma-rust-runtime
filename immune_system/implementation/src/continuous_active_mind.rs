@@ -403,6 +403,40 @@ impl BoundaryLexicalTransducer {
         folded.into_iter().map(MlirOpId).collect()
     }
 
+    /// Convert UTF-8 bytes directly to native ML-IR carrier IDs without a model tokenizer or
+    /// vocabulary table. Atomic-IR span folding remains available; expanding the result recovers
+    /// the original byte IDs exactly.
+    pub fn transduce_utf8_to_mlir(&self, text: &str, prepend_bos: bool) -> Vec<MlirOpId> {
+        let mut byte_ids = Vec::with_capacity(text.len() + usize::from(prepend_bos));
+        if prepend_bos {
+            byte_ids.push(self.bos_id.0);
+        }
+        byte_ids.extend(text.as_bytes().iter().map(|&byte| u32::from(byte)));
+        self.atomic_ir
+            .encode(&byte_ids)
+            .into_iter()
+            .map(MlirOpId)
+            .collect()
+    }
+
+    /// Expand native ML-IR carrier IDs directly back to UTF-8. This accepts only byte carriers
+    /// after atomic-IR expansion, so model-token IDs cannot silently leak into text output.
+    pub fn transduce_mlir_to_utf8(&self, ops: &[MlirOpId]) -> Result<String, String> {
+        let carrier_ids: Vec<u32> = ops
+            .iter()
+            .copied()
+            .filter(|op| *op != self.bos_id && !self.eos_ids.contains(op))
+            .map(|op| op.0)
+            .collect();
+        let expanded = self.atomic_ir.expand_checked(&carrier_ids)?;
+        let bytes: Result<Vec<u8>, _> = expanded
+            .into_iter()
+            .map(|id| u8::try_from(id).map_err(|_| id))
+            .collect();
+        let bytes = bytes.map_err(|id| format!("ML-IR carrier {id} is not a UTF-8 byte"))?;
+        String::from_utf8(bytes).map_err(|e| format!("ML-IR egress is invalid UTF-8: {e}"))
+    }
+
     /// **Egress Transduction (`Emitted MlirOpIds -> Expanded Carrier IDs -> UTF-8 Text`)**:
     pub fn transduce_egress_ops(&self, ops: &[MlirOpId]) -> (Vec<u32>, String) {
         let raw_atoms: Vec<u32> = ops
@@ -1542,7 +1576,8 @@ impl GeodesicActiveTransformer {
             " of ", " in ", " for ", " about ", " from ", " with ", " to ",
         ] {
             if let Some(pos) = lower_stripped.rfind(prep) {
-                let tail = Self::strip_trailing_conversational_verb(&cleaned_stripped[pos + prep.len()..]);
+                let tail =
+                    Self::strip_trailing_conversational_verb(&cleaned_stripped[pos + prep.len()..]);
                 if !tail.is_empty() && !raw_subjects.contains(&tail.to_string()) {
                     raw_subjects.push(tail.to_string());
                 }
@@ -1551,7 +1586,9 @@ impl GeodesicActiveTransformer {
         // Also include clean 3-word, 2-word, and 1-word N-grams from the prompt so mid-sentence
         // concepts (e.g. "Can you explain how a hash map works in plain English?") resolve directly.
         let ngram_words: Vec<&str> = cleaned_stripped
-            .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '(' | ')' | '/' | '?'))
+            .split(|c: char| {
+                c.is_whitespace() || matches!(c, ',' | ';' | ':' | '(' | ')' | '/' | '?')
+            })
             .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_'))
             .filter(|w| !w.is_empty())
             .collect();
@@ -1560,7 +1597,9 @@ impl GeodesicActiveTransformer {
                 for win in ngram_words.windows(win_len) {
                     let first_low = win[0].to_ascii_lowercase();
                     let last_low = win[win_len - 1].to_ascii_lowercase();
-                    if Self::is_concept_stop_word(&first_low) || Self::is_concept_stop_word(&last_low) {
+                    if Self::is_concept_stop_word(&first_low)
+                        || Self::is_concept_stop_word(&last_low)
+                    {
                         continue;
                     }
                     let joined = win.join(" ");
@@ -2287,9 +2326,12 @@ impl GeodesicActiveTransformer {
         }
 
         let ingress_ops = self.transducer.transduce_ingress_text(cleaned, true);
-        let standing_op = ingress_ops.last().copied().unwrap_or(self.transducer.bos_id);
-        let (query_lor, _query_phase) = NativeReader::address(&self.transducer.catalog, standing_op)
-            .unwrap_or_else(|_| {
+        let standing_op = ingress_ops
+            .last()
+            .copied()
+            .unwrap_or(self.transducer.bos_id);
+        let (query_lor, _query_phase) =
+            NativeReader::address(&self.transducer.catalog, standing_op).unwrap_or_else(|_| {
                 (
                     LorentzVector::origin(),
                     Phase {
@@ -2343,9 +2385,8 @@ impl GeodesicActiveTransformer {
             }
 
             let next_idx = if cur_idx > idx { cur_idx } else { idx + 1 };
-            let should_inspect = bpe_hits > 0
-                || n_arcs <= 512
-                || (content_words.is_empty() && idx < 64);
+            let should_inspect =
+                bpe_hits > 0 || n_arcs <= 512 || (content_words.is_empty() && idx < 64);
 
             if !chain_ops.is_empty() && should_inspect {
                 let (_exp, decoded_text) = self.transducer.transduce_egress_ops(&chain_ops);
@@ -3318,7 +3359,10 @@ impl GeodesicActiveTransformer {
             if let Some((bridged_ops, decoded_output_text, holds, _)) =
                 self.discover_and_bridge_novel_concept_trajectories(map, &dream_prompt, 96)
             {
-                if BoundaryLexicalTransducer::is_coherent_egress_text(&dream_prompt, &decoded_output_text) {
+                if BoundaryLexicalTransducer::is_coherent_egress_text(
+                    &dream_prompt,
+                    &decoded_output_text,
+                ) {
                     let mut running = ingress.clone();
                     let mut steps = Vec::with_capacity(bridged_ops.len());
                     let cert = Q32_31::from_f64(0.96);
@@ -3327,7 +3371,9 @@ impl GeodesicActiveTransformer {
                         running.push(op);
                     }
                     let trace = EpisodeWorkingTrace {
-                        episode_id: 900_000 + dream_epoch * 100 + (empty_space_bridges_minted as u64),
+                        episode_id: 900_000
+                            + dream_epoch * 100
+                            + (empty_space_bridges_minted as u64),
                         initial_prefix: ingress.clone(),
                         active_prefix: running,
                         tentative_steps: steps,
@@ -3467,6 +3513,36 @@ mod tests {
         let (expanded, decoded) = transducer.transduce_egress_ops(&ops);
         assert_eq!(expanded, vec![13796, 26, 1573]);
         assert_eq!(decoded, " Paris, which");
+    }
+
+    #[test]
+    fn native_mlir_text_conversion_is_utf8_byte_reversible_without_vocab_entries() {
+        let transducer = BoundaryLexicalTransducer::new(202_048, 200_000, vec![200_001]);
+        let source = "naïve 🐉";
+        let ops = transducer.transduce_utf8_to_mlir(source, true);
+        assert_eq!(ops.first(), Some(&MlirOpId(200_000)));
+        assert_eq!(transducer.transduce_mlir_to_utf8(&ops).unwrap(), source);
+    }
+
+    #[test]
+    fn native_egress_rejects_unknown_nonbyte_and_invalid_utf8_carriers() {
+        let transducer = BoundaryLexicalTransducer::new(202_048, 200_000, vec![200_001]);
+        for invalid in [u32::MAX, 256, 255] {
+            assert!(
+                transducer
+                    .transduce_mlir_to_utf8(&[MlirOpId(u32::from(b'a')), MlirOpId(invalid)])
+                    .is_err(),
+                "carrier {invalid} must not be dropped or repaired"
+            );
+        }
+        // The existing canonical span folds 'efgh'; byte conversion must expand it losslessly.
+        let source = "abcdefgh\0🐉\r\n";
+        let ids = transducer.transduce_utf8_to_mlir(source, true);
+        assert!(
+            ids.iter()
+                .any(|id| id.0 >= transducer.atomic_ir.base_vocab_size)
+        );
+        assert_eq!(transducer.transduce_mlir_to_utf8(&ids).unwrap(), source);
     }
 
     #[test]

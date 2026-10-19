@@ -717,6 +717,22 @@ impl AtomicIrAlphabet {
         out
     }
 
+    /// Expand a closed carrier stream without silently dropping unregistered atom IDs.
+    /// Native text egress uses this form so a corrupt ID cannot turn into apparent success.
+    pub fn expand_checked(&self, atoms: &[u32]) -> Result<Vec<u32>, String> {
+        let mut out = Vec::with_capacity(atoms.len());
+        for &id in atoms {
+            if id < self.base_vocab_size {
+                out.push(id);
+            } else if let Some(atom) = self.multi_atoms.iter().find(|atom| atom.atom_id == id) {
+                out.extend_from_slice(&atom.expansion);
+            } else {
+                return Err(format!("unknown Atomic-IR carrier {id}"));
+            }
+        }
+        Ok(out)
+    }
+
     /// Expand a draft block while enforcing the empirical `<= 7` token verify-cost cliff (`SPEC_atomic_ir.md` §2).
     pub fn expand_within_verify_cliff(&self, drafted_atoms: &[u32]) -> Vec<u32> {
         let mut expanded = self.expand(drafted_atoms);

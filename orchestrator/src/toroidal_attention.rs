@@ -658,6 +658,8 @@ impl MonsterHybridServer {
 pub struct ToroidalHarmonicFieldState {
     pub hidden_dim: usize,
     pub tokens_ingested: usize,
+    /// Cumulative unwrapped rotations supplied across token steps in this field.
+    pub cumulative_rotations: f64,
     /// Full Kuramoto `PhaseState` including the radial `amplitude` channel.
     pub phase_state: PhaseState,
     /// Monotonically expanding radius accumulator (grows with every rotation/step rather than decaying).
@@ -686,6 +688,7 @@ impl ToroidalHarmonicFieldState {
         Self {
             hidden_dim,
             tokens_ingested: 0,
+            cumulative_rotations: 0.0,
             phase_state: PhaseState::ZERO,
             radius_accumulator: 1.0,
             rapidity_accumulator: 0.0,
@@ -724,11 +727,13 @@ impl ToroidalHarmonicFieldState {
             traj.phase_state.theta_s,
         );
 
-        let amp_f64 = self.phase_state.amplitude.to_f64().max(1e-4);
-        let radial_step = 0.25 * traj.expanded_ball_radius
-            + 0.18 * traj.cumulative_rotations.max(0.05)
-            + 0.12 * amp_f64;
-        self.radius_accumulator += radial_step;
+        self.cumulative_rotations += traj.cumulative_rotations;
+        self.radius_accumulator =
+            atoma_immune::geometry::torus::TorPhaseEncoder::radius_for_rotations(
+                self.cumulative_rotations.floor(),
+                1.0,
+                1.9,
+            );
         self.rapidity_accumulator += traj.rapidity.max(0.05);
 
         // Variable-rapidity boost + Picard reduction for unbounded radii
@@ -1011,6 +1016,97 @@ impl ToroidalIsotropicRuntime {
         }
     }
 
+    /// Construct a dense replacement stack with one independent recurrent toroidal
+    /// attention state for every layer in the declared model depth.
+    ///
+    /// This only establishes layer coverage. It does not supply learned embeddings,
+    /// trained per-layer projections, or an output vocabulary head.
+    pub fn full_stack(hidden_dim: usize, total_model_layers: usize) -> Result<Self, String> {
+        if hidden_dim < 2 || !hidden_dim.is_multiple_of(2) {
+            return Err("toroidal hidden dimension must be positive and even".into());
+        }
+        if total_model_layers == 0 {
+            return Err("toroidal stack must contain at least one layer".into());
+        }
+        Ok(Self::new(
+            hidden_dim,
+            (0..total_model_layers).collect(),
+            total_model_layers,
+        ))
+    }
+
+    /// Run finite representations through each recurrent field without map effectors or a teacher.
+    /// Distribute the residual mix over the stack: applying an 18% blend 52 times previously
+    /// erased new input, so later positions collapsed to the first carrier. The product of
+    /// per-layer input weights is now `1 - toroidal_field_mix` regardless of depth.
+    pub fn step_toroidal_attention(&mut self, x_in: &[f32]) -> Result<Vec<f32>, String> {
+        if x_in.len() != self.hidden_dim || !x_in.iter().all(|x| x.is_finite()) {
+            return Err("toroidal input must match hidden dimension and be finite".into());
+        }
+        if self.layer_fields.is_empty()
+            || !self.toroidal_field_mix.is_finite()
+            || !(0.0..=1.0).contains(&self.toroidal_field_mix)
+        {
+            return Err(
+                "toroidal stack requires fields and a finite residual mix in [0, 1]".into(),
+            );
+        }
+        let layer_mix = -(f64::from(-self.toroidal_field_mix).ln_1p()
+            / self.layer_fields.len() as f64)
+            .exp_m1() as f32;
+        let mut x = x_in.to_vec();
+        for (layer, field) in self.layer_fields.iter_mut().enumerate() {
+            let attended = field.step_and_readout(&x, self.horizon_decay);
+            for (value, context) in x.iter_mut().zip(attended) {
+                *value += layer_mix * (context - *value);
+            }
+            if !x.iter().all(|value| value.is_finite()) {
+                return Err(format!("toroidal layer {layer} produced non-finite output"));
+            }
+        }
+        Ok(x)
+    }
+
+    /// Process native UTF-8→ML-IR address embeddings in order through every toroidal layer.
+    /// The caller owns this runtime per session so recurrent state remains isolated.
+    pub fn step_native_text(
+        &mut self,
+        embeddings: &[crate::input_embeddings::NativeMlirEmbedding],
+    ) -> Result<Vec<f32>, String> {
+        self.step_native_text_sequence(embeddings)?
+            .pop()
+            .ok_or_else(|| "native text contains no carrier embeddings".into())
+    }
+
+    /// Return one toroidal hidden state per byte position for the native output head.
+    pub fn step_native_text_sequence(
+        &mut self,
+        embeddings: &[crate::input_embeddings::NativeMlirEmbedding],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        if embeddings.is_empty() {
+            return Err("native text contains no carrier embeddings".into());
+        }
+        if self.hidden_dim != crate::input_embeddings::NATIVE_MLIR_EMBEDDING_DIM {
+            return Err(format!(
+                "native ML-IR embeddings are {}D but toroidal stack is {}D",
+                crate::input_embeddings::NATIVE_MLIR_EMBEDDING_DIM,
+                self.hidden_dim
+            ));
+        }
+        // Validate the complete input before changing any recurrent state.
+        if embeddings
+            .iter()
+            .any(|entry| entry.coordinates.iter().any(|value| !value.is_finite()))
+        {
+            return Err("native text contains non-finite carrier coordinates".into());
+        }
+        let mut outputs = Vec::with_capacity(embeddings.len());
+        for token in embeddings {
+            outputs.push(self.step_toroidal_attention(&token.coordinates)?);
+        }
+        Ok(outputs)
+    }
+
     /// Apply pair-wise RMS scaling on `(R_+ x S^1)^(D/2)` without `max_r = 3.0 * mean_pair_r`
     /// saturation clamps, preserving all pair relative amplitudes and `target_l2_norm`.
     pub fn isotropic_toroidal_rms_normalize(x: &mut [f32], target_l2_norm: f32) {
@@ -1131,6 +1227,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn full_stack_allocates_one_state_per_declared_layer() {
+        let mut runtime = ToroidalIsotropicRuntime::full_stack(256, 52).unwrap();
+        assert_eq!(runtime.total_model_layers, 52);
+        assert_eq!(runtime.active_layers, (0..52).collect::<Vec<_>>());
+        assert_eq!(runtime.layer_fields.len(), 52);
+        assert!(ToroidalIsotropicRuntime::full_stack(255, 52).is_err());
+        assert!(ToroidalIsotropicRuntime::full_stack(256, 0).is_err());
+
+        let hidden = vec![0.25; 256];
+        let output = runtime.step_toroidal_attention(&hidden).unwrap();
+        assert_eq!(output.len(), hidden.len());
+        assert!(output.iter().all(|x| x.is_finite()));
+        assert!(
+            runtime
+                .layer_fields
+                .iter()
+                .all(|field| field.tokens_ingested == 1)
+        );
+
+        let transducer =
+            atoma_immune::BoundaryLexicalTransducer::new(202_048, 200_000, vec![200_001]);
+        let embeddings =
+            crate::input_embeddings::embed_utf8_text(&transducer, "go", false).unwrap();
+        let mut native_runtime = ToroidalIsotropicRuntime::full_stack(6, 52).unwrap();
+        let native_output = native_runtime.step_native_text(&embeddings).unwrap();
+        assert_eq!(native_output.len(), 6);
+        assert!(
+            native_runtime
+                .layer_fields
+                .iter()
+                .all(|field| field.tokens_ingested == 2)
+        );
+    }
+
+    #[test]
     fn p2_aligned_opposed_and_degenerate() {
         assert!(
             (pair_coherence(&[1.0, 0.0, 0.0, 1.0], &[1.0, 0.0, 0.0, 1.0]).unwrap() - 2.0).abs()
@@ -1178,6 +1309,7 @@ mod tests {
     fn orchestrator_radius_accumulator_expands_over_time_with_amplitude_and_picard_reduction() {
         let mut state = ToroidalHarmonicFieldState::new(128);
         let mut prev_radius = state.radius_accumulator;
+        let mut prev_completed_rotations = 0.0f64;
         let mut prev_amp = state.phase_state.amplitude.to_f64();
         let mut prev_rapidity = state.rapidity_accumulator;
 
@@ -1188,11 +1320,16 @@ mod tests {
             let out = state.step_and_readout(&x_in, 0.995);
             assert_eq!(out.len(), 128);
             assert!(out.iter().all(|v| v.is_finite()));
-            assert!(
-                state.radius_accumulator > prev_radius,
-                "radius_accumulator must expand over time: step {step} {} <= {prev_radius}",
-                state.radius_accumulator
-            );
+            let completed_rotations = state.cumulative_rotations.floor();
+            assert!(state.radius_accumulator >= prev_radius);
+            if completed_rotations > prev_completed_rotations {
+                assert!(state.radius_accumulator > prev_radius);
+            } else {
+                assert_eq!(state.radius_accumulator, prev_radius);
+            }
+            let expected_radius =
+                TorPhaseEncoder::radius_for_rotations(state.cumulative_rotations.floor(), 1.0, 1.9);
+            assert!((state.radius_accumulator - expected_radius).abs() < 1e-12);
             assert!(
                 state.phase_state.amplitude.to_f64() > prev_amp,
                 "PhaseState amplitude must expand over time: step {step} {} <= {prev_amp}",
@@ -1208,8 +1345,57 @@ mod tests {
                 "Picard-reduced hyperbolic state must remain on H^3 at step {step}"
             );
             prev_radius = state.radius_accumulator;
+            prev_completed_rotations = completed_rotations;
             prev_amp = state.phase_state.amplitude.to_f64();
             prev_rapidity = state.rapidity_accumulator;
         }
+        assert!(
+            state.radius_accumulator > 1.0,
+            "completed turns must expand radius"
+        );
+    }
+    #[test]
+    fn standalone_depth_preserves_current_input_instead_of_locking_to_first_carrier() {
+        let transducer =
+            atoma_immune::BoundaryLexicalTransducer::new(202_048, 200_000, vec![200_001]);
+        let embedded = crate::input_embeddings::embed_utf8_text(&transducer, "AB", false).unwrap();
+        for depth in [1, 52] {
+            let mut runtime = ToroidalIsotropicRuntime::full_stack(6, depth).unwrap();
+            let output = runtime.step_native_text_sequence(&embedded).unwrap();
+            let distance = |target: &[f32]| {
+                output[1]
+                    .iter()
+                    .zip(target)
+                    .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                    .sum::<f64>()
+            };
+            assert!(
+                distance(&embedded[1].coordinates) < distance(&embedded[0].coordinates),
+                "depth {depth} erased the new carrier"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_later_carrier_is_rejected_before_recurrent_state_changes() {
+        let transducer =
+            atoma_immune::BoundaryLexicalTransducer::new(202_048, 200_000, vec![200_001]);
+        let mut embedded =
+            crate::input_embeddings::embed_utf8_text(&transducer, "AB", false).unwrap();
+        embedded[1].coordinates[0] = f32::NAN;
+        let mut runtime = ToroidalIsotropicRuntime::full_stack(6, 52).unwrap();
+        assert!(runtime.step_native_text_sequence(&embedded).is_err());
+        assert!(
+            runtime
+                .layer_fields
+                .iter()
+                .all(|field| field.tokens_ingested == 0)
+        );
+        let valid = &embedded[..1];
+        let mut fresh = ToroidalIsotropicRuntime::full_stack(6, 52).unwrap();
+        assert_eq!(
+            runtime.step_native_text_sequence(valid).unwrap(),
+            fresh.step_native_text_sequence(valid).unwrap()
+        );
     }
 }

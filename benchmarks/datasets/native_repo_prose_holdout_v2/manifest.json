@@ -1,0 +1,18 @@
+{
+  "schema": "native-repository-prose-holdout-v2",
+  "purpose": "Fresh documents selected before scoring the corrected optimizer. Never used to fit or select checkpoints.",
+  "files": [
+    {
+      "source": "design/implementation/merge-unified-mind.md",
+      "file": "01-merge-unified-mind.md",
+      "bytes": 5005,
+      "sha256": "f91ab6ffab6d0dc3bff1a0a84370ab9e683ddcffa020183712b92c5bb75b5023"
+    },
+    {
+      "source": "immune_system/audit/FLAG_01_BRIDGE_STUDY.md",
+      "file": "02-FLAG_01_BRIDGE_STUDY.md",
+      "bytes": 15257,
+      "sha256": "9d018ed76bc963cd303108dd9c3bf7fd7874f0b070b25b1a100b8b5b9887118f"
+    }
+  ]
+}

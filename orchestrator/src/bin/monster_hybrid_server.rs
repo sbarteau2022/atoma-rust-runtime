@@ -941,6 +941,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut runtime = MainModelCoordinatorRuntime {
             server,
             sessions: Default::default(),
+            toroidal_sessions: Default::default(),
+            toroidal_hidden_states: Default::default(),
+            toroidal_hidden_sequences: Default::default(),
         };
         for (idx, arg) in args.iter().enumerate() {
             if arg == "--turn" {
@@ -960,6 +963,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut runtime = MainModelCoordinatorRuntime {
             server,
             sessions: Default::default(),
+            toroidal_sessions: Default::default(),
+            toroidal_hidden_states: Default::default(),
+            toroidal_hidden_sequences: Default::default(),
         };
         println!(
             "[verified] GeodesicActiveTransformer stdin ready (bare prompts execute 3-Tier Live Operational Turn + Real-Time Learning; `query <text>` retrieves only, `learn <text>` intakes only, `save` snapshots vault, `/reset`, `status`, `quit`; max_new={}, global_0cells={}, global_1cell_arcs={})",
@@ -978,7 +984,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             if trimmed == "/reset" {
-                runtime.sessions.remove(&1);
+                runtime.reset_session(1);
                 println!("[session reset; global map retained]");
                 continue;
             }
@@ -1288,6 +1294,11 @@ fn print_live_operational_turn(op: &LiveOperationalTurnReceipt) {
         .map(|r| format!("{}({})", r.short_code(), r.name()))
         .collect();
     println!("{}", op.turn.response_text);
+    if let Some(candidate) = &op.native_output_candidate {
+        println!("[native-output-head prompt readout; untrained] {candidate:?}");
+    } else if let Some(error) = &op.native_output_error {
+        println!("[native-output-head unavailable] {error}");
+    }
     println!(
         "[live-turn] tier={:?} teacher={} specialist=[{}] emitted={} tier2_holds={} novel_0cells=+{} novel_1cells=+{} wal_bytes=+{} total_0cells={} total_1cells={} latency={:.2}ms",
         op.turn.tier,
@@ -1938,12 +1949,10 @@ fn run_persistent_tcp_server(
     let mut runtime = MainModelCoordinatorRuntime {
         server,
         sessions: Default::default(),
+        toroidal_sessions: Default::default(),
+        toroidal_hidden_states: Default::default(),
+        toroidal_hidden_sequences: Default::default(),
     };
-    let mut toroidal_runtime = atoma_orchestrator::toroidal_attention::ToroidalIsotropicRuntime::new(
-        256,
-        vec![0, 12, 24, 36, 48],
-        60,
-    );
     let mut brain_checkpoints: HashMap<u64, BrainContinuityCheckpoint> = HashMap::new();
     let mut latest_active_session_id: Option<u64> = None;
 
@@ -2137,61 +2146,6 @@ fn run_persistent_tcp_server(
                     cur_arcs,
                 );
 
-                // 1. Step the unified Toroidal Isotropic Attention + Rank-8 Local Jacobian (`ATOMA_OP_V3`)
-                //    runtime across real Qwen3.8 safetensors receptor sketches on every chat turn.
-                let prompt_carrier_ops = runtime
-                    .server
-                    .active_transformer
-                    .transducer
-                    .transduce_ingress_text(&user_prompt, false);
-                let prompt_tok_ids: Vec<u32> = prompt_carrier_ops.iter().map(|op| op.0).collect();
-                let qwen_shard_p = std::path::Path::new(
-                    atoma_orchestrator::live_map_ui::DEFAULT_QWEN_SHARD_PATH,
-                );
-                let (x_in, _) = atoma_immune::project_qwen_token_sketch(
-                    if qwen_shard_p.exists() {
-                        Some(qwen_shard_p)
-                    } else {
-                        None
-                    },
-                    &prompt_tok_ids,
-                    user_prompt.as_bytes(),
-                );
-                let toroidal_step = toroidal_runtime
-                    .step_token(handled, &x_in, &runtime.server.swarm_map)
-                    .ok();
-                if let Some(ref ts) = toroidal_step {
-                    let mut band_e = [1e-6f32; 4];
-                    for b in 0..4 {
-                        for &v in &ts.final_hidden_state[b * 64..(b + 1) * 64] {
-                            band_e[b] += v * v;
-                        }
-                    }
-                    let max_b = band_e
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1.total_cmp(b.1))
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    band_e[max_b] *= 6.0;
-                    let sum_e: f32 = band_e.iter().sum();
-                    let next_op_probs: Vec<f32> = band_e.iter().map(|&e| e / sum_e).collect();
-                    let mut tap_payload = vec![0u8; 256];
-                    for (i, &f) in ts.final_hidden_state.iter().take(64).enumerate() {
-                        tap_payload[i * 4..(i + 1) * 4].copy_from_slice(&f.to_le_bytes());
-                    }
-                    let t_digest = atoma_immune::Sha256Digest::compute(user_prompt.as_bytes());
-                    let live_tap = TeacherTapRecord {
-                        shard_id: u64::from_le_bytes(t_digest.0[0..8].try_into().unwrap())
-                            .wrapping_add(handled as u64),
-                        layer_index: 36,
-                        hidden_state: ts.final_hidden_state.clone(),
-                        next_op_probs,
-                        payload: tap_payload,
-                    };
-                    let _ = runtime.server.observe_and_distill_live_step(&live_tap);
-                }
-
                 // 2. Route live chat through the attached Qwen3.8-27B model (:8001) when reachable
                 //    (unless executing an explicit deterministic MLIR SSA benchmark operator),
                 //    and immediately upload + crystallize the exchange into `global_active_mind.atoma_map` + `.wal`.
@@ -2212,33 +2166,35 @@ fn run_persistent_tcp_server(
                     if let Some(captured_trajectory) =
                         proxy_to_upstream_qwen_and_capture(&upstream_body, stream_mode, &mut stream)
                     {
-                        if let Ok(op_receipt) = runtime.ingest_live_model_exchange_into_brain(
+                        match runtime.ingest_live_model_exchange_into_brain(
                             session_id,
                             &user_prompt,
                             &captured_trajectory,
                         ) {
-                            print_live_operational_turn(&op_receipt);
-                            cached_map_state_json = runtime.server.render_map_state_json();
-                            if let Some(ckpt) = brain_checkpoints.get_mut(&session_id) {
-                                ckpt.turn_count += 1;
-                                ckpt.last_lit_basins = op_receipt
-                                    .specialist_profile
-                                    .lit_basins
-                                    .iter()
-                                    .map(|r| r.short_code().to_string())
-                                    .collect();
-                                ckpt.last_atoms_total = op_receipt.atoms_after;
-                                ckpt.last_arcs_total = op_receipt.arcs_after;
-                                let summary: String =
-                                    captured_trajectory.trim().chars().take(200).collect();
-                                if !summary.is_empty() {
-                                    ckpt.recent_assistant_outputs.push(summary.clone());
-                                    if ckpt.folded_decisions_and_tools.len() < 64 {
-                                        ckpt.folded_decisions_and_tools.push(summary);
+                            Ok(op_receipt) => {
+                                print_live_operational_turn(&op_receipt);
+                                if let Some(ckpt) = brain_checkpoints.get_mut(&session_id) {
+                                    ckpt.turn_count += 1;
+                                    ckpt.last_lit_basins = op_receipt
+                                        .specialist_profile
+                                        .lit_basins
+                                        .iter()
+                                        .map(|r| r.short_code().to_string())
+                                        .collect();
+                                    ckpt.last_atoms_total = op_receipt.atoms_after;
+                                    ckpt.last_arcs_total = op_receipt.arcs_after;
+                                    let summary: String =
+                                        captured_trajectory.trim().chars().take(200).collect();
+                                    if !summary.is_empty() {
+                                        ckpt.recent_assistant_outputs.push(summary.clone());
+                                        if ckpt.folded_decisions_and_tools.len() < 64 {
+                                            ckpt.folded_decisions_and_tools.push(summary);
+                                        }
                                     }
+                                    persist_checkpoint_json(ckpt);
                                 }
-                                persist_checkpoint_json(ckpt);
                             }
+                            Err(error) => eprintln!("[live exchange persistence failed] {error}"),
                         }
                         handled += 1;
                         continue;
@@ -2248,10 +2204,18 @@ fn run_persistent_tcp_server(
                 // Seed prior subject from earlier user messages in `messages` if this session is new,
                 // enabling coreference resolution ("What is its largest city?") across stateless HTTP chat calls.
                 if !runtime.sessions.contains_key(&session_id) && conversation_turns.len() > 1 {
-                    for turn_str in conversation_turns[..conversation_turns.len() - 1].iter().rev() {
+                    for turn_str in conversation_turns[..conversation_turns.len() - 1]
+                        .iter()
+                        .rev()
+                    {
                         if let Some(u_prev) = turn_str.strip_prefix("user: ") {
-                            if !atoma_immune::GeodesicActiveTransformer::has_coreference_cue(u_prev) {
-                                if let Some(subj) = atoma_immune::GeodesicActiveTransformer::extract_primary_subject(u_prev) {
+                            if !atoma_immune::GeodesicActiveTransformer::has_coreference_cue(u_prev)
+                            {
+                                if let Some(subj) =
+                                    atoma_immune::GeodesicActiveTransformer::extract_primary_subject(
+                                        u_prev,
+                                    )
+                                {
                                     runtime.ingest_human_prompt_at_edge(session_id, u_prev);
                                     if let Some(sess) = runtime.sessions.get_mut(&session_id) {
                                         sess.last_subject = Some(subj);
@@ -2273,9 +2237,6 @@ fn run_persistent_tcp_server(
                 match turn_res {
                     Ok(op_receipt) => {
                         print_live_operational_turn(&op_receipt);
-                        if op_receipt.novel_atoms_minted > 0 || op_receipt.novel_arcs_minted > 0 {
-                            cached_map_state_json = runtime.server.render_map_state_json();
-                        }
                         if let Some(ckpt) = brain_checkpoints.get_mut(&session_id) {
                             ckpt.turn_count += 1;
                             ckpt.last_lit_basins = op_receipt
@@ -2583,9 +2544,6 @@ fn run_persistent_tcp_server(
                 ) {
                     Ok(op_receipt) => {
                         print_live_operational_turn(&op_receipt);
-                        if op_receipt.novel_atoms_minted > 0 || op_receipt.novel_arcs_minted > 0 {
-                            cached_map_state_json = runtime.server.render_map_state_json();
-                        }
                         runtime
                             .server
                             .render_live_operational_turn_json(&op_receipt)
@@ -2664,30 +2622,23 @@ fn run_persistent_tcp_server(
                     max_charts,
                     max_bridges,
                 ) {
-                    Ok(rec) => {
-                        if rec.charts_upgraded_to_multi_rank > 0
-                            || rec.empty_space_bridges_minted > 0
-                        {
-                            cached_map_state_json = runtime.server.render_map_state_json();
-                        }
-                        serde_json::json!({
-                            "status": "ok",
-                            "dream_epoch": rec.dream_epoch,
-                            "elapsed_us": t_dream.elapsed().as_micros() as u64,
-                            "charts_upgraded_to_multi_rank": rec.charts_upgraded_to_multi_rank,
-                            "tangent_ranks_accreted": rec.tangent_ranks_accreted,
-                            "empty_space_bridges_minted": rec.empty_space_bridges_minted,
-                            "macro_spans_folded": rec.macro_spans_folded,
-                            "holonomy_verified": rec.holonomy_verified,
-                            "total_atoms_before": rec.total_atoms_before,
-                            "total_atoms_after": rec.total_atoms_after,
-                            "total_arcs_before": rec.total_arcs_before,
-                            "total_arcs_after": rec.total_arcs_after,
-                            "locked_1cell_arcs": runtime.server.swarm_map.locked_arc_count,
-                            "novel_dream_propositions": rec.novel_dream_propositions,
-                        })
-                        .to_string()
-                    }
+                    Ok(rec) => serde_json::json!({
+                        "status": "ok",
+                        "dream_epoch": rec.dream_epoch,
+                        "elapsed_us": t_dream.elapsed().as_micros() as u64,
+                        "charts_upgraded_to_multi_rank": rec.charts_upgraded_to_multi_rank,
+                        "tangent_ranks_accreted": rec.tangent_ranks_accreted,
+                        "empty_space_bridges_minted": rec.empty_space_bridges_minted,
+                        "macro_spans_folded": rec.macro_spans_folded,
+                        "holonomy_verified": rec.holonomy_verified,
+                        "total_atoms_before": rec.total_atoms_before,
+                        "total_atoms_after": rec.total_atoms_after,
+                        "total_arcs_before": rec.total_arcs_before,
+                        "total_arcs_after": rec.total_arcs_after,
+                        "locked_1cell_arcs": runtime.server.swarm_map.locked_arc_count,
+                        "novel_dream_propositions": rec.novel_dream_propositions,
+                    })
+                    .to_string(),
                     Err(e) => serde_json::json!({
                         "status": "error",
                         "error": e,

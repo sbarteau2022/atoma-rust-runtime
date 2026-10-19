@@ -1,5 +1,17 @@
 # Master Design Specification: Monster Hybrid Server
 
+> **Status:** This document describes the target architecture and qualification gates. It is not
+> an inventory of the current implementation. The current server is a Rust orchestrator with an
+> HTTP/TCP edge and `.atoma_map` plus WAL persistence. Erlang/OTP supervision, FlatBuffers over
+> mmap, ANE prefill, predictive-automata speculative decode, and SSD-paged KV are not established
+> by the current codebase. See the README's verified/open ledger and `design/QUALIFICATION_GATES.md`
+> before treating a target tier as delivered.
+
+The tokenizer-free Phase B producer is specified separately in
+[`docs/NATIVE_NEXT_ATOM_DESIGN.md`](../docs/NATIVE_NEXT_ATOM_DESIGN.md). Its standalone
+Rust trainer/generator uses native byte carriers, fixed toroidal recurrence, and a trained
+next-byte/EOS head; its measured qualification does not promote the primary server cascade.
+
 ## 1. Objective
 To create a high-throughput, fault-tolerant, and agentic LLM runtime that leverages Apple Silicon's ANE and GPU through a decoupled orchestration and execution architecture.
 

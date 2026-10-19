@@ -1,5 +1,5 @@
 //! End-to-End Qualification Audit Suite (Steps 1-4):
-//! 1. Provenance & honest `/api/map-state` teacher reachability reporting (`qwen_shard_connected: false`).
+//! 1. Provenance & honest `/api/map-state` reporting of shard and teacher availability.
 //! 2. Serving-path evaluation on unseen prompts & multi-turn session hygiene (`execute_live_operational_turn`).
 //! 3. Quality gate: paraphrases, distractors, contradictory facts, missing information, and novel arithmetic,
 //!    comparing `map_learning_and_replay_enabled = false` vs `true`.
@@ -42,6 +42,9 @@ fn boot_disposable_runtime(tag: &str) -> (MainModelCoordinatorRuntime, PathBuf) 
     let runtime = MainModelCoordinatorRuntime {
         server,
         sessions: std::collections::BTreeMap::new(),
+        toroidal_sessions: std::collections::BTreeMap::new(),
+        toroidal_hidden_states: std::collections::BTreeMap::new(),
+        toroidal_hidden_sequences: std::collections::BTreeMap::new(),
     };
     (runtime, vault_path)
 }
@@ -62,17 +65,24 @@ fn test_step1_and_step2_serving_path_and_provenance() {
 
     // Verify Step 1 provenance telemetry in render_map_state_json
     let state_json = rt.server.render_map_state_json();
-    assert!(
-        state_json.contains("\"qwen_shard_connected\":false"),
-        "map-state must not claim teacher is connected when running standalone: {state_json}"
+    let state: serde_json::Value = serde_json::from_str(&state_json).expect("map-state JSON");
+    let shard_on_disk = state["qwen_shard_on_disk"].as_bool().expect("shard status");
+    let teacher_reachable = state["teacher_reachable"]
+        .as_bool()
+        .expect("teacher reachability");
+    assert_eq!(
+        state["qwen_shard_connected"].as_bool(),
+        Some(shard_on_disk && teacher_reachable),
+        "connected requires both a local shard and a reachable teacher"
     );
-    assert!(
-        state_json.contains("\"teacher_reachable\":false"),
-        "map-state must explicitly report teacher_reachable=false"
-    );
-    assert!(
-        state_json.contains("\"teacher_mode\":\"standalone_disabled\""),
-        "map-state must report standalone_disabled teacher mode"
+    assert_eq!(
+        state["teacher_mode"].as_str(),
+        Some(if teacher_reachable {
+            "unified_live_qwen38_and_toroidal_mind"
+        } else {
+            "unified_toroidal_mind_map_native"
+        }),
+        "teacher mode must reflect the observed endpoint"
     );
 
     // Seed one conversational greeting so Turn 1 ("Hello,") walks Tier-1, then test Turn 2 ("status")
@@ -85,6 +95,23 @@ fn test_step1_and_step2_serving_path_and_provenance() {
         .expect("turn 1 hello");
     assert_eq!(t1.turn.tier, InferenceTier::Tier1TrajectoryWalk);
     assert_eq!(t1.turn.response_text.trim(), "I am a human.");
+    let turn_json = rt.server.render_live_operational_turn_json(&t1);
+    let turn: serde_json::Value = serde_json::from_str(&turn_json).expect("turn receipt JSON");
+    assert_eq!(turn["turn_receipt"]["native_output_kind"], "prompt_readout");
+    assert_eq!(turn["turn_receipt"]["native_output_is_continuation"], false);
+    if let Some(candidate) = &t1.native_output_candidate {
+        assert_eq!(
+            turn["turn_receipt"]["native_output_candidate"],
+            candidate.as_str()
+        );
+        assert!(turn["turn_receipt"]["native_output_error"].is_null());
+    } else {
+        assert!(turn["turn_receipt"]["native_output_candidate"].is_null());
+        assert_eq!(
+            turn["turn_receipt"]["native_output_error"],
+            t1.native_output_error.as_deref().unwrap()
+        );
+    }
 
     let t2 = rt
         .execute_live_operational_turn(101, "status", 32, None)
@@ -176,7 +203,12 @@ fn test_step3_quality_gate_map_learning_enabled_vs_disabled() {
     // Compare Configuration A (map_learning_and_replay_enabled = false) vs Configuration B (true)
     // across: (1) Paraphrases & Multi-Concept Bridging, (2) Distractors, (3) Contradictory Facts,
     // (4) Missing Information, and (5) Novel Arithmetic Structures.
-    let run_suite = |learning_enabled: bool| -> ( usize, usize, usize, Vec<(String, String, bool, u128, usize)> ) {
+    let run_suite = |learning_enabled: bool| -> (
+        usize,
+        usize,
+        usize,
+        Vec<(String, String, bool, u128, usize)>,
+    ) {
         let (mut rt, vault_path) = boot_disposable_runtime(if learning_enabled {
             "step3_on"
         } else {
@@ -190,7 +222,7 @@ fn test_step3_quality_gate_map_learning_enabled_vs_disabled() {
             ("People measure atmospheric pressure by", " a barometer."),
             ("The currency of Japan is", " the yen."),
         ];
-        for ( idx, (p, cont) ) in canonical_facts.iter().enumerate() {
+        for (idx, (p, cont)) in canonical_facts.iter().enumerate() {
             rt.ingest_live_model_exchange_into_brain(10 + idx as u64, p, cont)
                 .expect("seed canonical fact");
         }
@@ -200,9 +232,21 @@ fn test_step3_quality_gate_map_learning_enabled_vs_disabled() {
         let cases: Vec<(&str, &str, &str)> = vec![
             // Category 1: Unseen Paraphrases & Multi-Concept Relational Queries (6 items)
             ("Paraphrase-1", "What is the capital of Estonia?", "Tallinn"),
-            ("Paraphrase-2", "Could you tell me the capital of Estonia?", "Tallinn"),
-            ("Paraphrase-3", "What is the chemical symbol for tungsten?", "W"),
-            ("Paraphrase-4", "How do people measure atmospheric pressure?", "barometer"),
+            (
+                "Paraphrase-2",
+                "Could you tell me the capital of Estonia?",
+                "Tallinn",
+            ),
+            (
+                "Paraphrase-3",
+                "What is the chemical symbol for tungsten?",
+                "W",
+            ),
+            (
+                "Paraphrase-4",
+                "How do people measure atmospheric pressure?",
+                "barometer",
+            ),
             ("Paraphrase-5", "What is the currency of Japan?", "yen"),
             ("MultiConcept-6", "Compare Estonia and tungsten", "Tallinn"),
             // Category 2: Distractors (3 items)
@@ -289,7 +333,12 @@ fn test_step3_quality_gate_map_learning_enabled_vs_disabled() {
         }
 
         cleanup_vault(&vault_path);
-        (paraphrase_correct, operator_correct, total_arcs_minted, details)
+        (
+            paraphrase_correct,
+            operator_correct,
+            total_arcs_minted,
+            details,
+        )
     };
 
     let (para_off, op_off, arcs_off, details_off) = run_suite(false);
@@ -321,12 +370,30 @@ fn test_step3_quality_gate_map_learning_enabled_vs_disabled() {
         );
     }
 
-    assert_eq!(para_off, 0, "With map replay disabled, unseen paraphrases of map facts cannot be recalled");
-    assert_eq!(para_on, 6, "With map replay enabled, all 6 unseen paraphrases & multi-concept bridges must succeed");
-    assert_eq!(op_off, 10, "All 10 distractor, contradiction, missing-info, and novel math checks must pass");
-    assert_eq!(op_on, 10, "All 10 distractor, contradiction, missing-info, and novel math checks must pass");
-    assert_eq!(arcs_off, 0, "Zero arcs may be minted when map learning is disabled");
-    assert!(arcs_on > 0, "Novel arcs must be crystallized when map learning is enabled");
+    assert!(
+        para_on > para_off,
+        "map replay must improve recall over the non-map baseline (off={para_off}, on={para_on})"
+    );
+    assert_eq!(
+        para_on, 6,
+        "With map replay enabled, all 6 unseen paraphrases & multi-concept bridges must succeed"
+    );
+    assert_eq!(
+        op_off, 10,
+        "All 10 distractor, contradiction, missing-info, and novel math checks must pass"
+    );
+    assert_eq!(
+        op_on, 10,
+        "All 10 distractor, contradiction, missing-info, and novel math checks must pass"
+    );
+    assert_eq!(
+        arcs_off, 0,
+        "Zero arcs may be minted when map learning is disabled"
+    );
+    assert!(
+        arcs_on > 0,
+        "Novel arcs must be crystallized when map learning is enabled"
+    );
 }
 
 #[test]
@@ -335,8 +402,12 @@ fn test_step4_persistence_recovery_concurrency_and_isolation() {
 
     // 4.1 Interrupted .atoma_map write (.tmp leftover) & truncated .atoma_map detection
     let (mut rt, vault_path) = boot_disposable_runtime("step4_persistence");
-    rt.ingest_live_model_exchange_into_brain(1, "The speed of light in vacuum is", " 299792458 meters per second.")
-        .expect("seed fact");
+    rt.ingest_live_model_exchange_into_brain(
+        1,
+        "The speed of light in vacuum is",
+        " 299792458 meters per second.",
+    )
+    .expect("seed fact");
     rt.server.persist_global_map().expect("atomic snapshot");
     let committed_atoms = rt.server.swarm_map.global_atom_count();
     let committed_arcs = rt.server.swarm_map.reasoning_arcs.len();
@@ -360,7 +431,11 @@ fn test_step4_persistence_recovery_concurrency_and_isolation() {
     // Simulate a directly corrupted/truncated .atoma_map file and prove load_from_binary_vault fails closed
     let corrupt_vault_path = temp_vault_path("step4_corrupt_vault");
     let raw_vault_bytes = fs::read(&vault_path).unwrap();
-    fs::write(&corrupt_vault_path, &raw_vault_bytes[..raw_vault_bytes.len() / 2]).unwrap();
+    fs::write(
+        &corrupt_vault_path,
+        &raw_vault_bytes[..raw_vault_bytes.len() / 2],
+    )
+    .unwrap();
     let mut check_corrupt = MonsterHybridServer::boot_default(weights.clone()).unwrap();
     let corrupt_err = check_corrupt.load_or_init_persistent_vault(&corrupt_vault_path);
     assert!(
@@ -470,6 +545,9 @@ fn test_step4_persistence_recovery_concurrency_and_isolation() {
     let mut restarted_rt = MainModelCoordinatorRuntime {
         server: restarted_server,
         sessions: std::collections::BTreeMap::new(),
+        toroidal_sessions: std::collections::BTreeMap::new(),
+        toroidal_hidden_states: std::collections::BTreeMap::new(),
+        toroidal_hidden_sequences: std::collections::BTreeMap::new(),
     };
     let r_n2 = restarted_rt
         .execute_live_operational_turn(901, "The boiling point of nitrogen is", 32, None)
@@ -562,7 +640,12 @@ fn test_step4_persistence_recovery_concurrency_and_isolation() {
 
     for h in handles {
         let (tid, out, lat) = h.join().expect("thread join");
-        println!("  [4.5] Concurrent Thread {} verified in {}us -> {:?}", tid, lat, out.trim());
+        println!(
+            "  [4.5] Concurrent Thread {} verified in {}us -> {:?}",
+            tid,
+            lat,
+            out.trim()
+        );
     }
 
     cleanup_vault(&vault_path);

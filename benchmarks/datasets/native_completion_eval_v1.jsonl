@@ -1,0 +1,24 @@
+{"prompt":"2 + 2 = ","completion":"4"}
+{"prompt":"7 * 8 = ","completion":"56"}
+{"prompt":"23 - 9 = ","completion":"14"}
+{"prompt":"A, B, C, ","completion":"D"}
+{"prompt":"1, 2, 3, ","completion":"4"}
+{"prompt":"2, 4, 8, ","completion":"16"}
+{"prompt":"The capital of France is ","completion":"Paris"}
+{"prompt":"The chemical formula for water is ","completion":"H2O"}
+{"prompt":"The day after Monday is ","completion":"Tuesday"}
+{"prompt":"The opposite of hot is ","completion":"cold"}
+{"prompt":"The plural of cat is ","completion":"cats"}
+{"prompt":"The past tense of walk is ","completion":"walked"}
+{"prompt":"def add(a, b):\n    return ","completion":"a + b"}
+{"prompt":"fn main() { println!(\"hi\"); ","completion":"}"}
+{"prompt":"{\"ok\": true","completion":"}"}
+{"prompt":"The decimal value of 0x10 is ","completion":"16"}
+{"prompt":"Reply with exactly ZEBRA: ","completion":"ZEBRA"}
+{"prompt":"Lowercase BLUE: ","completion":"blue"}
+{"prompt":"Reverse abc: ","completion":"cba"}
+{"prompt":"What is the secret code? No code was provided. Answer UNKNOWN: ","completion":"UNKNOWN"}
+{"prompt":"Translate cat into Spanish: ","completion":"gato"}
+{"prompt":"Repeat 猫: ","completion":"猫"}
+{"prompt":"Repeat 🐉: ","completion":"🐉"}
+{"prompt":"Repeat café: ","completion":"café"}

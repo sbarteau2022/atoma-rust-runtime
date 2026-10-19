@@ -12,6 +12,19 @@ Consumes `TeacherTapRecord`s (frozen layer states + next-op probabilities), `Fro
 
 `core_lm` (`../../core_lm`) and Rust `std` (`[verified]`).
 
+## Native byte egress
+
+`BoundaryLexicalTransducer::transduce_utf8_to_mlir` converts raw UTF-8 bytes without loading
+a tokenizer lexicon. `transduce_mlir_to_utf8` uses `AtomicIrAlphabet::expand_checked`, which
+rejects unregistered IDs, then rejects non-byte carriers and invalid UTF-8. Unknown IDs no
+longer disappear into an apparently successful output. Legacy `expand` call sites retain
+their existing behavior. Canonical span labels are structural fixtures, not semantic knowledge.
+
+Qualification: `cargo test --manifest-path immune_system/implementation/Cargo.toml --lib`,
+including native round trips, macro-span/control-byte preservation, and rejection of unknown,
+non-byte, and malformed UTF-8 streams. The end-to-end native evaluation is documented in
+[`docs/NATIVE_TOROIDAL_QUALIFICATION.md`](../../docs/NATIVE_TOROIDAL_QUALIFICATION.md).
+
 ## Qualification
 
 Run `cargo test --manifest-path Cargo.toml` from this directory, or run the full chain qualification in [../../orchestrator/tests/full_chain_qualification.rs](../../orchestrator/tests/full_chain_qualification.rs) (`[verified]`).

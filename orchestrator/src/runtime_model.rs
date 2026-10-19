@@ -94,6 +94,10 @@ pub struct LiveOperationalTurnReceipt {
     pub novel_arcs_minted: usize,
     pub wal_bytes_appended: usize,
     pub latency_us: u128,
+    /// Experimental prompt-position readout, if UTF-8. This is not a continuation.
+    pub native_output_candidate: Option<String>,
+    /// Readout or UTF-8 error from the native output head; primary response remains separate.
+    pub native_output_error: Option<String>,
 }
 
 /// Measured inputs to the preregistered 24-family kill gate.
@@ -118,9 +122,23 @@ pub struct KillCriteriaBenchmarkReport {
 pub struct MainModelCoordinatorRuntime {
     pub server: MonsterHybridServer,
     pub sessions: BTreeMap<u64, SessionHandle>,
+    /// Session-isolated toroidal state driven by native byte-carrier embeddings.
+    pub toroidal_sessions: BTreeMap<u64, crate::toroidal_attention::ToroidalIsotropicRuntime>,
+    /// Latest native toroidal hidden state, ready for the output-reader stage.
+    pub toroidal_hidden_states: BTreeMap<u64, Vec<f32>>,
+    /// Per-position toroidal hidden states consumed by the native byte output head.
+    pub toroidal_hidden_sequences: BTreeMap<u64, Vec<Vec<f32>>>,
 }
 
 impl MainModelCoordinatorRuntime {
+    /// Drop a caller's cursor and native recurrence together; other sessions and the map survive.
+    pub fn reset_session(&mut self, session_id: u64) {
+        self.sessions.remove(&session_id);
+        self.toroidal_sessions.remove(&session_id);
+        self.toroidal_hidden_states.remove(&session_id);
+        self.toroidal_hidden_sequences.remove(&session_id);
+    }
+
     /// Fuse the supplied vaults into one central map. The trajectory vault is loaded first so it
     /// becomes the persistence target; static and operator vaults are deduplicating merges.
     pub fn load_unified_mind(
@@ -156,7 +174,56 @@ impl MainModelCoordinatorRuntime {
         Ok(Self {
             server,
             sessions: BTreeMap::new(),
+            toroidal_sessions: BTreeMap::new(),
+            toroidal_hidden_states: BTreeMap::new(),
+            toroidal_hidden_sequences: BTreeMap::new(),
         })
+    }
+
+    /// Direct native input path: UTF-8 bytes → ML-IR carriers → H³×T² coordinates →
+    /// recurrent toroidal attention across every configured layer, with state isolated by session.
+    pub fn step_native_toroidal_prompt(
+        &mut self,
+        session_id: u64,
+        prompt: &str,
+    ) -> Result<&[f32], String> {
+        let embeddings = crate::input_embeddings::embed_utf8_text(
+            &self.server.active_transformer.transducer,
+            prompt,
+            false,
+        )?;
+        let layer_count = self.server.swarm_map.base_weights.num_layers.max(52);
+        if !self.toroidal_sessions.contains_key(&session_id) {
+            let runtime = crate::toroidal_attention::ToroidalIsotropicRuntime::full_stack(
+                crate::input_embeddings::NATIVE_MLIR_EMBEDDING_DIM,
+                layer_count,
+            )?;
+            self.toroidal_sessions.insert(session_id, runtime);
+        }
+        let runtime = self.toroidal_sessions.get_mut(&session_id).unwrap();
+        let hidden_sequence = runtime.step_native_text_sequence(&embeddings)?;
+        let hidden = hidden_sequence
+            .last()
+            .cloned()
+            .ok_or_else(|| "native toroidal stack produced no hidden states".to_string())?;
+        self.toroidal_hidden_sequences
+            .insert(session_id, hidden_sequence);
+        self.toroidal_hidden_states.insert(session_id, hidden);
+        Ok(self.toroidal_hidden_states.get(&session_id).unwrap())
+    }
+
+    /// Read the latest prompt positions to UTF-8 through byte carriers; this does not generate
+    /// a continuation or apply a learned next-carrier transition.
+    pub fn read_native_toroidal_output(&self, session_id: u64) -> Result<String, String> {
+        let hidden = self
+            .toroidal_hidden_sequences
+            .get(&session_id)
+            .ok_or_else(|| format!("session {session_id} has no native toroidal sequence"))?;
+        let ops = crate::native_output::readout_byte_carriers(&self.server.mlir_catalog, hidden)?;
+        self.server
+            .active_transformer
+            .transducer
+            .transduce_mlir_to_utf8(&ops)
     }
 
     /// Convert UTF-8 input to reversible MLIR carrier IDs using the configured boundary table.
@@ -332,8 +399,11 @@ impl MainModelCoordinatorRuntime {
             match self
                 .server
                 .active_transformer
-                .decode_span_accelerated_incremental(&self.server.swarm_map, &check_prefix, max_new.max(768))
-            {
+                .decode_span_accelerated_incremental(
+                    &self.server.swarm_map,
+                    &check_prefix,
+                    max_new.max(768),
+                ) {
                 Ok((emitted_ops, expanded_tokens, decoded_output_text))
                     if !emitted_ops.is_empty()
                         && atoma_immune::BoundaryLexicalTransducer::is_coherent_egress_text(
@@ -433,16 +503,19 @@ impl MainModelCoordinatorRuntime {
                             pruned_dead_ends: Vec::new(),
                             superposition_holds: 1,
                         };
-                        if let Ok(wb) = GeodesicActiveTransformer::append_wal_frame(
+                        wal_bytes = GeodesicActiveTransformer::append_wal_frame(
                             &wal_path,
                             &trace,
                             self.server.active_transformer.origin_fingerprint,
-                        ) {
-                            wal_bytes = wb;
-                        }
-                        if let Ok(meta) = std::fs::metadata(&wal_path) {
-                            self.server.wal_replayed_offset = meta.len();
-                        }
+                        )
+                        .map_err(|e| {
+                            format!("append qualified teacher WAL {}: {e}", wal_path.display())
+                        })?;
+                        self.server.wal_replayed_offset = std::fs::metadata(&wal_path)
+                            .map_err(|e| {
+                                format!("stat qualified teacher WAL {}: {e}", wal_path.display())
+                            })?
+                            .len();
                     }
 
                     if teacher_crystallized > 0 {
@@ -527,7 +600,8 @@ impl MainModelCoordinatorRuntime {
         use std::io::{Read, Write};
         let addr: std::net::SocketAddr = "127.0.0.1:8001".parse().ok()?;
         let mut stream =
-            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250)).ok()?;
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250))
+                .ok()?;
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(90)));
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(15)));
 
@@ -704,9 +778,11 @@ impl MainModelCoordinatorRuntime {
 
         if server.map_learning_and_replay_enabled {
             // 1. Check exact or prefix-resolved geodesic trajectory chain in the unified map
-            let resolved = server
-                .active_transformer
-                .resolve_geodesic_prompt_prefix(&server.swarm_map, latest_turn, None);
+            let resolved = server.active_transformer.resolve_geodesic_prompt_prefix(
+                &server.swarm_map,
+                latest_turn,
+                None,
+            );
             if server
                 .active_transformer
                 .has_exact_trajectory_chain(&server.swarm_map, &resolved)
@@ -778,11 +854,12 @@ impl MainModelCoordinatorRuntime {
             latest_turn.as_bytes(),
         );
 
-        let mut iso_rt = crate::toroidal_attention::ToroidalIsotropicRuntime::new(
-            256,
-            vec![0, 12, 24, 36, 48],
-            60,
-        );
+        let declared_layers = server.swarm_map.base_weights.num_layers.max(52);
+        let Ok(mut iso_rt) =
+            crate::toroidal_attention::ToroidalIsotropicRuntime::full_stack(256, declared_layers)
+        else {
+            return Vec::new();
+        };
         let mut x_curr = base_sketch;
         let mut voted_ops: Vec<MlirOpId> = Vec::new();
 
@@ -798,7 +875,9 @@ impl MainModelCoordinatorRuntime {
                 let ts = phase.theta_s.to_f64() as f32;
                 let radial_amp = (1.0 + 0.04 * (pos_i as f32 + 1.0)) as f32;
                 for d in 0..x_curr.len() {
-                    let coord_mod = (lx[d % 4] * 0.05 + ((d & 1) as f32 * tf + ((1 - (d & 1)) as f32) * ts) * 0.02) * radial_amp;
+                    let coord_mod = (lx[d % 4] * 0.05
+                        + ((d & 1) as f32 * tf + ((1 - (d & 1)) as f32) * ts) * 0.02)
+                        * radial_amp;
                     x_curr[d] = x_curr[d] + coord_mod;
                 }
             }
@@ -823,8 +902,9 @@ impl MainModelCoordinatorRuntime {
                             voted_ops.push(next_op);
                         }
                     } else if server.map_learning_and_replay_enabled
-                        && let Some(arc) =
-                            profile.lit_arcs.get(step_idx % profile.lit_arcs.len().max(1))
+                        && let Some(arc) = profile
+                            .lit_arcs
+                            .get(step_idx % profile.lit_arcs.len().max(1))
                     {
                         if arc.op_id >= 64 {
                             let next_op = MlirOpId(arc.op_id);
@@ -963,16 +1043,15 @@ impl MainModelCoordinatorRuntime {
                     pruned_dead_ends: Vec::new(),
                     superposition_holds: 1,
                 };
-                if let Ok(wb) = GeodesicActiveTransformer::append_wal_frame(
+                wal_bytes = GeodesicActiveTransformer::append_wal_frame(
                     &wal_path,
                     &trace,
                     self.server.active_transformer.origin_fingerprint,
-                ) {
-                    wal_bytes = wb;
-                }
-                if let Ok(meta) = std::fs::metadata(&wal_path) {
-                    self.server.wal_replayed_offset = meta.len();
-                }
+                )
+                .map_err(|e| format!("append live exchange WAL {}: {e}", wal_path.display()))?;
+                self.server.wal_replayed_offset = std::fs::metadata(&wal_path)
+                    .map_err(|e| format!("stat live exchange WAL {}: {e}", wal_path.display()))?
+                    .len();
             }
         }
 
@@ -988,7 +1067,7 @@ impl MainModelCoordinatorRuntime {
         if atoms_after > atoms_before || arcs_after > arcs_before || teacher_crystallized > 0 {
             self.server.mark_map_updated();
         }
-        let _ = self.server.persist_global_map_live_turn();
+        self.server.persist_global_map_live_turn()?;
 
         let turn_index = self.sessions.get(&session_id).map_or(1, |s| s.turn_index);
         let dummy_receipt = AgenticTaskCompletionReceipt {
@@ -1037,6 +1116,8 @@ impl MainModelCoordinatorRuntime {
             novel_arcs_minted: arcs_after.saturating_sub(arcs_before),
             wal_bytes_appended: wal_bytes,
             latency_us: t0.elapsed().as_micros(),
+            native_output_candidate: None,
+            native_output_error: None,
         })
     }
 
@@ -1054,6 +1135,7 @@ impl MainModelCoordinatorRuntime {
         manual_basins: Option<&[RoleId]>,
     ) -> Result<LiveOperationalTurnReceipt, String> {
         let t0 = std::time::Instant::now();
+        self.step_native_toroidal_prompt(session_id, prompt)?;
         let atoms_before = self.server.swarm_map.global_atom_count();
         let arcs_before = self.server.swarm_map.reasoning_arcs.len();
 
@@ -1167,6 +1249,11 @@ impl MainModelCoordinatorRuntime {
         }
 
         let turn_index = self.sessions.get(&session_id).map_or(1, |s| s.turn_index);
+        let (native_output_candidate, native_output_error) =
+            match self.read_native_toroidal_output(session_id) {
+                Ok(text) => (Some(text), None),
+                Err(error) => (None, Some(error)),
+            };
 
         Ok(LiveOperationalTurnReceipt {
             session_id,
@@ -1182,6 +1269,8 @@ impl MainModelCoordinatorRuntime {
             novel_arcs_minted: arcs_after.saturating_sub(arcs_before),
             wal_bytes_appended,
             latency_us: t0.elapsed().as_micros(),
+            native_output_candidate,
+            native_output_error,
         })
     }
 
@@ -1568,6 +1657,9 @@ mod tests {
         let mut runtime = MainModelCoordinatorRuntime {
             server,
             sessions: BTreeMap::new(),
+            toroidal_sessions: BTreeMap::new(),
+            toroidal_hidden_states: BTreeMap::new(),
+            toroidal_hidden_sequences: BTreeMap::new(),
         };
         let path = std::env::temp_dir().join(format!(
             "runtime-subagent-map-{}-{}.atoma_map",
@@ -1613,12 +1705,73 @@ mod tests {
     }
 
     #[test]
+    fn native_toroidal_input_is_byte_based_and_session_isolated() {
+        let weights = FrozenBaseWeights::freeze("native-toroidal-input-test", 52, vec![0.0; 8]);
+        let server = MonsterHybridServer::boot_default(weights).unwrap();
+        let mut runtime = MainModelCoordinatorRuntime {
+            server,
+            sessions: BTreeMap::new(),
+            toroidal_sessions: BTreeMap::new(),
+            toroidal_hidden_states: BTreeMap::new(),
+            toroidal_hidden_sequences: BTreeMap::new(),
+        };
+
+        let first = runtime
+            .step_native_toroidal_prompt(1, "A🐉")
+            .unwrap()
+            .to_vec();
+        assert_eq!(
+            first.len(),
+            crate::input_embeddings::NATIVE_MLIR_EMBEDDING_DIM
+        );
+        assert!(first.iter().all(|value| value.is_finite()));
+        assert!(
+            runtime.toroidal_sessions[&1]
+                .layer_fields
+                .iter()
+                .all(|field| field.tokens_ingested == "A🐉".len())
+        );
+
+        runtime.step_native_toroidal_prompt(2, "B").unwrap();
+        assert!(
+            runtime.toroidal_sessions[&2]
+                .layer_fields
+                .iter()
+                .all(|field| field.tokens_ingested == 1)
+        );
+        assert!(
+            runtime.toroidal_sessions[&1]
+                .layer_fields
+                .iter()
+                .all(|field| field.tokens_ingested == "A🐉".len())
+        );
+        assert_eq!(runtime.toroidal_hidden_sequences[&1].len(), "A🐉".len());
+        assert_eq!(runtime.read_native_toroidal_output(2).unwrap(), "B");
+        runtime.sessions.insert(1, SessionHandle::new(1));
+        runtime.reset_session(1);
+        assert!(!runtime.sessions.contains_key(&1));
+        assert!(!runtime.toroidal_sessions.contains_key(&1));
+        assert!(!runtime.toroidal_hidden_states.contains_key(&1));
+        assert!(!runtime.toroidal_hidden_sequences.contains_key(&1));
+        assert_eq!(
+            runtime.toroidal_sessions[&2].layer_fields[0].tokens_ingested,
+            1
+        );
+        assert_eq!(runtime.read_native_toroidal_output(2).unwrap(), "B");
+        runtime.step_native_toroidal_prompt(1, "Z").unwrap();
+        assert_eq!(runtime.read_native_toroidal_output(1).unwrap(), "Z");
+    }
+
+    #[test]
     fn runtime_learns_novel_prompt_in_tier3_then_hits_tier1_on_repeat() {
         let weights = FrozenBaseWeights::freeze("runtime-realtime-learn-test", 52, vec![0.5; 32]);
         let server = MonsterHybridServer::boot_default(weights).unwrap();
         let mut runtime = MainModelCoordinatorRuntime {
             server,
             sessions: BTreeMap::new(),
+            toroidal_sessions: BTreeMap::new(),
+            toroidal_hidden_states: BTreeMap::new(),
+            toroidal_hidden_sequences: BTreeMap::new(),
         };
         let path = std::env::temp_dir().join(format!(
             "runtime-learn-map-{}-{}.atoma_map",
@@ -1651,12 +1804,50 @@ mod tests {
     }
 
     #[test]
+    fn live_exchange_returns_error_when_wal_cannot_be_written() {
+        let weights = FrozenBaseWeights::freeze("runtime-wal-failure-test", 52, vec![0.5; 32]);
+        let server = MonsterHybridServer::boot_default(weights).unwrap();
+        let mut runtime = MainModelCoordinatorRuntime {
+            server,
+            sessions: BTreeMap::new(),
+            toroidal_sessions: BTreeMap::new(),
+            toroidal_hidden_states: BTreeMap::new(),
+            toroidal_hidden_sequences: BTreeMap::new(),
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "runtime-wal-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mind.atoma_map");
+        runtime.server.load_or_init_persistent_vault(&path).unwrap();
+        let wal_path = std::path::PathBuf::from(format!("{}.wal", path.display()));
+        std::fs::create_dir(&wal_path).unwrap();
+
+        let result = runtime.ingest_live_model_exchange_into_brain(
+            303,
+            "Explain a quantum holonomy invariant",
+            "A holonomy invariant is preserved by transport around a closed loop.",
+        );
+        assert!(result.is_err(), "missing WAL directory must fail ingestion");
+        assert!(result.unwrap_err().contains("WAL"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn mind_autonomously_bridges_novel_multi_concept_trajectory_in_tier2_then_hits_tier1() {
         let weights = FrozenBaseWeights::freeze("runtime-tier2-bridge-test", 52, vec![0.5; 32]);
         let server = MonsterHybridServer::boot_default(weights).unwrap();
         let mut runtime = MainModelCoordinatorRuntime {
             server,
             sessions: BTreeMap::new(),
+            toroidal_sessions: BTreeMap::new(),
+            toroidal_hidden_states: BTreeMap::new(),
+            toroidal_hidden_sequences: BTreeMap::new(),
         };
         let path = std::env::temp_dir().join(format!(
             "runtime-tier2-bridge-{}-{}.atoma_map",

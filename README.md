@@ -25,17 +25,17 @@ All components in this repository use standard machine learning and numerical li
 
 ## Status & Proven-vs-Open Ledger
 
-- **Verified (`atoma_immune` — 51 / 51 library tests passing):**
+- **Verified (`atoma_immune` — 56 / 56 library tests passing):**
   - `Q32.31` fixed-point arithmetic, CORDIC trigonometry, Lorentz hyperboloid boosts, and Poincaré ball $\leftrightarrow$ hyperboloid isometry (`4.4e-9` agreement across 900 pairs).
   - `Atlas13` 12-cluster topology, $\mathrm{SO}(3)$ Wigner frame parallel transport, and discrete loop consistency verification.
   - `ATOMA_OP_V3` Rank-8 Two-Pass Modified Gram-Schmidt subspace accretion and 7-ray tangent perturbation sweeps (`immune_system/implementation/src/map_native.rs`).
   - `GeodesicActiveTransformer` (`immune_system/implementation/src/continuous_active_mind.rs`): reversible `BoundaryLexicalTransducer` (`ATOMA_LX`), $O(1)$ `GeodesicCursor`, strict `chain_id` trajectory verification, egress coherence filtering (`is_coherent_egress_text`), immutable base trajectory locking (`locked_arc_count`), atomic `.atoma_map` snapshots, and crash-safe `.atoma_map.wal` recovery.
-- **Verified (`atoma_orchestrator` — 14 / 14 library tests + 3 / 3 end-to-end qualification audit tests passing):**
+- **Verified (`atoma_orchestrator` — 35 / 35 library, 13 / 13 full-chain, 4 / 4 map-toroidal, 3 / 3 native-predictor integration, and 3 / 3 qualification-audit tests passing):**
   - Loopback/TLS HTTP edge (`orchestrator/src/http_api.rs`), `ToroidalHarmonicFieldState` + `ToroidalIsotropicRuntime` (`orchestrator/src/toroidal_attention.rs`), and `MainModelCoordinatorRuntime` (`orchestrator/src/runtime_model.rs`).
   - End-to-end serving-path qualification (`orchestrator/tests/qualification_audit.rs`):
-    1. Honest `/api/map-state` provenance (`qwen_shard_connected: false`, `teacher_reachable: false`, `teacher_mode: "standalone_disabled"`).
+    1. `/api/map-state` reports shard availability separately from a reachable teacher endpoint; `qwen_shard_connected` is true only when both are present.
     2. Multi-turn session hygiene (`Turn 1 -> Turn 2 -> Turn 3` without cross-turn prefix pollution) and full-length Tier-1 trajectory replay (`Tier1TrajectoryWalk`).
-    3. Map learning/replay ablation (`set_map_learning_and_replay(false)` vs `true`): proves `0/6 -> 6/6` recall gain on unseen paraphrases and multi-concept bridges when map replay is enabled, alongside `10/10` pass rate on narrative/numeric distractors, contradictory premises (`#### CONTRADICTION`), and unanswerable premises (`#### UNANSWERABLE`).
+    3. Map learning/replay ablation (`set_map_learning_and_replay(false)` vs `true`): verifies map replay improves recall and reaches `6/6` unseen paraphrase and multi-concept bridge cases, alongside `10/10` pass rate on narrative/numeric distractors, contradictory premises (`#### CONTRADICTION`), and unanswerable premises (`#### UNANSWERABLE`). The replay-disabled baseline may answer some items through non-map paths.
     4. Disposable-vault persistence & isolation: atomic survival across interrupted `.tmp` writes, fail-closed SHA-256 rejection of truncated vaults, automatic repair/truncation of torn `.atoma_map.wal` tails across restarts, 8-thread concurrent turn execution, and cross-session coreference isolation.
 
 ---
@@ -53,11 +53,75 @@ All components in this repository use standard machine learning and numerical li
 
 ## Quickstart & Verification Commands
 
+Live upstream exchanges are recorded in the configured `.atoma_map.wal` and snapshot before the
+runtime returns a successful ingestion receipt. WAL and snapshot I/O failures are returned as
+errors; the HTTP proxy logs an ingestion failure because it may already have streamed the upstream
+response to the client. A successful upstream answer therefore does not imply that map learning
+was persisted; check the server log for `[live exchange persistence failed]`.
+
+WAL replay failures now stop task and subagent execution before it proceeds with potentially stale
+map state. Active-inference bridge updates also surface snapshot failures instead of reporting a
+successful step. The `design/DESIGN.md` Erlang/OTP, FlatBuffers, ANE, and SSD-paged KV items remain
+target architecture requirements; they are not claims about the current Rust/HTTP implementation.
+
+Typed central-map K/V ingestion compensates for refraction's amplitude phase offset so the stored
+atom phase matches the encoded key phase. The toroidal attention qualification tests cover this
+phase invariant alongside causal, role, layer, head, and sequence filtering.
+
+`ToroidalIsotropicRuntime::full_stack` now allocates an independent recurrent toroidal state for
+every declared layer (at least 52) and the server uses that dense layer coverage. This is a layer
+coverage change, not by itself a qualified standalone language-model forward pass. The legacy
+map decoder still has a Qwen-named sketch path and captured map layer effectors; do not interpret
+full-stack allocation as proof of teacher-free language quality.
+
+The native boundary exposes `transduce_utf8_to_mlir` / `transduce_mlir_to_utf8`: direct UTF-8 byte
+carriers folded through Atomic IR, with no BPE/model tokenizer. `input_embeddings.rs` maps each
+carrier through `NativeReader` into six H³×T² coordinates (four Lorentz coordinates plus two
+toroidal phases). `execute_live_operational_turn` feeds that byte sequence through a per-session
+full-depth toroidal recurrence and retains its final and per-position states for diagnostic readout. This is a
+native geometric representation, not a learned semantic embedding. The output head now reads each
+torus hidden state to its nearest canonical byte-carrier address and passes those IDs through the
+strict UTF-8 reader, with periodic T² phase distance. Unknown atom IDs are rejected rather than dropped.
+`/api/turn` exposes `native_output_candidate` or `native_output_error` and labels the operation
+`native_output_kind: "prompt_readout"`, `native_output_is_continuation: false`. It remains an
+untrained diagnostic and does not replace the primary response. The legacy vault has only 219
+distinct checkpoint-token layer-0 sketches; they are not substituted for native byte embeddings.
+The teacher-off response-quality gate remains open, so the primary returned text still uses the
+legacy map/teacher paths.
+
+The historical untrained [native qualification report](benchmarks/NATIVE_TOROIDAL_REPORT.md) measures
+**0/24 completion references matched** with no teacher, checkpoint, vault, or tokenizer lexicon
+loaded. That diagnostic readout has no trained next-carrier prediction or EOS. Regression tests establish
+component behavior, not language quality. The 52-field standalone path now distributes its
+residual mix over the stack to prevent first-carrier collapse; this preserves more incoming
+information but does not create a language model. `/reset` clears all native session caches.
+Recurrent fields have fixed size; the per-position diagnostic capture uses O(prompt length)
+storage per session. The [qualification contract](docs/NATIVE_TOROIDAL_QUALIFICATION.md) records
+the boundaries and reproducer.
+
+The separate [`native_toroidal` producer](orchestrator/src/bin/native_toroidal.rs) now trains,
+saves, loads, evaluates, and generates with a learned **next-byte/EOS** head over the native
+toroidal state. It uses direct UTF-8 → ML-IR conversion, 52 fixed recurrent fields, and a
+76,329-parameter readout. Targets are shifted, prompt loss is masked, and EOS is learned.
+Predicted bytes feed back through the same fields; EOS or an explicit byte budget stops
+generation. Corrupt/incompatible artifacts, overlapping training/evaluation documents, and
+invalid UTF-8 are reported explicitly. No teacher, checkpoint, vault, tokenizer lexicon,
+response template, grammar mask, or repetition correction participates in this path.
+Only the head is trained. Its [design](docs/NATIVE_NEXT_ATOM_DESIGN.md) and
+[measured report](benchmarks/NATIVE_NEXT_ATOM_REPORT.md) distinguish training/generation
+mechanics from language quality. The trained head still matches **0/24** completion references;
+reliable natural-text EOS stopping remains open. The primary HTTP/server response still uses
+the legacy cascade; the native producer is available through its standalone CLI and Rust API.
+
+The native `core_lm` crate uses Metal 0.33. Its transitive `block` 0.1.6 dependency is locally
+patched to use an inhabited opaque C-layout type and explicit C ABIs, removing its future
+incompatibility and ABI warnings without changing the block layout.
+
 ```sh
-# 1. Run all 51 library tests in atoma_immune
+# 1. Run all 56 library tests in atoma_immune
 cargo test --manifest-path immune_system/implementation/Cargo.toml --lib
 
-# 2. Run all 14 library tests in atoma_orchestrator
+# 2. Run all 35 library tests in atoma_orchestrator
 cargo test --manifest-path orchestrator/Cargo.toml --lib
 
 # 3. Run the 3 end-to-end qualification audit suites

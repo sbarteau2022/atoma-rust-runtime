@@ -31,28 +31,6 @@ fn top_k_indices(logits: &[f32], k: usize) -> Vec<usize> {
     pairs.into_iter().take(k).map(|(i, _)| i).collect()
 }
 
-fn perturb_hidden_state(x: &[f32], rel_noise: f32, seed: u64) -> Vec<f32> {
-    let orig_norm = x
-        .iter()
-        .map(|&v| (v as f64) * (v as f64))
-        .sum::<f64>()
-        .sqrt()
-        .max(1e-12) as f32;
-    let rms = (orig_norm / (x.len() as f32).sqrt()).max(1e-6);
-    let mut out = Vec::with_capacity(x.len());
-    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
-    for &v in x {
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        let u = ((state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as f32) / (u32::MAX as f32)
-            * 2.0
-            - 1.0;
-        out.push(v + rel_noise * rms * u);
-    }
-    out
-}
-
 /// Propagate `x` across all 52 layers where:
 /// - Any layer in `replaced_layers` is executed purely by `MapNativeInferenceEngine::retrieve_and_synthesize_layer`
 ///   from `server.swarm_map` using the live hidden state `x` as the query (`0` layer weights executed!).

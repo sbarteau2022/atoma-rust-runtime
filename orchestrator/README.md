@@ -34,6 +34,92 @@ Build the paired checkpoint qualifier with `cargo build --release --manifest-pat
 
 An experimental offline ridge-linear map-value fit can be run with `--fit-map-adapter true` and at least two repeated `--prompt` arguments. Prompts are split 75/25 in supplied order (last prompt(s) held out); it fits query-head + direct phase-recalled value features to the baseline attention output and reports train/held-out mean relative L2. Example: `qualify_map_glimmer --model /path/to/Muse-Glimmer --vault /path/to/global_swarm_map.atoma_map --fit-map-adapter true --tokens 2 --prompt 'The capital of France is' --prompt 'Water freezes at zero degrees Celsius and boils at' --prompt 'A prime number after seven is' --prompt 'The largest ocean on Earth is'`. This is offline research only: it does not alter model serving, and a saved adapter path must not already exist. No production use is justified until held-out attention and final-logit congruence gates pass.
 
+## Native toroidal prompt readout and qualification
+
+The native path converts raw UTF-8 byte IDs into six H³×T² address coordinates and processes
+them in session-isolated recurrent fields. It uses no checkpoint tokenizer. The standalone
+stack distributes its 0.18 residual mixing budget across its depth; the map-backed layer
+substitution path retains its existing per-layer mixing behavior. Inputs are checked before
+any byte advances the recurrence. `MainModelCoordinatorRuntime::reset_session` clears both
+the legacy cursor and the native fields/hidden caches.
+
+`native_output.rs` classifies prompt-position hidden states to byte addresses using periodic
+phase distance. It is untrained and predicts neither the next byte nor EOS. The strict reader
+rejects unknown IDs, non-byte expansions, and invalid UTF-8. `/api/turn` labels these diagnostic
+fields as `native_output_kind: "prompt_readout"` and `native_output_is_continuation: false`.
+Diagnostic hidden-state capture is O(prompt bytes), even though the recurrent field size is fixed.
+
+`qualify_native_toroidal` consumes fixed completion fixtures and emits a JSON evidence report
+including raw outputs, structural controls, an untrained self-feedback probe, and hashes of
+the executable and its compile-time source. Its dependencies are the native components and
+Rust `std`/`serde_json`; it never constructs the legacy server or loads a teacher/map/model.
+Build without `glimmer`. The current independent run matched **0/24** completion references.
+See [the contract](../docs/NATIVE_TOROIDAL_QUALIFICATION.md) and
+[the measured report](../benchmarks/NATIVE_TOROIDAL_REPORT.md).
+
+```sh
+cargo run --release --no-default-features --manifest-path orchestrator/Cargo.toml \
+  --bin qualify_native_toroidal -- --stress-bytes 100000 \
+  --output benchmarks/native_toroidal_quality.json --require-quality
+```
+
+Run this command from the repository root. A recorded quality failure exits with status 2.
+
+## Learned native next-atom producer
+
+**Purpose:** Implement the Phase B next-carrier producer in
+[`NATIVE_NEXT_ATOM_DESIGN.md`](../docs/NATIVE_NEXT_ATOM_DESIGN.md) with a trained readout
+over the native toroidal recurrence. This is a separate generation path from prompt readout.
+
+**Inputs/outputs:** `native_predictor::NativeToroidalPredictor::fit` consumes explicit
+`NativeTextRecord { label, prompt, completion }` records. Whole documents have empty prompts.
+Training supervises the next UTF-8 byte and final EOS, with no prompt loss. The 257-class
+softmax reads 39 causal toroidal features plus a current-byte/BOS branch and bias (76,329
+parameters). `generate(prompt, max_new)` starts fresh 52-field state by default and returns
+byte IDs, strict text/error, stop reason, EOS ID, and timings. Every predicted byte is fed
+through the recurrence. Output is not masked, repaired, or replaced by a fallback. Field
+storage is fixed; generated output is O(byte budget), and offline feature caching is O(corpus
+positions). Only the head is trained. The phase encoder and rotation-driven radii remain live.
+
+**Dependencies:** Native byte/address geometry, `ToroidalIsotropicRuntime`, strict boundary
+egress, serde/serde_json, existing SHA-256, and Rust std. No model, teacher, network call,
+tokenizer lexicon, or map is loaded. The standalone `native_toroidal` binary rejects `glimmer`
+builds. Saved binary envelopes include JSON parameters, a SHA-256 corruption check, native
+schema/configuration, source fingerprint, corpus provenance, and training checkpoint selection.
+Loading validates bounds, shapes, finite values and compatibility. Atomic publication refuses
+to overwrite files. The primary server cascade is not promoted by creating this artifact.
+
+**Qualification:** Eleven mechanism/edge/artifact unit tests and
+[`tests/native_toroidal_predictor.rs`](tests/native_toroidal_predictor.rs) cover training,
+saved-model generation, EOS, Unicode, data isolation, corruption, and CLI failure behavior.
+Training-only checkpoint selection and regularization around the empirical byte-statistics
+prior prevent the saved checkpoint from regressing in training NLL. See the
+[measured report](../benchmarks/NATIVE_NEXT_ATOM_REPORT.md) for independent byte-statistics
+controls and actual language/termination failures. Synthetic mechanism fixtures in tests are
+not the training corpus used for that report.
+
+Run from the repository root (choose new output filenames):
+
+```sh
+cargo build --release --no-default-features --manifest-path orchestrator/Cargo.toml \
+  --bin native_toroidal
+orchestrator/target/release/native_toroidal train \
+  --train-text path/to/train.md --eval-text path/to/held-out.md \
+  --artifact new-model.atoma_next --report new-training-report.json
+orchestrator/target/release/native_toroidal generate \
+  --artifact benchmarks/native_toroidal_repo_prose_v2.atoma_next \
+  --prompt "The native runtime " --max-new 128
+```
+
+Repeat `--train-text`/`--eval-text` for multiple documents. `--train-jsonl`/`--eval-jsonl`
+accept strict `{"prompt":"...","completion":"..."}` records. Labels never enter features.
+`evaluate --artifact FILE --eval-jsonl FILE --report NEW_FILE --require-exact` writes raw
+evidence and exits 2 when exact completion plus EOS fails; I/O/configuration errors exit 1.
+Standalone evaluation rejects exact hashes of training documents; full document-containment
+checks require both corpora and run before fitting. Held-out labels score teacher-forced
+metrics but are never fed into greedy generation. A tiny technical-document corpus cannot
+establish general language quality or matched transformer replacement.
+
 ## Qualification
 
 Verified by [tests/full_chain_qualification.rs](tests/full_chain_qualification.rs) (`cargo test --manifest-path Cargo.toml`) and executable demonstration [src/bin/monster_hybrid_server.rs](src/bin/monster_hybrid_server.rs) (`[verified]`).

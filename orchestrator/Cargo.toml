@@ -15,6 +15,9 @@ rustls-pemfile = "2.2"
 [features]
 glimmer = ["dep:core_lm"]
 
+[patch.crates-io]
+block = { path = "../core_lm/vendor/block" }
+
 [[bin]]
 name = "qualify_map_glimmer"
 path = "src/bin/qualify_map_glimmer.rs"

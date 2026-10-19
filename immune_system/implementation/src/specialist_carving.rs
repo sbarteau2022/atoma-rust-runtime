@@ -16,7 +16,6 @@ use crate::compliance::OverlapPolicyMatrix;
 use crate::continuous_active_mind::GeodesicActiveTransformer;
 use crate::distill_engine::OpenWeightsDistillationEngine;
 use crate::geometry::fixed::Q32_31;
-use crate::geometry::lorentz::LorentzVector;
 use crate::mlir_native::MlirOpId;
 use crate::native_reader::NativeReader;
 use crate::refraction::{OpticalLens, Sha256Digest, TeacherTapRecord, rad_q32_to_pi_unit};
@@ -505,7 +504,7 @@ impl CarvedSwarmMap {
         probe_prompt: &str,
         sub_probes: &[&str],
         transformer: &GeodesicActiveTransformer,
-        policy: &OverlapPolicyMatrix,
+        _policy: &OverlapPolicyMatrix,
         qwen_shard_path: Option<&Path>,
         explicit_basins_override: Option<&[RoleId]>,
     ) -> CarvedSpecialistProfile {

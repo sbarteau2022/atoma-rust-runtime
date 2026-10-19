@@ -1,0 +1,58 @@
+{
+  "schema": "native-repository-prose-v1",
+  "description": "Frozen existing repository documents; whole documents, no generated QA or teacher traces.",
+  "splits": {
+    "train": [
+      {
+        "source": "design/CARVED_SWARM_SPEC.md",
+        "file": "train/01-CARVED_SWARM_SPEC.md",
+        "bytes": 6843,
+        "sha256": "9f21b921ad13823f9fe7f9341e620d14ec11cfb3c6a85e8d4b17bed8d0dac5ff"
+      },
+      {
+        "source": "design/SUPERPOWERS_SERVER_INTEGRATION_SPEC.md",
+        "file": "train/02-SUPERPOWERS_SERVER_INTEGRATION_SPEC.md",
+        "bytes": 15812,
+        "sha256": "bb7154aacf6f42a82637676291a4e1c34d8fba8294ba118e6989e94e55ab33c2"
+      },
+      {
+        "source": "design/superpositionholding.md",
+        "file": "train/03-superpositionholding.md",
+        "bytes": 10327,
+        "sha256": "33d8b535665bca6bd6f4005940adb115b7805c8868843e70a2e66a35ef61c60b"
+      },
+      {
+        "source": "docs/MAP_TOROIDAL_ATTENTION.md",
+        "file": "train/04-MAP_TOROIDAL_ATTENTION.md",
+        "bytes": 14082,
+        "sha256": "9a09b2a120b283ebfb95262e51b2a89e770a9cfde478735998442fd8ff7b8365"
+      },
+      {
+        "source": "docs/LM_HEAD_Q5_METAL.md",
+        "file": "train/05-LM_HEAD_Q5_METAL.md",
+        "bytes": 6610,
+        "sha256": "56eedbf128d88fc0265d9b1278aa18bfb2a218f8711524e03a3c4c4dfdb15c0c"
+      }
+    ],
+    "eval": [
+      {
+        "source": "design/ARCHITECTURE.md",
+        "file": "eval/01-ARCHITECTURE.md",
+        "bytes": 1587,
+        "sha256": "92013e92785472df852465af33e1e12bf133fa05aa79c3574413505eed81ea40"
+      },
+      {
+        "source": "immune_system/README.md",
+        "file": "eval/02-README.md",
+        "bytes": 1179,
+        "sha256": "3f937d7a8245fdddc0121b8ba6a23115a49882b9a00a0a36abbd0539e9a2bc14"
+      },
+      {
+        "source": "docs/SESSION_NOTES.md",
+        "file": "eval/03-SESSION_NOTES.md",
+        "bytes": 5979,
+        "sha256": "d5a9f514d1c5a44a5a72e0454ed85c93dbf41a40d332499e1a3353f19866c00b"
+      }
+    ]
+  }
+}
