@@ -14,12 +14,22 @@ pub mod glimmer_map;
 pub mod http_api;
 pub mod input_embeddings;
 pub mod live_map_ui;
+pub mod free_energy;
+pub mod outcome_ledger;
+pub mod pami;
+pub mod falsifier;
+pub mod provenance;
+pub mod manifold;
+pub mod math_eval;
 pub mod native_output;
 pub mod native_predictor;
+pub mod predict_gate;
 pub mod routing;
 pub mod runtime_model;
 pub mod swarm;
 pub mod toroidal_attention;
+pub mod word_problem;
+pub mod word_problem_derive;
 pub use toroidal_attention::{
     ToroidalHarmonicFieldState, ToroidalIsotropicLayerReceipt, ToroidalIsotropicRuntime,
     ToroidalIsotropicStepReceipt,
@@ -69,7 +79,11 @@ pub struct NativeMlirDispatchReceipt {
     pub handoff: DeliveredHandoff,
     pub validation: MlirSsaValidationReceipt,
     pub ssa_permit: CompliancePermit,
-    pub result_q32: Q32_31,
+    /// Arithmetic execution result: `Some` only when the block's semantics are
+    /// implemented by the deterministic arithmetic executor and it actually ran.
+    /// `None` for blocks whose semantics live in other engines (manifold, tool) —
+    /// CS-NATIVE-04: never a fabricated number.
+    pub result_q32: Option<Q32_31>,
     pub expanded_model_tokens: Vec<u32>,
 }
 
@@ -792,11 +806,19 @@ impl MonsterHybridServer {
                     reason: e.to_string(),
                 }
             })?;
-        let result_q32 = decoded_block
-            .execute_deterministic(&self.mlir_catalog, from_role)
-            .map_err(|e| ComplianceViolation::InvalidMlirSsaBlock {
-                reason: e.to_string(),
-            })?;
+        // CS-NATIVE-04 D1: UnimplementedOpcode is a status, not a dispatch
+        // failure — the block was authorized, handed off, and decoded; its
+        // semantics simply do not belong to the arithmetic executor.
+        let result_q32 = match decoded_block.execute_deterministic(&self.mlir_catalog, from_role)
+        {
+            Ok(v) => Some(v),
+            Err(atoma_immune::MlirSsaError::UnimplementedOpcode { .. }) => None,
+            Err(e) => {
+                return Err(ComplianceViolation::InvalidMlirSsaBlock {
+                    reason: e.to_string(),
+                })
+            }
+        };
         let expanded_model_tokens = decoded_block.expand_to_model_tokens(&self.mlir_catalog);
 
         Ok(NativeMlirDispatchReceipt {
@@ -1231,10 +1253,16 @@ impl MonsterHybridServer {
             &hop_states,
         )
         .map_err(|e| e.to_string())?;
-        let ssa_result_q32 = decode_rec
+        // CS-NATIVE-04 D1: geodesic programs are reported as programs; the
+        // numeric field is Some only for an actual arithmetic execution.
+        let ssa_result_q32 = match decode_rec
             .block
             .execute_deterministic(&self.mlir_catalog, target_role)
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(v) => Some(v),
+            Err(atoma_immune::MlirSsaError::UnimplementedOpcode { .. }) => None,
+            Err(e) => return Err(e.to_string()),
+        };
         let ssa_mnemonics: Vec<String> = decode_rec
             .block
             .instructions
@@ -1342,7 +1370,9 @@ pub struct SwarmMapQueryResult {
     pub hits: Vec<RetrievedAtomHit>,
     pub reasoning_hops: Vec<ReasoningHopHit>,
     pub synthesized_mlir_program: Vec<String>,
-    pub mlir_execution_result_q32: Q32_31,
+    /// Arithmetic execution result for the synthesized program: `Some` only
+    /// when an arithmetic execution actually happened (CS-NATIVE-04).
+    pub mlir_execution_result_q32: Option<Q32_31>,
     pub holonomy_flux_rad_q32: Q32_31,
     pub live_ingest: Option<LiveNoveltyDistillationReceipt>,
 }

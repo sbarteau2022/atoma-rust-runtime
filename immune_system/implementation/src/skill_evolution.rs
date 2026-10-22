@@ -916,7 +916,7 @@ func EncodeHandoffFrame(pkt HandoffPacket) ([]byte, error) {
         let ingress_ops = transformer
             .transducer
             .transduce_ingress_text(spec.prompt_trigger, true);
-        let (emitted_ops, _expanded_tokens, _decoded_preview) =
+        let (emitted_ops, _expanded_tokens, _decoded_preview, _prov) =
             transformer.decode_span_accelerated_incremental(map, &ingress_ops, 32)?;
 
         let mut trace = EpisodeWorkingTrace {

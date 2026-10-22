@@ -28,6 +28,10 @@ pub enum InferenceTier {
     Tier1TrajectoryWalk,
     Tier2SuperpositionOperator,
     Tier3QualifiedTeacher,
+    /// The trained native carrier predictor serving a computed
+    /// continuation through the gate (2026-10-19 promotion). NOT the
+    /// removed live teacher.
+    Tier3NativeCarrierPredictor,
 }
 
 impl InferenceTier {
@@ -36,6 +40,7 @@ impl InferenceTier {
             Self::Tier1TrajectoryWalk => "Tier1TrajectoryWalk",
             Self::Tier2SuperpositionOperator => "Tier2SuperpositionOperator",
             Self::Tier3QualifiedTeacher => "Tier3QualifiedTeacher",
+            Self::Tier3NativeCarrierPredictor => "Tier3NativeCarrierPredictor",
         }
     }
 }
@@ -98,6 +103,21 @@ pub struct LiveOperationalTurnReceipt {
     pub native_output_candidate: Option<String>,
     /// Readout or UTF-8 error from the native output head; primary response remains separate.
     pub native_output_error: Option<String>,
+    /// Trajectory-match gate verdict on the served candidate ("accept"/"reject"/"cold").
+    pub gate_verdict: Option<String>,
+    /// Maximum z-surprise the gate measured on the served candidate.
+    pub gate_max_surprise: Option<f64>,
+    /// Measured free energy F of the served turn (regulator ledger).
+    pub free_energy_f: Option<f64>,
+    /// Per-turn dissonance ||c_now - c_prev|| from the ledger.
+    pub free_energy_dissonance: Option<f64>,
+    /// Named refusal (falcon-ground discipline): when a turn serves no
+    /// grounded answer, the receipt names WHY, diagnosably.
+    pub refusal_reason: Option<String>,
+    /// Gate v2: fraction of walked arcs lying on the prompt's own chain.
+    pub prov_basin_agreement: Option<f64>,
+    /// Gate v2: fraction of walked arcs from quarantined teacher origins.
+    pub prov_self_crystallized_mass: Option<f64>,
 }
 
 /// Measured inputs to the preregistered 24-family kill gate.
@@ -128,6 +148,25 @@ pub struct MainModelCoordinatorRuntime {
     pub toroidal_hidden_states: BTreeMap<u64, Vec<f32>>,
     /// Per-position toroidal hidden states consumed by the native byte output head.
     pub toroidal_hidden_sequences: BTreeMap<u64, Vec<Vec<f32>>>,
+    /// Session-isolated trajectory-match gates (Elle prediction operator port).
+    pub trajectory_gates: BTreeMap<u64, crate::predict_gate::TrajectoryMatchGate>,
+    /// Session-isolated free-energy ledgers (Elle regulator port).
+    pub free_energy_ledgers: BTreeMap<u64, crate::free_energy::FreeEnergyLedger>,
+    /// The oracle outcome ledger: filed bets, resolutions, scars.
+    pub outcome_ledger: crate::outcome_ledger::OutcomeLedger,
+    /// Quarantined arc origins for the gate-v2 relevance verdict.
+    pub quarantine: crate::provenance::QuarantineRegistry,
+    /// Argon's trained carrier predictor (lazy-fit on first promotion).
+    pub promoter: crate::native_predictor::NativeCarrierPromoter,
+    /// CRYSTALLIZATION HOLD master switch (2026-10-19): live turns run
+    /// with crystallization held; held episodes are logged to
+    /// `<vault>.held_crystallizations.log` for approval. The REPL
+    /// `release-held` command clears this to replay approved prompts.
+    pub crystallization_hold_enabled: bool,
+    /// ABLATION (2026-10-19): when true, the per-turn 52-layer toroidal
+    /// forward pass is skipped entirely. Exists to prove (or refute)
+    /// that the forward pass contributes to served answers.
+    pub ablate_forward_pass: bool,
 }
 
 impl MainModelCoordinatorRuntime {
@@ -137,6 +176,8 @@ impl MainModelCoordinatorRuntime {
         self.toroidal_sessions.remove(&session_id);
         self.toroidal_hidden_states.remove(&session_id);
         self.toroidal_hidden_sequences.remove(&session_id);
+        self.trajectory_gates.remove(&session_id);
+        self.free_energy_ledgers.remove(&session_id);
     }
 
     /// Fuse the supplied vaults into one central map. The trajectory vault is loaded first so it
@@ -175,6 +216,13 @@ impl MainModelCoordinatorRuntime {
             server,
             sessions: BTreeMap::new(),
             toroidal_sessions: BTreeMap::new(),
+            trajectory_gates: BTreeMap::new(),
+            free_energy_ledgers: BTreeMap::new(),
+            outcome_ledger: crate::outcome_ledger::OutcomeLedger::new(),
+            quarantine: crate::provenance::QuarantineRegistry::with_teacher_era(),
+            promoter: crate::native_predictor::NativeCarrierPromoter::new(),
+            crystallization_hold_enabled: true,
+            ablate_forward_pass: false,
             toroidal_hidden_states: BTreeMap::new(),
             toroidal_hidden_sequences: BTreeMap::new(),
         })
@@ -210,6 +258,36 @@ impl MainModelCoordinatorRuntime {
             .insert(session_id, hidden_sequence);
         self.toroidal_hidden_states.insert(session_id, hidden);
         Ok(self.toroidal_hidden_states.get(&session_id).unwrap())
+    }
+
+    /// Score a candidate continuation against the prompt's geometric trajectory
+    /// using the session's trajectory-match gate (Elle prediction operator).
+    /// The prompt seeds the forecaster; only candidate steps are scored.
+    pub fn gate_turn_candidate(
+        &mut self,
+        session_id: u64,
+        prompt_text: &str,
+        candidate_text: &str,
+    ) -> crate::predict_gate::GateScore {
+        // Macro grain (2026-10-19): the gate scores the boundary-piece
+        // trajectory, not the byte expansion. Measured 2026-10-19: byte-grain
+        // z-surprise does not separate fluent-but-wrong continuations from
+        // good ones; the semantic address lives at the piece grain.
+        let prompt = {
+            let transducer = &self.server.active_transformer.transducer;
+            crate::input_embeddings::embed_text_macro(transducer, prompt_text)
+                .unwrap_or_default()
+        };
+        let candidate = {
+            let transducer = &self.server.active_transformer.transducer;
+            crate::input_embeddings::embed_text_macro(transducer, candidate_text)
+                .unwrap_or_default()
+        };
+        let gate = self
+            .trajectory_gates
+            .entry(session_id)
+            .or_insert_with(crate::predict_gate::TrajectoryMatchGate::new);
+        gate.score_candidate(&prompt, &candidate)
     }
 
     /// Read the latest prompt positions to UTF-8 through byte carriers; this does not generate
@@ -368,7 +446,14 @@ impl MainModelCoordinatorRuntime {
         } else {
             resolved_direct.clone()
         };
+        // Deterministic operators take precedence over stored trajectories
+        // (2026-10-19): when a benchmark operator can compute the answer, a
+        // memorized trajectory for the same prompt must not preempt it —
+        // a wrong trajectory learned from a teacher turn once shadowed the
+        // arithmetic operator exactly this way.
         let has_exact_chain = learn_enabled
+            && !is_benchmark_operator_task
+            && !self.outcome_ledger.scarred(prompt)
             && self
                 .server
                 .active_transformer
@@ -393,6 +478,7 @@ impl MainModelCoordinatorRuntime {
             superposition_interventions: 1,
             crystallization: None,
             compliance_verified: comp_report.all_statutes_satisfied,
+            arc_provenance: Vec::new(),
         };
 
         let mut final_receipt = if has_exact_chain {
@@ -404,7 +490,7 @@ impl MainModelCoordinatorRuntime {
                     &check_prefix,
                     max_new.max(768),
                 ) {
-                Ok((emitted_ops, expanded_tokens, decoded_output_text))
+                Ok((emitted_ops, expanded_tokens, decoded_output_text, tier1_provenance))
                     if !emitted_ops.is_empty()
                         && atoma_immune::BoundaryLexicalTransducer::is_coherent_egress_text(
                             &effective_prompt,
@@ -423,6 +509,7 @@ impl MainModelCoordinatorRuntime {
                         superposition_interventions: 0,
                         crystallization: None,
                         compliance_verified: comp_report.all_statutes_satisfied,
+                        arc_provenance: tier1_provenance,
                     }
                 }
                 _ => empty_fallback_receipt(),
@@ -448,7 +535,10 @@ impl MainModelCoordinatorRuntime {
                         .transduce_ingress_text(&effective_prompt, true);
 
                     let mut teacher_crystallized = 0usize;
-                    if learn_enabled {
+                    // CRYSTALLIZATION HOLD (2026-10-19): this direct-write
+                    // block is the second crystallization mechanism (the
+                    // first, `crystallize_episode`, checks the same flag).
+                    if learn_enabled && !self.server.active_transformer.hold_crystallization {
                         let writes = NativeReader::record_continuation(
                             &mut self.server.swarm_map,
                             &self.server.mlir_catalog,
@@ -482,7 +572,10 @@ impl MainModelCoordinatorRuntime {
                     }
 
                     let mut wal_bytes = 0usize;
-                    if learn_enabled && let Some(ref vp) = self.server.persistent_vault_path {
+                    if learn_enabled
+                        && !self.server.active_transformer.hold_crystallization
+                        && let Some(ref vp) = self.server.persistent_vault_path
+                    {
                         let mut s = vp.as_os_str().to_os_string();
                         s.push(".wal");
                         let wal_path = std::path::PathBuf::from(s);
@@ -538,9 +631,13 @@ impl MainModelCoordinatorRuntime {
                         novel_arcs_minted: teacher_crystallized,
                         holonomy_verified: true,
                         wal_bytes_appended: wal_bytes,
-                        mark: EpistemicMark::Verified,
+                        mark: if self.server.active_transformer.hold_crystallization {
+                            EpistemicMark::Theory
+                        } else {
+                            EpistemicMark::Verified
+                        },
                     });
-                    tier = InferenceTier::Tier3QualifiedTeacher;
+                    tier = InferenceTier::Tier2SuperpositionOperator; // TEACHER REMOVED 2026-10-19: closure ops are map-native synthesis, not a teacher
                 }
                 _ => {
                     final_receipt = self.server.execute_active_transformer_task(
@@ -593,65 +690,9 @@ impl MainModelCoordinatorRuntime {
         })
     }
 
-    /// Query the live local Qwen3.8-27B MLX server (`127.0.0.1:8001/v1/chat/completions`)
-    /// when reachable so unmapped turns are answered by the real model and immediately
-    /// crystallized into the unified `(H^3 x T^2)/Gamma_12` mind map and `.atoma_map.wal`.
-    fn try_query_live_qwen_endpoint(prompt: &str, max_new: usize) -> Option<String> {
-        use std::io::{Read, Write};
-        let addr: std::net::SocketAddr = "127.0.0.1:8001".parse().ok()?;
-        let mut stream =
-            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250))
-                .ok()?;
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(90)));
-        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(15)));
-
-        let body = serde_json::json!({
-            "model": "Qwen3.8-27B-Uncensored-OrcaRouter-MLX-4bit",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "max_tokens": max_new.clamp(32, 1024),
-            "temperature": 0.2,
-            "stream": false
-        })
-        .to_string();
-
-        let req = format!(
-            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:8001\r\nContent-Type: application/json\r\nAuthorization: Bearer dummy\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(req.as_bytes()).ok()?;
-
-        let mut raw = Vec::with_capacity(8192);
-        stream.read_to_end(&mut raw).ok()?;
-        let resp_str = String::from_utf8_lossy(&raw);
-        let body_part = resp_str.split("\r\n\r\n").nth(1)?;
-        let parsed: serde_json::Value = serde_json::from_str(body_part.trim()).ok()?;
-        let msg = parsed.get("choices")?.get(0)?.get("message")?;
-        let content = msg
-            .get("content")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                msg.get("reasoning_content")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.trim().is_empty())
-            })?;
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(format!(" {trimmed}"))
-        }
-    }
-
     /// Synthesize a grounded continuation from the unified mind map (`CarvedSwarmMap` +
     /// `MlirAtomCatalog` + `ToroidalIsotropicRuntime` Rank-8 Local Jacobian `ATOMA_OP_V3` +
-    /// live `Qwen3.8-27B` when reachable), with zero hardcoded synthetic template strings
+    /// map-native only -- live-teacher fallback removed 2026-10-19), with zero hardcoded synthetic template strings
     /// and zero fake sine-wave embeddings.
     fn synthesize_carved_specialist_teacher_continuation(
         server: &MonsterHybridServer,
@@ -724,31 +765,8 @@ impl MainModelCoordinatorRuntime {
             }
         }
 
-        if let Some(qwen_text) = Self::try_query_live_qwen_endpoint(prompt, max_new) {
-            let mut ops = server
-                .active_transformer
-                .transducer
-                .transduce_ingress_text(&qwen_text, false);
-            if ops.len() > max_new.max(512) {
-                ops.truncate(max_new.max(512));
-            }
-            if !ops.is_empty() {
-                return (
-                    ops,
-                    format!(
-                        "LiveQwen3.8Teacher[{}]",
-                        profile
-                            .lit_basins
-                            .iter()
-                            .map(|r| r.short_code())
-                            .collect::<Vec<_>>()
-                            .join("+")
-                    ),
-                );
-            }
-        }
-
-        let basins_tag = profile
+        // TEACHER REMOVED 2026-10-19: no live-teacher fallback. Map-native only.
+let basins_tag = profile
             .lit_basins
             .iter()
             .map(|r| r.short_code())
@@ -787,7 +805,7 @@ impl MainModelCoordinatorRuntime {
                 .active_transformer
                 .has_exact_trajectory_chain(&server.swarm_map, &resolved)
             {
-                if let Ok((ops, _, txt)) = server
+                if let Ok((ops, _, txt, _prov)) = server
                     .active_transformer
                     .decode_span_accelerated_incremental(
                         &server.swarm_map,
@@ -1089,6 +1107,7 @@ impl MainModelCoordinatorRuntime {
                 mark: EpistemicMark::Verified,
             }),
             compliance_verified: true,
+            arc_provenance: Vec::new(),
         };
         let turn = MainModelTurnReceipt {
             response_text: r_slice.to_string(),
@@ -1118,6 +1137,13 @@ impl MainModelCoordinatorRuntime {
             latency_us: t0.elapsed().as_micros(),
             native_output_candidate: None,
             native_output_error: None,
+            gate_verdict: None,
+            gate_max_surprise: None,
+            free_energy_f: None,
+            free_energy_dissonance: None,
+            refusal_reason: None,
+            prov_basin_agreement: None,
+            prov_self_crystallized_mass: None,
         })
     }
 
@@ -1127,6 +1153,26 @@ impl MainModelCoordinatorRuntime {
     ///    synthesizes from the internal manifold (`Tier2SuperpositionOperator` or Rank-8 Jacobian
     ///    specialist), permanently crystallizing novel `0-cells` and `1-cell` arcs into
     ///    `self.server.swarm_map` and `.atoma_map.wal` while keeping locked trajectories immutable.
+    /// Resolve the most recent unresolved outcome bet (REPL `mark` path).
+    /// An incorrect resolution files a scar: that prompt's trajectory can
+    /// never again serve as a Tier1 exact chain.
+    pub fn resolve_latest_outcome(&mut self, incorrect: bool) -> Option<u64> {
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let outcome = if incorrect {
+            crate::outcome_ledger::OUTCOME_INCORRECT
+        } else {
+            crate::outcome_ledger::OUTCOME_CORRECT
+        };
+        self.outcome_ledger.resolve_latest(
+            outcome,
+            crate::outcome_ledger::SOURCE_USER,
+            unix_ms,
+        )
+    }
+
     pub fn execute_live_operational_turn(
         &mut self,
         session_id: u64,
@@ -1135,7 +1181,9 @@ impl MainModelCoordinatorRuntime {
         manual_basins: Option<&[RoleId]>,
     ) -> Result<LiveOperationalTurnReceipt, String> {
         let t0 = std::time::Instant::now();
-        self.step_native_toroidal_prompt(session_id, prompt)?;
+        if !self.ablate_forward_pass {
+            self.step_native_toroidal_prompt(session_id, prompt)?;
+        }
         let atoms_before = self.server.swarm_map.global_atom_count();
         let arcs_before = self.server.swarm_map.reasoning_arcs.len();
 
@@ -1171,7 +1219,7 @@ impl MainModelCoordinatorRuntime {
                     &resolved_check,
                     max_new,
                 )
-                .is_ok_and(|(ops, _, txt)| {
+                .is_ok_and(|(ops, _, txt, _prov)| {
                     !ops.is_empty()
                         && atoma_immune::BoundaryLexicalTransducer::is_coherent_egress_text(
                             prompt, &txt,
@@ -1199,9 +1247,62 @@ impl MainModelCoordinatorRuntime {
                 max_new,
             ))
         };
+        // TRAJECTORY GATE (2026-10-19): score the synthesis candidate before it
+        // can be crystallized into the vault. A rejected candidate never reaches
+        // the learning write path; the turn falls through to the map-native arm.
+        let pre_synth = match pre_synth {
+            Some((ops, src_tag)) => {
+                // Deterministic operator families are computed, not
+                // retrieved; their outputs are exact by construction and
+                // skip trajectory gating.
+                let is_deterministic = src_tag.contains("Operator");
+                let cand_text = if is_deterministic {
+                    String::new()
+                } else {
+                    let (_, text) = self
+                        .server
+                        .active_transformer
+                        .transducer
+                        .transduce_egress_ops(&ops);
+                    text
+                };
+                let score = if is_deterministic {
+                    // Bypass: verdict Accept without scoring.
+                    crate::predict_gate::GateScore {
+                        verdict: crate::predict_gate::GateVerdict::Accept,
+                        scored_steps: 0,
+                        max_surprise: None,
+                        mean_surprise: None,
+                        max_z_hyper: None,
+                        max_z_torus: None,
+                        hot_steps: 0,
+                        worst_skill: None,
+                        trusted: false,
+                    }
+                } else {
+                    self.gate_turn_candidate(session_id, prompt, &cand_text)
+                };
+                if score.verdict == crate::predict_gate::GateVerdict::Reject {
+                    eprintln!(
+                        "[trajectory-gate] REJECTED pre-synthesis candidate from {}                          (max_surprise={:?}, scored_steps={})",
+                        src_tag, score.max_surprise, score.scored_steps
+                    );
+                    None
+                } else {
+                    Some((ops, src_tag))
+                }
+            }
+            None => None,
+        };
         let mut teacher_source = "MapNativeTier1Geodesic".to_string();
 
-        let turn = self.execute_human_turn(session_id, prompt, max_new, |_ingress, _max_n| {
+        // CRYSTALLIZATION HOLD (2026-10-19): live turns crystallize
+        // NOTHING into the vault. Held episodes are logged below for
+        // review (Stewart's rule: new Tier2 content is logged and
+        // approved before it may crystallize).
+        self.server.active_transformer.hold_crystallization =
+            self.crystallization_hold_enabled;
+        let mut turn = self.execute_human_turn(session_id, prompt, max_new, |_ingress, _max_n| {
             if let Some((ref ops, ref src)) = pre_synth {
                 teacher_source = src.clone();
                 Ok(ops.clone())
@@ -1209,6 +1310,42 @@ impl MainModelCoordinatorRuntime {
                 Err("unmapped: delegate to Tier-2 Autonomous Mind Superposition".to_string())
             }
         })?;
+
+        self.server.active_transformer.hold_crystallization = false;
+        if self.crystallization_hold_enabled
+            && turn.receipt.crystallization.as_ref().is_some_and(|c| {
+                c.novel_arcs_minted == 0 && c.steps_crystallized > 0
+            })
+        {
+            if let Some(vp) = &self.server.persistent_vault_path {
+                let mut p = vp.as_os_str().to_os_string();
+                p.push(".held_crystallizations.log");
+                let resp_short: String =
+                    turn.response_text.chars().take(160).collect();
+                let line = format!(
+                    "{}\t{}\t{}\n",
+                    turn.tier.as_str(),
+                    prompt.replace(['\t', '\n'], " "),
+                    resp_short.replace(['\t', '\n'], " ")
+                );
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(std::path::PathBuf::from(p))
+                {
+                    use std::io::Write as _;
+                    let _ = f.write_all(line.as_bytes());
+                }
+                eprintln!(
+                    "[crystallization-hold] held {} steps from {} (logged for review)",
+                    turn.receipt
+                        .crystallization
+                        .as_ref()
+                        .map_or(0, |c| c.steps_crystallized),
+                    turn.tier.as_str()
+                );
+            }
+        }
 
         if turn.tier == InferenceTier::Tier2SuperpositionOperator {
             let basins_tag = pre_profile
@@ -1227,6 +1364,255 @@ impl MainModelCoordinatorRuntime {
                 teacher_source = format!("Tier2SuperpositionHoldingEngine[{}]", basins_tag);
             }
         }
+
+        // TRAJECTORY GATE (2026-10-19): score what is about to be served.
+        // A rejected candidate fails closed; the verdict and max surprise are
+        // recorded on the receipt as evidence.
+        let mut served_score = if crate::benchmark_operators::try_execute_high_level_operator(
+            &self.server.mlir_catalog,
+            prompt,
+        )
+        .is_some()
+        {
+            // Deterministic operator path: computed answer, no gating.
+            crate::predict_gate::GateScore {
+                verdict: crate::predict_gate::GateVerdict::Accept,
+                scored_steps: 0,
+                max_surprise: None,
+                mean_surprise: None,
+                max_z_hyper: None,
+                max_z_torus: None,
+                hot_steps: 0,
+                worst_skill: None,
+                trusted: false,
+            }
+        } else {
+            self.gate_turn_candidate(session_id, prompt, &turn.response_text.clone())
+        };
+        let mut gate_verdict = Some(served_score.verdict.as_str().to_string());
+        let mut gate_max_surprise = served_score.max_surprise;
+        // FALSIFIER HARDENING (2026-10-19): thresholds from signals
+        // that earned PASS actively refuse candidates beyond every
+        // correct example on record. Inert while all signals are
+        // unqualified (the current state) — no threshold exists until
+        // the falsifier grants one.
+        if served_score.verdict != crate::predict_gate::GateVerdict::Reject {
+            let thresholds =
+                crate::falsifier::active_thresholds(&self.outcome_ledger);
+            let mean_bad = thresholds
+                .mean_z_max
+                .zip(served_score.mean_surprise)
+                .is_some_and(|(t, m)| m > t);
+            let max_bad = thresholds
+                .max_z_max
+                .zip(served_score.max_surprise)
+                .is_some_and(|(t, m)| m > t);
+            // NOTE: basin_agreement is computed later in the turn
+            // (provenance attaches at filing time), so the basin
+            // threshold is enforced there in future work; the surprise
+            // thresholds are enforced here at the gate.
+            if mean_bad || max_bad {
+                eprintln!(
+                    "[falsifier-threshold] ACTIVE threshold refused candidate \
+                     (mean_z={:?} max_z={:?})",
+                    served_score.mean_surprise, served_score.max_surprise
+                );
+                served_score.verdict = crate::predict_gate::GateVerdict::Reject;
+                gate_verdict = Some("Reject".to_string());
+            }
+        }
+        if served_score.verdict == crate::predict_gate::GateVerdict::Reject {
+            eprintln!(
+                "[trajectory-gate] REJECTED served candidate \
+                 (max_surprise={:?}, mean_surprise={:?}, scored_steps={})",
+                served_score.max_surprise, served_score.mean_surprise, served_score.scored_steps
+            );
+            teacher_source = "TrajectoryGateRejected".to_string();
+            turn.response_text =
+                "[no grounded continuation - trajectory gate rejected]".to_string();
+        }
+
+        // PREDICTOR PROMOTION (2026-10-19, Argon): the last-chance computed
+        // candidate. Only when no operator fired, the walk missed, and the
+        // turn is otherwise a refusal. The candidate is scored through the
+        // single TrajectoryMatchGate chassis; only an Accept promotes into
+        // the served response. A rejected/cold candidate leaves the refusal
+        // standing - the promotion never manufactures an answer the gate
+        // didn't clear.
+        if !is_benchmark_op
+            && (turn.response_text.starts_with("[no grounded")
+                || turn.response_text.trim().is_empty())
+        {
+            let toroidal_state = self.toroidal_sessions.get(&session_id);
+            if let Some(candidate) = self.promoter.promote(
+                toroidal_state,
+                &self.server.swarm_map,
+                &self.server.mlir_catalog,
+                &self.server.active_transformer.transducer,
+                prompt,
+                max_new,
+            ) {
+                let gate = self
+                    .trajectory_gates
+                    .entry(session_id)
+                    .or_insert_with(crate::predict_gate::TrajectoryMatchGate::new);
+                let cand_score = candidate.score_with_gate(gate);
+                if cand_score.verdict == crate::predict_gate::GateVerdict::Accept {
+                    if let Some(text) = candidate.decoded_text.clone() {
+                        eprintln!(
+                            "[predictor-promotion] ACCEPTED computed candidate \
+                             (max_surprise={:?}, mean_surprise={:?}, steps={})",
+                            cand_score.max_surprise,
+                            cand_score.mean_surprise,
+                            cand_score.scored_steps
+                        );
+                        turn.response_text = text;
+                        turn.tier = InferenceTier::Tier3NativeCarrierPredictor;
+                        teacher_source = "NativeCarrierPredictor".to_string();
+                        served_score = cand_score;
+                        gate_verdict = Some(served_score.verdict.as_str().to_string());
+                        gate_max_surprise = served_score.max_surprise;
+                    }
+                } else {
+                    eprintln!(
+                        "[predictor-promotion] candidate not promoted (verdict={})",
+                        cand_score.verdict.as_str()
+                    );
+                }
+            }
+        }
+
+        // FREE-ENERGY REGULATOR (2026-10-19, Elle port): measure the
+        // turn's three coherence coordinates from native turn evidence and
+        // run the session ledger. This replaces the hardcoded 0.12 / 0.96
+        // constants the receipts used to carry.
+        let op_fired = is_benchmark_op;
+        let c_structural = if op_fired {
+            1.0 // computed, exact
+        } else if turn.tier == InferenceTier::Tier1TrajectoryWalk {
+            1.0 // exact trajectory chain served
+        } else if turn.tier == InferenceTier::Tier2SuperpositionOperator {
+            0.7 // synthesized, not exact
+        } else if turn.tier == InferenceTier::Tier3NativeCarrierPredictor {
+            0.8 // computed by the trained carrier predictor, gate-cleared
+        } else {
+            0.0 // nothing served
+        };
+        let c_relational = if op_fired {
+            1.0 // exact by construction
+        } else {
+            match served_score.verdict {
+                crate::predict_gate::GateVerdict::Accept => 1.0,
+                crate::predict_gate::GateVerdict::Cold => 0.5,
+                crate::predict_gate::GateVerdict::Reject => 0.0,
+            }
+        };
+        let c_harmonic = if turn.response_text.trim().is_empty()
+            || turn.response_text.starts_with("[no grounded")
+        {
+            0.3 // rejected or empty: no harmonic closure
+        } else if turn
+            .receipt
+            .crystallization
+            .as_ref()
+            .is_some_and(|c| c.holonomy_verified)
+        {
+            1.0 // crystallized under a verified holonomy check
+        } else {
+            0.8 // served from the map without fresh crystallization
+        };
+        let coherence =
+            crate::free_energy::Coherence::new(c_structural, c_relational, c_harmonic);
+        let ledger = self
+            .free_energy_ledgers
+            .entry(session_id)
+            .or_insert_with(crate::free_energy::FreeEnergyLedger::new);
+        let (f_val, dissonance, _conserved) = ledger.observe(coherence);
+        turn.final_free_energy_q32 = Q32_31::from_f64(f_val);
+        turn.final_readiness_omega_q32 = Q32_31::from_f64((1.0 - f_val).clamp(0.0, 1.0));
+        let free_energy_f = Some(f_val);
+        let free_energy_dissonance = Some(dissonance);
+        eprintln!(
+            "[free-energy] F={:.4} dissonance={:.4} c=({:.1},{:.1},{:.1})",
+            f_val, dissonance, c_structural, c_relational, c_harmonic
+        );
+
+        // OUTCOME LEDGER (oracle design): file a bet on every served turn.
+        // Refusals and empty responses file nothing — they made no claim.
+        let mut bet_seq: Option<u64> = None;
+        if !turn.response_text.trim().is_empty()
+            && !turn.response_text.starts_with("[no grounded")
+        {
+            let (tier_no, conf_bp) = if op_fired {
+                (2u8, crate::outcome_ledger::CONFIDENCE_OPERATOR_BP)
+            } else if turn.tier == InferenceTier::Tier1TrajectoryWalk {
+                (1u8, crate::outcome_ledger::CONFIDENCE_TIER1_BP)
+            } else {
+                (2u8, crate::outcome_ledger::CONFIDENCE_TIER2_BP)
+            };
+            let unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            bet_seq = Some(self.outcome_ledger.file(
+                prompt,
+                &turn.response_text,
+                tier_no,
+                conf_bp,
+                unix_ms,
+            ));
+            // File the gate signal with the bet (non-operator turns only):
+            // these (signal, outcome) pairs are the falsifier's dataset.
+            if !op_fired {
+                if let (Some(mz), Some(mnz)) =
+                    (served_score.max_surprise, served_score.mean_surprise)
+                {
+                    if let Some(seq) = bet_seq {
+                        self.outcome_ledger.attach_signal(seq, mz, mnz);
+                    }
+                }
+            }
+        }
+
+        // NAMED REFUSAL: a turn that serves nothing grounded says why.
+        // GATE v2 RELEVANCE VERDICT (instrument, not yet a gate): judge
+        // the served candidate by the provenance of the arcs that built it.
+        let prov_verdict = crate::provenance::relevance_verdict(
+            &turn.receipt.arc_provenance,
+            &self.quarantine,
+        );
+        if let Some(v) = &prov_verdict {
+            eprintln!(
+                "[provenance] ops={} basin_agreement={:.2} self_crystallized={:.2} \
+                 mean_certainty={:.2}",
+                v.n_ops, v.basin_agreement, v.self_crystallized_mass, v.mean_certainty
+            );
+        }
+        let prov_basin_agreement = prov_verdict.map(|v| v.basin_agreement);
+        let prov_self_crystallized_mass = prov_verdict.map(|v| v.self_crystallized_mass);
+        // File the relevance verdict with the bet: the falsifier judges it
+        // against resolved outcomes. No provenance (synthesis/operator)
+        // means no pair.
+        if let (Some(v), Some(seq)) = (&prov_verdict, bet_seq) {
+            self.outcome_ledger
+                .attach_relevance(seq, v.basin_agreement, v.self_crystallized_mass);
+        }
+
+        let refusal_reason =
+            if served_score.verdict == crate::predict_gate::GateVerdict::Reject {
+                Some(format!(
+                    "trajectory_gate_reject: candidate diverged from the prompt \
+                     forecast (mean_surprise={:?}, scored_steps={})",
+                    served_score.mean_surprise, served_score.scored_steps
+                ))
+            } else if turn.response_text.trim().is_empty() {
+                Some(
+                    "no_grounded_continuation: synthesis produced no admissible span"
+                        .to_string(),
+                )
+            } else {
+                None
+            };
 
         let atoms_after = self.server.swarm_map.global_atom_count();
         let arcs_after = self.server.swarm_map.reasoning_arcs.len();
@@ -1271,6 +1657,13 @@ impl MainModelCoordinatorRuntime {
             latency_us: t0.elapsed().as_micros(),
             native_output_candidate,
             native_output_error,
+            gate_verdict,
+            gate_max_surprise,
+            free_energy_f,
+            free_energy_dissonance,
+            refusal_reason,
+            prov_basin_agreement,
+            prov_self_crystallized_mass,
         })
     }
 
@@ -1658,6 +2051,13 @@ mod tests {
             server,
             sessions: BTreeMap::new(),
             toroidal_sessions: BTreeMap::new(),
+            trajectory_gates: BTreeMap::new(),
+            free_energy_ledgers: BTreeMap::new(),
+            outcome_ledger: crate::outcome_ledger::OutcomeLedger::new(),
+            quarantine: crate::provenance::QuarantineRegistry::with_teacher_era(),
+            promoter: crate::native_predictor::NativeCarrierPromoter::new(),
+            crystallization_hold_enabled: true,
+            ablate_forward_pass: false,
             toroidal_hidden_states: BTreeMap::new(),
             toroidal_hidden_sequences: BTreeMap::new(),
         };
@@ -1712,6 +2112,13 @@ mod tests {
             server,
             sessions: BTreeMap::new(),
             toroidal_sessions: BTreeMap::new(),
+            trajectory_gates: BTreeMap::new(),
+            free_energy_ledgers: BTreeMap::new(),
+            outcome_ledger: crate::outcome_ledger::OutcomeLedger::new(),
+            quarantine: crate::provenance::QuarantineRegistry::with_teacher_era(),
+            promoter: crate::native_predictor::NativeCarrierPromoter::new(),
+            crystallization_hold_enabled: true,
+            ablate_forward_pass: false,
             toroidal_hidden_states: BTreeMap::new(),
             toroidal_hidden_sequences: BTreeMap::new(),
         };
@@ -1763,13 +2170,20 @@ mod tests {
     }
 
     #[test]
-    fn runtime_learns_novel_prompt_in_tier3_then_hits_tier1_on_repeat() {
+    fn runtime_synthesizes_novel_prompt_map_native_then_recalls_on_repeat() {
         let weights = FrozenBaseWeights::freeze("runtime-realtime-learn-test", 52, vec![0.5; 32]);
         let server = MonsterHybridServer::boot_default(weights).unwrap();
         let mut runtime = MainModelCoordinatorRuntime {
             server,
             sessions: BTreeMap::new(),
             toroidal_sessions: BTreeMap::new(),
+            trajectory_gates: BTreeMap::new(),
+            free_energy_ledgers: BTreeMap::new(),
+            outcome_ledger: crate::outcome_ledger::OutcomeLedger::new(),
+            quarantine: crate::provenance::QuarantineRegistry::with_teacher_era(),
+            promoter: crate::native_predictor::NativeCarrierPromoter::new(),
+            crystallization_hold_enabled: true,
+            ablate_forward_pass: false,
             toroidal_hidden_states: BTreeMap::new(),
             toroidal_hidden_sequences: BTreeMap::new(),
         };
@@ -1784,10 +2198,13 @@ mod tests {
         runtime.server.load_or_init_persistent_vault(&path).unwrap();
 
         let novel_prompt = "Quantum holonomy invariant for icosahedral silo L7";
+        // Approved-learning path test: the 2026-10-19 crystallization
+        // hold blocks unreviewed learning, so disable it here.
+        runtime.crystallization_hold_enabled = false;
         let turn1 = runtime
             .execute_live_operational_turn(101, novel_prompt, 16, None)
             .unwrap();
-        assert_eq!(turn1.turn.tier, InferenceTier::Tier3QualifiedTeacher);
+        assert_ne!(turn1.turn.tier, InferenceTier::Tier3QualifiedTeacher, "teacher removed 2026-10-19: no turn may report Tier3");
         assert!(turn1.novel_arcs_minted > 0);
         assert!(!turn1.turn.response_text.trim().is_empty());
 
@@ -1811,6 +2228,13 @@ mod tests {
             server,
             sessions: BTreeMap::new(),
             toroidal_sessions: BTreeMap::new(),
+            trajectory_gates: BTreeMap::new(),
+            free_energy_ledgers: BTreeMap::new(),
+            outcome_ledger: crate::outcome_ledger::OutcomeLedger::new(),
+            quarantine: crate::provenance::QuarantineRegistry::with_teacher_era(),
+            promoter: crate::native_predictor::NativeCarrierPromoter::new(),
+            crystallization_hold_enabled: true,
+            ablate_forward_pass: false,
             toroidal_hidden_states: BTreeMap::new(),
             toroidal_hidden_sequences: BTreeMap::new(),
         };
@@ -1846,6 +2270,13 @@ mod tests {
             server,
             sessions: BTreeMap::new(),
             toroidal_sessions: BTreeMap::new(),
+            trajectory_gates: BTreeMap::new(),
+            free_energy_ledgers: BTreeMap::new(),
+            outcome_ledger: crate::outcome_ledger::OutcomeLedger::new(),
+            quarantine: crate::provenance::QuarantineRegistry::with_teacher_era(),
+            promoter: crate::native_predictor::NativeCarrierPromoter::new(),
+            crystallization_hold_enabled: true,
+            ablate_forward_pass: false,
             toroidal_hidden_states: BTreeMap::new(),
             toroidal_hidden_sequences: BTreeMap::new(),
         };
@@ -1891,6 +2322,11 @@ mod tests {
             )
             .unwrap();
         }
+
+        // This test exercises the APPROVED learning path: under the
+        // 2026-10-19 crystallization hold, live turns crystallize
+        // nothing until released, so disable the hold here.
+        runtime.crystallization_hold_enabled = false;
 
         let novel_problem = "How do recursion and encryption relate when designing software?";
         let turn1 = runtime

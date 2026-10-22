@@ -43,6 +43,13 @@ fn boot_disposable_runtime(tag: &str) -> (MainModelCoordinatorRuntime, PathBuf) 
         server,
         sessions: std::collections::BTreeMap::new(),
         toroidal_sessions: std::collections::BTreeMap::new(),
+        trajectory_gates: std::collections::BTreeMap::new(),
+        free_energy_ledgers: std::collections::BTreeMap::new(),
+        outcome_ledger: atoma_orchestrator::outcome_ledger::OutcomeLedger::new(),
+        quarantine: atoma_orchestrator::provenance::QuarantineRegistry::with_teacher_era(),
+        promoter: atoma_orchestrator::native_predictor::NativeCarrierPromoter::new(),
+        crystallization_hold_enabled: true,
+        ablate_forward_pass: false,
         toroidal_hidden_states: std::collections::BTreeMap::new(),
         toroidal_hidden_sequences: std::collections::BTreeMap::new(),
     };
@@ -62,6 +69,9 @@ fn cleanup_vault(vault_path: &PathBuf) {
 #[test]
 fn test_step1_and_step2_serving_path_and_provenance() {
     let (mut rt, vault_path) = boot_disposable_runtime("step2_serving");
+    // This audit exercises the learn->recall loop; under the 2026-10-19
+    // crystallization hold that loop requires explicit release.
+    rt.crystallization_hold_enabled = false;
 
     // Verify Step 1 provenance telemetry in render_map_state_json
     let state_json = rt.server.render_map_state_json();
@@ -546,6 +556,13 @@ fn test_step4_persistence_recovery_concurrency_and_isolation() {
         server: restarted_server,
         sessions: std::collections::BTreeMap::new(),
         toroidal_sessions: std::collections::BTreeMap::new(),
+        trajectory_gates: std::collections::BTreeMap::new(),
+        free_energy_ledgers: std::collections::BTreeMap::new(),
+        outcome_ledger: atoma_orchestrator::outcome_ledger::OutcomeLedger::new(),
+        quarantine: atoma_orchestrator::provenance::QuarantineRegistry::with_teacher_era(),
+        promoter: atoma_orchestrator::native_predictor::NativeCarrierPromoter::new(),
+        crystallization_hold_enabled: true,
+        ablate_forward_pass: false,
         toroidal_hidden_states: std::collections::BTreeMap::new(),
         toroidal_hidden_sequences: std::collections::BTreeMap::new(),
     };

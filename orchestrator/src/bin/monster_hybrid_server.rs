@@ -16,6 +16,13 @@ use atoma_orchestrator::live_map_ui::INTERACTIVE_MAP_VISUALIZER_HTML;
 use atoma_orchestrator::runtime_model::{LiveOperationalTurnReceipt, MainModelCoordinatorRuntime};
 use std::collections::HashMap;
 
+/// CS-NATIVE-04: an arithmetic execution result exists only when an execution
+/// actually happened; render the absence honestly instead of a number.
+fn fmt_q32_opt(v: Option<Q32_31>) -> String {
+    v.map(|q| format!("{:.4}", q.to_f64()))
+        .unwrap_or_else(|| "not_executed".to_string())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("==========================================================================");
     println!(" MONSTER HYBRID SERVER :: CARVED SWARM & FIRST-PRINCIPLES IMMUNE SYSTEM");
@@ -34,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             || a == "--distill-safetensors"
             || a == "--distill-model-dir"
             || a == "--distill-full"
+            || a == "--truncate-arcs-to"
     });
     let run_boot_demo = !wants_query_or_serve || args.iter().any(|a| a == "--self-test");
 
@@ -598,10 +606,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (_, trans_loss) =
             reloaded_catalog.tokens_to_mlir_ops(&mlir_dispatch.expanded_model_tokens);
         println!(
-            "[verified] Native MLIR Inter-Process SSA Dispatch (L1->L3, 0 JSON/Python): ops={} wire_bytes={} result_q32={:.4} tokens={}->{}ops lossless={} catalog_sha256={}..",
+            "[verified] Native MLIR Inter-Process SSA Dispatch (L1->L3, 0 JSON/Python): ops={} wire_bytes={} result_q32={} tokens={}->{}ops lossless={} catalog_sha256={}..",
             mlir_dispatch.validation.instruction_count,
             mlir_dispatch.handoff.wire_packet.payload.len(),
-            mlir_dispatch.result_q32.to_f64(),
+            fmt_q32_opt(mlir_dispatch.result_q32),
             trans_loss.input_token_count,
             trans_loss.output_mlir_op_count,
             trans_loss.roundtrip_lossless,
@@ -633,10 +641,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect();
         println!(
-            "[verified] Geodesic MLIR Hidden-State->SSA Synthesis (256d->(H³xT²)/Γ₁₂, 0 tokens): steps={} masked_illegal_ops={} result_q32={:.4} program={:?}",
+            "[verified] Geodesic MLIR Hidden-State->SSA Synthesis (256d->(H³xT²)/Γ₁₂, 0 tokens): steps={} masked_illegal_ops={} result_q32={} program={:?}",
             geo_dispatch.validation.instruction_count,
             geo_decode.masked_illegal_opcodes_count,
-            geo_dispatch.result_q32.to_f64(),
+            fmt_q32_opt(geo_dispatch.result_q32),
             synthesized_mnemonics
         );
 
@@ -879,6 +887,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // One-shot arc rollback (2026-10-19): drop the tail of
+    // `reasoning_arcs` (a contaminated crystallization batch) and
+    // rebuild the adjacency index, then persist and exit.
+    if let Some(pos) = args.iter().position(|a| a == "--truncate-arcs-to") {
+        let keep: usize = args
+            .get(pos + 1)
+            .and_then(|s| s.parse().ok())
+            .ok_or("--truncate-arcs-to requires a usize argument")?;
+        if keep < server.swarm_map.locked_arc_count {
+            return Err(format!(
+                "refusing to cut into locked arcs (keep={}, locked={})",
+                keep, server.swarm_map.locked_arc_count
+            )
+            .into());
+        }
+        let before = server.swarm_map.reasoning_arcs.len();
+        let removed = server.swarm_map.truncate_reasoning_arcs(keep);
+        server.persist_global_map()?;
+        println!(
+            "[verified] arc rollback: {} -> {} (removed {}), vault persisted",
+            before, keep, removed
+        );
+        return Ok(());
+    }
+
     let role_override = args
         .iter()
         .position(|a| a == "--role")
@@ -942,6 +975,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             server,
             sessions: Default::default(),
             toroidal_sessions: Default::default(),
+            trajectory_gates: Default::default(),
+            free_energy_ledgers: Default::default(),
+            outcome_ledger: Default::default(),
+            quarantine: Default::default(),
+            promoter: Default::default(),
+            crystallization_hold_enabled: true,
+            ablate_forward_pass: false,
             toroidal_hidden_states: Default::default(),
             toroidal_hidden_sequences: Default::default(),
         };
@@ -964,15 +1004,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             server,
             sessions: Default::default(),
             toroidal_sessions: Default::default(),
+            trajectory_gates: Default::default(),
+            free_energy_ledgers: Default::default(),
+            outcome_ledger: Default::default(),
+            quarantine: Default::default(),
+            promoter: Default::default(),
+            crystallization_hold_enabled: true,
+            ablate_forward_pass: false,
             toroidal_hidden_states: Default::default(),
             toroidal_hidden_sequences: Default::default(),
         };
+        {
+            let mut outcomes_os = vault_path.clone().into_os_string();
+            outcomes_os.push(".outcomes");
+            match runtime
+                .outcome_ledger
+                .attach(std::path::PathBuf::from(outcomes_os))
+            {
+                Ok(()) => eprintln!(
+                    "[outcome-ledger] attached ({} bets, {} unresolved)",
+                    runtime.outcome_ledger.bets.len(),
+                    runtime.outcome_ledger.unresolved_count()
+                ),
+                Err(e) => eprintln!("[outcome-ledger] attach failed: {e}"),
+            }
+        }
         println!(
             "[verified] GeodesicActiveTransformer stdin ready (bare prompts execute 3-Tier Live Operational Turn + Real-Time Learning; `query <text>` retrieves only, `learn <text>` intakes only, `save` snapshots vault, `/reset`, `status`, `quit`; max_new={}, global_0cells={}, global_1cell_arcs={})",
             max_new,
             runtime.server.swarm_map.global_atom_count(),
             runtime.server.swarm_map.reasoning_arcs.len()
         );
+        if args.iter().any(|a| a == "--ablate-no-forward") {
+            runtime.ablate_forward_pass = true;
+            println!("[ablation] forward pass SKIPPED for all turns in this session");
+        }
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let line = line?;
@@ -1021,6 +1087,127 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     runtime.server.swarm_map.ingested_tensor_digests.len(),
                     silo_counts.join(", ")
                 );
+                continue;
+            }
+            if trimmed == "mark wrong" || trimmed == "mark right" {
+                let incorrect = trimmed == "mark wrong";
+                match runtime.resolve_latest_outcome(incorrect) {
+                    Some(seq) => println!(
+                        "[outcome] bet #{} resolved {} ({} unresolved remain)",
+                        seq,
+                        if incorrect {
+                            "INCORRECT — scar filed; this prompt will never walk Tier1 again"
+                        } else {
+                            "CORRECT"
+                        },
+                        runtime.outcome_ledger.unresolved_count()
+                    ),
+                    None => println!("[outcome] no unresolved bet to resolve"),
+                }
+                continue;
+            }
+            if let Some(text) = trimmed.strip_prefix("transduce ") {
+                let transducer = &runtime.server.active_transformer.transducer;
+                let ops = transducer.transduce_ingress_text(text, true);
+                let (_expanded, back) = transducer.transduce_egress_ops(&ops);
+                let exact = back == text;
+                let diffs = text
+                    .chars()
+                    .zip(back.chars())
+                    .filter(|(a, b)| a != b)
+                    .count()
+                    + text.chars().count().abs_diff(back.chars().count());
+                println!(
+                    "[transduce] ops={} in_chars={} out_chars={} exact={} char_diffs={}",
+                    ops.len(),
+                    text.chars().count(),
+                    back.chars().count(),
+                    exact,
+                    diffs
+                );
+                if !exact {
+                    println!(
+                        "[transduce] out: {}",
+                        back.chars().take(240).collect::<String>()
+                    );
+                }
+                continue;
+            }
+            if trimmed == "held" {
+                let mut p = vault_path.as_os_str().to_os_string();
+                p.push(".held_crystallizations.log");
+                let path = std::path::PathBuf::from(p);
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => {
+                        let n = content.lines().count();
+                        println!("[held] {n} crystallizations held for review ({})", path.display());
+                        for line in content.lines().take(20) {
+                            println!("  {line}");
+                        }
+                    }
+                    Err(_) => println!("[held] no crystallizations held"),
+                }
+                continue;
+            }
+            if trimmed == "release-held" {
+                let mut p = vault_path.as_os_str().to_os_string();
+                p.push(".held_crystallizations.log");
+                let path = std::path::PathBuf::from(p);
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => {
+                        let prompts: Vec<String> = content
+                            .lines()
+                            .filter_map(|l| l.split('\t').nth(1).map(str::to_string))
+                            .collect();
+                        println!("[release-held] replaying {} approved prompts with crystallization ON", prompts.len());
+                        runtime.crystallization_hold_enabled = false;
+                        for p in &prompts {
+                            let _ = runtime.execute_live_operational_turn(1, p, 96, None);
+                        }
+                        runtime.crystallization_hold_enabled = true;
+                        let _ = std::fs::remove_file(&path);
+                        println!("[release-held] done; log cleared; hold restored");
+                    }
+                    Err(_) => println!("[release-held] nothing held"),
+                }
+                continue;
+            }
+            if trimmed == "falsify" {
+                for q in atoma_orchestrator::falsifier::qualify_gate_signals(
+                    &runtime.outcome_ledger,
+                ) {
+                    match (q.result.rho, q.result.p) {
+                        (Some(rho), Some(p)) => println!(
+                            "[falsify] {}: verdict={} rho={:.3} p={:.4} n={} (alpha={})",
+                            q.signal,
+                            q.result.verdict.as_str(),
+                            rho,
+                            p,
+                            q.result.n,
+                            q.result.alpha
+                        ),
+                        _ => println!(
+                            "[falsify] {}: verdict={} n={} (power floor {})",
+                            q.signal,
+                            q.result.verdict.as_str(),
+                            q.result.n,
+                            atoma_orchestrator::falsifier::POWER_FLOOR
+                        ),
+                    }
+                }
+                continue;
+            }
+            if trimmed == "calibration" {
+                let cal = runtime.outcome_ledger.calibration();
+                if cal.is_empty() {
+                    println!("[calibration] no resolved bets yet");
+                }
+                for (label, n, stated, observed) in cal {
+                    println!(
+                        "[calibration] {}: n={} stated={:.2} observed={:.2}",
+                        label, n, stated, observed
+                    );
+                }
                 continue;
             }
             if let Some(q_str) = trimmed.strip_prefix("query ") {
@@ -1374,7 +1561,7 @@ fn print_specialist_carving_profile(profile: &CarvedSpecialistProfile) {
 
 fn print_query_result(res: &atoma_orchestrator::SwarmMapQueryResult, elapsed_us: u128) {
     println!(
-        "[verified] QueryResult (\"{}\") -> role={}({}) sector={} silo_atoms={}/{} global_arcs={} mlir_result_q32={:.4} holonomy_flux={:.4}rad latency={}us",
+        "[verified] QueryResult (\"{}\") -> role={}({}) sector={} silo_atoms={}/{} global_arcs={} mlir_result_q32={} holonomy_flux={:.4}rad latency={}us",
         res.query_text,
         res.routed_role.short_code(),
         res.routed_role.name(),
@@ -1382,7 +1569,7 @@ fn print_query_result(res: &atoma_orchestrator::SwarmMapQueryResult, elapsed_us:
         res.silo_atom_count,
         res.global_atom_count,
         res.global_reasoning_arc_count,
-        res.mlir_execution_result_q32.to_f64(),
+        fmt_q32_opt(res.mlir_execution_result_q32),
         res.holonomy_flux_rad_q32.to_f64(),
         elapsed_us
     );
@@ -1415,9 +1602,9 @@ fn print_query_result(res: &atoma_orchestrator::SwarmMapQueryResult, elapsed_us:
         );
     }
     println!(
-        "  [native-mlir-ssa] ops={:?} -> deterministic_q32={:.4}",
+        "  [native-mlir-ssa] ops={:?} -> deterministic_q32={}",
         res.synthesized_mlir_program,
-        res.mlir_execution_result_q32.to_f64()
+        fmt_q32_opt(res.mlir_execution_result_q32)
     );
     if let Some(ref live) = res.live_ingest {
         println!(
@@ -1950,6 +2137,13 @@ fn run_persistent_tcp_server(
         server,
         sessions: Default::default(),
         toroidal_sessions: Default::default(),
+            trajectory_gates: Default::default(),
+            free_energy_ledgers: Default::default(),
+            outcome_ledger: Default::default(),
+            quarantine: Default::default(),
+            promoter: Default::default(),
+            crystallization_hold_enabled: true,
+            ablate_forward_pass: false,
         toroidal_hidden_states: Default::default(),
         toroidal_hidden_sequences: Default::default(),
     };
@@ -2700,7 +2894,7 @@ fn run_persistent_tcp_server(
             .map(|h| h.cosh_distance_q32.to_f64())
             .unwrap_or(1.0);
         let json_body = format!(
-            "{{\"query\":\"{}\",\"routed_role\":\"{}\",\"sector\":{},\"silo_atoms\":{},\"global_0cells\":{},\"global_1cell_arcs\":{},\"top_atom_id\":{},\"top_cosh_dist\":{:.6},\"reasoning_hops\":{},\"mlir_result_q32\":{:.4},\"holonomy_flux_rad\":{:.4},\"latency_us\":{}}}\n",
+            "{{\"query\":\"{}\",\"routed_role\":\"{}\",\"sector\":{},\"silo_atoms\":{},\"global_0cells\":{},\"global_1cell_arcs\":{},\"top_atom_id\":{},\"top_cosh_dist\":{:.6},\"reasoning_hops\":{},\"mlir_result_q32\":{},\"holonomy_flux_rad\":{:.4},\"latency_us\":{}}}\n",
             res.query_text.replace('"', "\\\""),
             res.routed_role.short_code(),
             res.query_sector,
@@ -2710,7 +2904,7 @@ fn run_persistent_tcp_server(
             top_hit_id,
             top_hit_cosh,
             res.reasoning_hops.len(),
-            res.mlir_execution_result_q32.to_f64(),
+            res.mlir_execution_result_q32.map(|q| format!("{:.4}", q.to_f64())).unwrap_or_else(|| "null".to_string()),
             res.holonomy_flux_rad_q32.to_f64(),
             q_us
         );

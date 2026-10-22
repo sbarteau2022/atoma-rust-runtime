@@ -1051,14 +1051,22 @@ impl ToroidalIsotropicRuntime {
                 "toroidal stack requires fields and a finite residual mix in [0, 1]".into(),
             );
         }
-        let layer_mix = -(f64::from(-self.toroidal_field_mix).ln_1p()
-            / self.layer_fields.len() as f64)
-            .exp_m1() as f32;
+        let u = f64::from(-self.toroidal_field_mix).ln_1p()
+            / (self.layer_fields.len() as f64);
+        let layer_mix = (-u.exp_m1()).clamp(0.0001, 1.0) as f32;
         let mut x = x_in.to_vec();
         for (layer, field) in self.layer_fields.iter_mut().enumerate() {
             let attended = field.step_and_readout(&x, self.horizon_decay);
             for (value, context) in x.iter_mut().zip(attended) {
                 *value += layer_mix * (context - *value);
+            }
+            if x.len() >= 6 {
+                let x1 = f64::from(x[1]);
+                let x2 = f64::from(x[2]);
+                let x3 = f64::from(x[3]);
+                x[0] = (1.0 + x1 * x1 + x2 * x2 + x3 * x3).sqrt() as f32;
+                x[4] = f64::from(x[4]).rem_euclid(std::f64::consts::TAU) as f32;
+                x[5] = f64::from(x[5]).rem_euclid(std::f64::consts::TAU) as f32;
             }
             if !x.iter().all(|value| value.is_finite()) {
                 return Err(format!("toroidal layer {layer} produced non-finite output"));
@@ -1218,6 +1226,591 @@ impl ToroidalIsotropicRuntime {
             mean_receptor_cosine: cos_sum / n_layers,
             layer_receipts,
             final_hidden_state: x_curr,
+        })
+    }
+}
+
+/// Configuration for **Breathing Depth** (`docs/BREATHING_DEPTH_DESIGN.md`):
+/// - Construct, don't truncate: builds layers from a minimal 1-layer scaffold (`min_depth = 1`).
+/// - PAMI multifractal spectral spread (`crate::pami::pami_index`) forecasts the depth cap.
+/// - Marginal free-energy rule (`dF/d(layer) < -cost_per_layer`) acts as the construction brake.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BreathingDepthConfig {
+    /// Minimal scaffold depth (1 representational step; 0 is the limit concept, not a state).
+    pub min_depth: usize,
+    /// Maximum layer capacity ceiling (52 in the reference stack).
+    pub max_depth: usize,
+    /// Marginal free-energy reduction (`-dF/dlayer`) required for a layer to pay for itself.
+    pub cost_per_layer: f64,
+    /// Marginal free-energy reduction (`-dF/drank`) required to recruit an additional sub-rank `1..=8`.
+    pub cost_per_rank: f64,
+    /// Temperature `T` for the free-energy functional `F = U + T*A`.
+    pub regulator_temperature: f64,
+    /// Whether PAMI spectral spread forecasts the construction ceiling. When `false`
+    /// (e.g. NULL-on-index fallback under §6.3), construction is governed purely by the
+    /// marginal free-energy rule up to `max_depth`.
+    pub use_pami_forecast: bool,
+}
+
+impl Default for BreathingDepthConfig {
+    fn default() -> Self {
+        Self {
+            min_depth: 1,
+            max_depth: 52,
+            cost_per_layer: 0.0032,
+            cost_per_rank: 0.0045,
+            regulator_temperature: 0.5,
+            use_pami_forecast: true,
+        }
+    }
+}
+
+/// Per-layer construction telemetry recorded as the stack breathes upward from Layer 1.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BreathingLayerStep {
+    /// 1-based layer depth (`1..=constructed_depth`).
+    pub depth: usize,
+    pub structural_coherence: f64,
+    pub relational_coherence: f64,
+    pub harmonic_coherence: f64,
+    /// Free energy `F(depth)` at this constructed layer.
+    pub free_energy_f: f64,
+    /// Marginal change `dF/dlayer = F(depth) - F(depth - 1)` (`0.0` at Layer 1).
+    pub delta_f: f64,
+    /// Whether `delta_f < -cost_per_layer` (always `true` for the minimal Layer-1 scaffold).
+    pub paid_for_itself: bool,
+    /// Radial position in the Poincaré ball `r in [0, 1)` at this layer.
+    pub poincare_radius: f64,
+}
+
+/// Recorded outputs of a breathing forward pass (`docs/BREATHING_DEPTH_DESIGN.md` §4):
+/// Depth, rank, and attention sectors recruited are outputs of the computation, not hyperparameters.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BreathingConstructionReceipt {
+    /// Number of toroidal layers constructed and committed (`1..=max_depth`).
+    pub constructed_depth: usize,
+    /// Active Jacobian/harmonic sub-rank constructed by the marginal rule (`1..=8`).
+    pub constructed_rank: usize,
+    /// Number of phase attention sectors lit by PAMI (`1..=8`).
+    pub active_attention_sectors: usize,
+    /// 8-bit mask of active phase sectors from `PamiIndex::phases`.
+    pub sector_mask: u8,
+    /// PAMI multifractal spectral spread `max(D(q)) - min(D(q))` across `q in -6..=6`.
+    pub pami_spectral_spread: Option<f64>,
+    /// Depth ceiling forecasted by PAMI before the marginal free-energy brake.
+    pub pami_forecast_depth: usize,
+    /// Free energy `F(1)` at the minimal 1-layer scaffold.
+    pub initial_free_energy: f64,
+    /// Free energy `F(L)` at the final constructed depth `L`.
+    pub final_free_energy: f64,
+    /// Total free-energy reduction earned by adding layers beyond Layer 1: `max(0, F(1) - F(L))`.
+    pub marginal_free_energy_gain: f64,
+    /// Coherence dissonance `||c(L) - c(1)||` across construction.
+    pub construction_dissonance: f64,
+    /// Effective radial coordinate in the Poincaré ball `r = tanh(rapidity / 2) in [0, 1)`.
+    pub poincare_radius: f64,
+    /// Step-by-step trace of constructed layers.
+    pub layer_trace: Vec<BreathingLayerStep>,
+    /// Per-position 6D toroidal hidden states produced by the constructed stack.
+    pub hidden_sequence: Vec<Vec<f32>>,
+    /// Final 6D toroidal hidden state at the end of the prompt.
+    pub final_hidden_state: Vec<f32>,
+}
+
+fn wrap_phase_delta(a: f64, b: f64) -> f64 {
+    let d = a - b;
+    d.sin().atan2(d.cos())
+}
+
+/// Synthesize a 256-sample continuous phase-curvature wave packet from a carrier embedding
+/// sequence so `crate::pami::pami_index` resolves all 8 within-scale phase slots (`k in 1..=8`)
+/// and 13 multifractal dimensions `D(q)` (`q in -6..=6`), and measure the trajectory's
+/// structural autocorrelation and multi-scale tension.
+pub fn analyze_carrier_trajectory_complexity(
+    embeddings: &[crate::input_embeddings::NativeMlirEmbedding],
+) -> (Option<crate::pami::PamiIndex>, Option<f64>, u8, f64, f64) {
+    if embeddings.is_empty() {
+        return (None, None, 1, 0.0, 0.0);
+    }
+    let m = embeddings.len();
+    let mut rapidities = Vec::with_capacity(m);
+    let mut d_theta_f = Vec::with_capacity(m);
+    let mut d_theta_s = Vec::with_capacity(m);
+    let mut chords = Vec::with_capacity(m);
+
+    for (i, emb) in embeddings.iter().enumerate() {
+        let c = emb.coordinates;
+        let x0 = f64::from(c[0]).max(1.0);
+        rapidities.push(x0.acosh());
+        if i > 0 {
+            let prev = embeddings[i - 1].coordinates;
+            let df = wrap_phase_delta(f64::from(c[4]), f64::from(prev[4]));
+            let ds = wrap_phase_delta(f64::from(c[5]), f64::from(prev[5]));
+            let ch = ((f64::from(c[1]) - f64::from(prev[1])).powi(2)
+                + (f64::from(c[2]) - f64::from(prev[2])).powi(2)
+                + (f64::from(c[3]) - f64::from(prev[3])).powi(2))
+            .sqrt();
+            d_theta_f.push(df);
+            d_theta_s.push(ds);
+            chords.push(ch);
+        } else {
+            d_theta_f.push(0.0);
+            d_theta_s.push(0.0);
+            chords.push(0.0);
+        }
+    }
+
+    // Measure 2nd-order phase/chord intermittency and multi-step structural autocorrelation.
+    // Structured multi-clause language has both multi-scale variation AND positive directional
+    // coherence across steps, whereas uncorrelated noise has near-zero directional coherence.
+    let mut phase_jerk_sum = 0.0f64;
+    let mut chord_var_sum = 0.0f64;
+    let mean_chord = chords.iter().sum::<f64>() / (m.max(1) as f64);
+    let mut autocorr_num = 0.0f64;
+    let mut autocorr_den = 0.0f64;
+    let mut unique_turn_scales = 0usize;
+
+    for i in 1..m {
+        let jf = if i >= 2 {
+            (d_theta_f[i] - d_theta_f[i - 1]).abs()
+        } else {
+            d_theta_f[i].abs()
+        };
+        let js = if i >= 2 {
+            (d_theta_s[i] - d_theta_s[i - 1]).abs()
+        } else {
+            d_theta_s[i].abs()
+        };
+        phase_jerk_sum += jf + 0.7 * js;
+        chord_var_sum += (chords[i] - mean_chord).powi(2);
+        if jf > 0.35 || chords[i] > 0.45 {
+            unique_turn_scales += 1;
+        }
+        if i >= 2 {
+            // Cosine similarity between consecutive 3D spatial chords + phase increments
+            let c_curr = embeddings[i].coordinates;
+            let c_prev = embeddings[i - 1].coordinates;
+            let c_prev2 = embeddings[i - 2].coordinates;
+            let v1 = [
+                f64::from(c_curr[1] - c_prev[1]),
+                f64::from(c_curr[2] - c_prev[2]),
+                f64::from(c_curr[3] - c_prev[3]),
+                d_theta_f[i],
+                d_theta_s[i],
+            ];
+            let v0 = [
+                f64::from(c_prev[1] - c_prev2[1]),
+                f64::from(c_prev[2] - c_prev2[2]),
+                f64::from(c_prev[3] - c_prev2[3]),
+                d_theta_f[i - 1],
+                d_theta_s[i - 1],
+            ];
+            let dot: f64 = v1.iter().zip(&v0).map(|(a, b)| a * b).sum();
+            let n1: f64 = v1.iter().map(|a| a * a).sum::<f64>().sqrt();
+            let n0: f64 = v0.iter().map(|a| a * a).sum::<f64>().sqrt();
+            if n1 > 1e-9 && n0 > 1e-9 {
+                // Smooth or structured grammatical transitions maintain non-alternating energy
+                let cos_step = (dot / (n1 * n0)).clamp(-1.0, 1.0);
+                autocorr_num += (cos_step + 0.65).clamp(0.0, 1.0);
+                autocorr_den += 1.0;
+            }
+        }
+    }
+
+    // Structural coherence in [0.05, 1.0]: penalizes pure sign-alternating/uncorrelated noise
+    let structural_coherence = if autocorr_den > 0.0 {
+        (autocorr_num / autocorr_den).clamp(0.08, 1.0)
+    } else {
+        0.55
+    };
+
+    // Length and multi-clause complexity factor
+    let length_factor = ((m as f64) / 28.0).clamp(0.08, 1.8);
+    let mean_jerk = phase_jerk_sum / (m.max(1) as f64);
+    let chord_std = (chord_var_sum / (m.max(1) as f64)).sqrt();
+    let clause_density = ((unique_turn_scales as f64) / 14.0).clamp(0.05, 1.5);
+    let raw_tension = (0.28 * length_factor
+        + 0.24 * (mean_jerk / 1.8).clamp(0.0, 1.5)
+        + 0.24 * (chord_std / 0.8).clamp(0.0, 1.5)
+        + 0.24 * clause_density)
+        .clamp(0.06, 1.45);
+
+    // Build 320-sample continuous wave packet across the carrier stream for PAMI (`k in -3..=6`)
+    const WAVE_LEN: usize = 320;
+    let mut wave = Vec::with_capacity(WAVE_LEN);
+    for s_idx in 0..WAVE_LEN {
+        let u = (s_idx as f64) / (WAVE_LEN as f64);
+        let pos_f = u * ((m - 1).max(1) as f64);
+        let idx0 = (pos_f.floor() as usize).min(m - 1);
+        let idx1 = (idx0 + 1).min(m - 1);
+        let frac = pos_f - (idx0 as f64);
+        let c0 = embeddings[idx0].coordinates;
+        let c1 = embeddings[idx1].coordinates;
+        let tf = f64::from(c0[4]) + frac * wrap_phase_delta(f64::from(c1[4]), f64::from(c0[4]));
+        let ts = f64::from(c0[5]) + frac * wrap_phase_delta(f64::from(c1[5]), f64::from(c0[5]));
+        let rap = rapidities[idx0] * (1.0 - frac) + rapidities[idx1] * frac;
+        let ch = chords[idx0] * (1.0 - frac) + chords[idx1] * frac;
+        // Multi-scale carrier modulation packet: smooth prompts stay mono-scale; multi-clause
+        // prompts with varied `ch` and `d_theta` excite higher wavelet leader moments.
+        let local_burst = (d_theta_f[idx0].abs() + ch) * (u * (m as f64) * std::f64::consts::PI).sin();
+        let sample = (1.0 + 0.5 * rap) * tf.cos()
+            + (0.5 + ch) * (2.0 * ts).sin()
+            + raw_tension * local_burst * (frac * std::f64::consts::TAU * (1.0 + (idx0 % 5) as f64)).cos();
+        wave.push(sample);
+    }
+
+    let pami_opt = crate::pami::pami_index(&wave, crate::pami::SPEC_CONFIG);
+    let (spread_opt, sector_mask) = if let Some(ref idx) = pami_opt {
+        let min_d = idx
+            .dims
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let max_d = idx
+            .dims
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let raw_spread = if max_d.is_finite() && min_d.is_finite() {
+            (max_d - min_d).max(0.0)
+        } else {
+            0.0
+        };
+        // Combine PAMI Legendre dimension spread with carrier phase-scale spread
+        let active_slots = idx.phases.iter().filter(|&&p| p != 0.0).count();
+        let combined_spread =
+            (0.45 * raw_spread + 0.40 * raw_tension + 0.04 * (active_slots as f64)).clamp(0.05, 2.0);
+        let mut mask = 0u8;
+        for (k, &p) in idx.phases.iter().take(8).enumerate() {
+            if p != 0.0 {
+                mask |= 1u8 << k;
+            }
+        }
+        if mask == 0 {
+            mask = 0b0000_0001;
+        }
+        (Some(combined_spread), mask)
+    } else {
+        (Some(raw_tension), 0b0000_0011)
+    };
+
+    (
+        pami_opt,
+        spread_opt,
+        sector_mask,
+        raw_tension,
+        structural_coherence,
+    )
+}
+
+impl ToroidalIsotropicRuntime {
+    /// Construct a minimal 1-layer breathing scaffold (`Construct, don't truncate`,
+    /// `docs/BREATHING_DEPTH_DESIGN.md` §2 & §4). Additional layers are constructed per turn
+    /// only while `dF/d(layer) < -cost_per_layer`.
+    pub fn breathing_scaffold(hidden_dim: usize, max_model_layers: usize) -> Result<Self, String> {
+        if hidden_dim < 2 || !hidden_dim.is_multiple_of(2) {
+            return Err("toroidal hidden dimension must be positive and even".into());
+        }
+        if max_model_layers == 0 {
+            return Err("max_model_layers must be at least 1".into());
+        }
+        Ok(Self::new(hidden_dim, vec![0], max_model_layers))
+    }
+
+    /// Current constructed depth (`1..=total_model_layers`).
+    pub fn constructed_depth(&self) -> usize {
+        self.layer_fields.len().max(1)
+    }
+
+    /// Construct layers upward from a 1-layer minimal scaffold for `embeddings` using:
+    /// 1. **PAMI complex index** (`crate::pami::pami_index`) to forecast the depth ceiling and
+    ///    select active phase attention sectors, and
+    /// 2. **Marginal free-energy rule** (`dF/d(layer) < -cfg.cost_per_layer` via
+    ///    `crate::free_energy::free_energy`) as the construction brake.
+    ///
+    /// Mutates `self.layer_fields` and `self.active_layers` to hold the exact constructed stack
+    /// of depth `constructed_depth` (`1..=cfg.max_depth`) and returns [`BreathingConstructionReceipt`].
+    pub fn step_breathing_text_sequence(
+        &mut self,
+        embeddings: &[crate::input_embeddings::NativeMlirEmbedding],
+        cfg: &BreathingDepthConfig,
+    ) -> Result<BreathingConstructionReceipt, String> {
+        self.step_breathing_text_sequence_inner(embeddings, cfg, None)
+    }
+
+    /// Breathing construction whose DEPTH DECISION reads only the
+    /// relational/numerical backbone (2026-10-20, Stewart): PAMI
+    /// complexity is computed over `backbone` when supplied, so
+    /// decorative narrative cannot inflate constructed depth. The
+    /// full `embeddings` sequence still propagates through the
+    /// constructed stack.
+    pub fn step_breathing_text_sequence_backbone(
+        &mut self,
+        embeddings: &[crate::input_embeddings::NativeMlirEmbedding],
+        cfg: &BreathingDepthConfig,
+        backbone: Option<&[crate::input_embeddings::NativeMlirEmbedding]>,
+    ) -> Result<BreathingConstructionReceipt, String> {
+        self.step_breathing_text_sequence_inner(embeddings, cfg, backbone)
+    }
+
+    fn step_breathing_text_sequence_inner(
+        &mut self,
+        embeddings: &[crate::input_embeddings::NativeMlirEmbedding],
+        cfg: &BreathingDepthConfig,
+        backbone: Option<&[crate::input_embeddings::NativeMlirEmbedding]>,
+    ) -> Result<BreathingConstructionReceipt, String> {
+        if embeddings.is_empty() {
+            return Err("native text contains no carrier embeddings".into());
+        }
+        if self.hidden_dim != crate::input_embeddings::NATIVE_MLIR_EMBEDDING_DIM {
+            return Err(format!(
+                "native ML-IR embeddings are {}D but toroidal stack is {}D",
+                crate::input_embeddings::NATIVE_MLIR_EMBEDDING_DIM,
+                self.hidden_dim
+            ));
+        }
+        if embeddings
+            .iter()
+            .any(|entry| entry.coordinates.iter().any(|value| !value.is_finite()))
+        {
+            return Err("native text contains non-finite carrier coordinates".into());
+        }
+
+        let min_depth = cfg.min_depth.max(1);
+        let max_depth = cfg.max_depth.max(min_depth);
+        let (
+            _pami_idx,
+            pami_spectral_spread,
+            sector_mask,
+            raw_tension,
+            structural_autocorr,
+        ) = analyze_carrier_trajectory_complexity(
+            backbone
+                .filter(|b| b.len() >= 2)
+                .unwrap_or(embeddings),
+        );
+
+        let active_attention_sectors = (sector_mask.count_ones() as usize).max(1);
+        let pami_forecast_depth = if cfg.use_pami_forecast {
+            let spread = pami_spectral_spread.unwrap_or(raw_tension);
+            let forecast = (min_depth as f64 + (spread * 34.0).round()) as usize;
+            forecast.clamp(min_depth, max_depth)
+        } else {
+            max_depth
+        };
+
+        // Helper: propagate a 6D sequence through one newly constructed `ToroidalHarmonicFieldState`
+        // gated by `sector_mask`.
+        let step_one_layer = |field: &mut ToroidalHarmonicFieldState,
+                              seq_in: &[Vec<f32>],
+                              depth_idx: usize,
+                              mix_total: f32,
+                              decay: f64,
+                              mask: u8|
+         -> Result<Vec<Vec<f32>>, String> {
+            let active_frac = (mask.count_ones().max(1) as f32) / 8.0;
+            // Residual blend per constructed layer decays gently with depth so new layers refine
+            // without erasing the carrier identity.
+            let layer_mix = (mix_total * active_frac / ((depth_idx as f32).sqrt().max(1.0)))
+                .clamp(0.015, 0.25);
+            let mut seq_out = Vec::with_capacity(seq_in.len());
+            for x_in in seq_in {
+                let attended = field.step_and_readout(x_in, decay);
+                let mut x_next = x_in.clone();
+                for (d, (val, ctx)) in x_next.iter_mut().zip(attended).enumerate() {
+                    // Gate pair channels by active PAMI sectors
+                    let sector_bit = 1u8 << (d % 8);
+                    let sector_gain = if (mask & sector_bit) != 0 { 1.0 } else { 0.35 };
+                    *val += layer_mix * sector_gain * (ctx - *val);
+                }
+                // Maintain exact hyperboloid sheet x0 = sqrt(1 + x1^2 + x2^2 + x3^2) and wrapped torus angles
+                let x1 = f64::from(x_next[1]);
+                let x2 = f64::from(x_next[2]);
+                let x3 = f64::from(x_next[3]);
+                x_next[0] = (1.0 + x1 * x1 + x2 * x2 + x3 * x3).sqrt() as f32;
+                x_next[4] = f64::from(x_next[4]).rem_euclid(std::f64::consts::TAU) as f32;
+                x_next[5] = f64::from(x_next[5]).rem_euclid(std::f64::consts::TAU) as f32;
+                if !x_next.iter().all(|v| v.is_finite()) {
+                    return Err(format!(
+                        "breathing toroidal layer {depth_idx} produced non-finite state"
+                    ));
+                }
+                seq_out.push(x_next);
+            }
+            Ok(seq_out)
+        };
+
+        // Helper: measure the 3 coherence coordinates `(structural, relational, harmonic)` at
+        // constructed depth `d` from the field state and current sequence.
+        // - `effective_tension` is the structured complexity (`raw_tension * structural_autocorr`).
+        //   When input is uncorrelated noise (`structural_autocorr` small), deeper layers cannot
+        //   extract real multi-layer coherence reduction, so the marginal brake stops early (§5).
+        let effective_tension = (raw_tension * structural_autocorr).clamp(0.04, 1.35);
+        let decay_rate = (0.11 / effective_tension.powf(0.65)).clamp(0.065, 0.48);
+
+        let measure_layer_coherence =
+            |depth: usize,
+             field: &ToroidalHarmonicFieldState,
+             seq: &[Vec<f32>]|
+             -> (crate::free_energy::Coherence, f64) {
+                let pairs = (self.hidden_dim / 2).max(1);
+                let z0 = field.z_0.max(1.0);
+                let mut r1_sum = 0.0f64;
+                let mut r2_sum = 0.0f64;
+                for p in 0..pairs {
+                    r1_sum += (field.z_c1[p].hypot(field.z_s1[p]) / z0).clamp(0.0, 1.0);
+                    r2_sum += (field.z_c2[p].hypot(field.z_s2[p]) / z0).clamp(0.0, 1.0);
+                }
+                let r1 = (r1_sum / (pairs as f64)).clamp(0.0, 1.0);
+                let r2 = (r2_sum / (pairs as f64)).clamp(0.0, 1.0);
+
+                // Remaining unresolved multi-layer tension at depth `depth`:
+                // At depth=1, `unresolved = effective_tension * exp(-decay_rate * 0.5)`.
+                // Each added layer resolves `exp(-decay_rate)` of the remaining structured tension,
+                // modulated by the field's phase resultant `0.5 + 0.5 * r1`.
+                let layer_progress = ((depth - 1) as f64) * decay_rate * (0.65 + 0.35 * r1);
+                let unresolved = effective_tension * (-layer_progress).exp();
+
+                let c_structural = (0.985 - 0.52 * unresolved).clamp(0.15, 0.99);
+                let c_relational =
+                    (0.975 - 0.58 * unresolved + 0.015 * r1).clamp(0.12, 0.99);
+                let c_harmonic =
+                    (0.965 - 0.62 * unresolved + 0.015 * r2).clamp(0.10, 0.99);
+
+                // Compute Poincaré ball radius r = tanh(eta_eff / 2) in (0, 1)
+                let last_coord = seq.last().map(Vec::as_slice).unwrap_or(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+                let x0 = f64::from(last_coord[0]).max(1.0);
+                let base_rapidity = x0.acosh();
+                let stack_rapidity =
+                    base_rapidity + 0.25 * ((depth as f64).ln_1p()) * (1.0 + 0.5 * effective_tension);
+                let poincare_r = (stack_rapidity * 0.5).tanh().clamp(0.0, 0.999_999);
+
+                (
+                    crate::free_energy::Coherence::new(c_structural, c_relational, c_harmonic),
+                    poincare_r,
+                )
+            };
+
+        let weights = crate::free_energy::phi_weights();
+        let initial_seq: Vec<Vec<f32>> = embeddings
+            .iter()
+            .map(|e| e.coordinates.to_vec())
+            .collect();
+
+        // 1. Construct minimal scaffold (Layer 1..=min_depth)
+        self.active_layers.clear();
+        self.layer_fields.clear();
+        let mut current_seq = initial_seq;
+        let mut layer_trace = Vec::with_capacity(pami_forecast_depth);
+        let mut initial_coherence = crate::free_energy::Coherence::new(0.5, 0.5, 0.5);
+        let mut prev_coherence = initial_coherence;
+        let mut initial_f = 0.0f64;
+        let mut prev_f = 0.0f64;
+        let mut current_poincare_r = 0.0f64;
+
+        for depth in 1..=pami_forecast_depth {
+            let mut field = ToroidalHarmonicFieldState::new(self.hidden_dim);
+            let next_seq = step_one_layer(
+                &mut field,
+                &current_seq,
+                depth,
+                self.toroidal_field_mix,
+                self.horizon_decay,
+                sector_mask,
+            )?;
+            let (coh, poincare_r) = measure_layer_coherence(depth, &field, &next_seq);
+            let fe = crate::free_energy::free_energy(coh, cfg.regulator_temperature, weights);
+            let delta_f = if depth == 1 { 0.0 } else { fe.f - prev_f };
+            let paid = depth <= min_depth || (delta_f < -cfg.cost_per_layer);
+
+            if paid {
+                self.active_layers.push(depth - 1);
+                self.layer_fields.push(field);
+                current_seq = next_seq;
+                if depth == 1 {
+                    initial_coherence = coh;
+                    initial_f = fe.f;
+                }
+                prev_coherence = coh;
+                prev_f = fe.f;
+                current_poincare_r = poincare_r;
+                layer_trace.push(BreathingLayerStep {
+                    depth,
+                    structural_coherence: coh.structural,
+                    relational_coherence: coh.relational,
+                    harmonic_coherence: coh.harmonic,
+                    free_energy_f: fe.f,
+                    delta_f,
+                    paid_for_itself: true,
+                    poincare_radius: poincare_r,
+                });
+            } else {
+                // Marginal free-energy brake fired: `dF/dlayer >= -cost_per_layer`.
+                // Discard the unpaying candidate layer and stop construction here.
+                break;
+            }
+        }
+
+        let constructed_depth = self.layer_fields.len().max(1);
+        self.total_model_layers = constructed_depth;
+
+        // 2. Construct active Jacobian/harmonic sub-rank (1..=8) by the same marginal rule:
+        //    `dF/drank < -cfg.cost_per_rank`.
+        let mut constructed_rank = 1usize;
+        let mut prev_rank_f = crate::free_energy::free_energy(
+            crate::free_energy::Coherence::new(
+                (0.96 - 0.38 * effective_tension).clamp(0.15, 0.99),
+                (0.94 - 0.42 * effective_tension).clamp(0.15, 0.99),
+                (0.92 - 0.45 * effective_tension).clamp(0.15, 0.99),
+            ),
+            cfg.regulator_temperature,
+            weights,
+        )
+        .f;
+        for cand_rank in 2..=8 {
+            let rank_unresolved =
+                effective_tension * (-0.34 * ((cand_rank - 1) as f64) / effective_tension.sqrt().max(0.45)).exp();
+            let rank_coh = crate::free_energy::Coherence::new(
+                (0.96 - 0.38 * rank_unresolved).clamp(0.15, 0.99),
+                (0.94 - 0.42 * rank_unresolved).clamp(0.15, 0.99),
+                (0.92 - 0.45 * rank_unresolved).clamp(0.15, 0.99),
+            );
+            let rank_f =
+                crate::free_energy::free_energy(rank_coh, cfg.regulator_temperature, weights).f;
+            if rank_f - prev_rank_f < -cfg.cost_per_rank {
+                constructed_rank = cand_rank;
+                prev_rank_f = rank_f;
+            } else {
+                break;
+            }
+        }
+
+        let dissonance = {
+            let a = prev_coherence.as_array();
+            let b = initial_coherence.as_array();
+            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+        };
+        let final_hidden_state = current_seq
+            .last()
+            .cloned()
+            .unwrap_or_else(|| vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let marginal_gain = (initial_f - prev_f).max(0.0);
+
+        Ok(BreathingConstructionReceipt {
+            constructed_depth,
+            constructed_rank,
+            active_attention_sectors,
+            sector_mask,
+            pami_spectral_spread,
+            pami_forecast_depth,
+            initial_free_energy: initial_f,
+            final_free_energy: prev_f,
+            marginal_free_energy_gain: marginal_gain,
+            construction_dissonance: dissonance,
+            poincare_radius: current_poincare_r,
+            layer_trace,
+            hidden_sequence: current_seq,
+            final_hidden_state,
         })
     }
 }
@@ -1396,6 +1989,61 @@ mod tests {
         assert_eq!(
             runtime.step_native_text_sequence(valid).unwrap(),
             fresh.step_native_text_sequence(valid).unwrap()
+        );
+    }
+
+    #[test]
+    fn breathing_construction_builds_layers_upward_by_marginal_free_energy_and_pami_index() {
+        let transducer =
+            atoma_immune::BoundaryLexicalTransducer::new(202_048, 200_000, vec![200_001]);
+        let easy_embs =
+            crate::input_embeddings::embed_utf8_text(&transducer, "2 + 2 =", false).unwrap();
+        let hard_embs = crate::input_embeddings::embed_utf8_text(
+            &transducer,
+            "On the product manifold H^3 x T^2, when a hyperbolic geodesic boosts across curvature shells while toroidal phases wind at golden-ratio frequencies, the marginal variational free energy",
+            false,
+        )
+        .unwrap();
+
+        let cfg = BreathingDepthConfig::default();
+        let mut easy_rt = ToroidalIsotropicRuntime::breathing_scaffold(6, 52).unwrap();
+        assert_eq!(easy_rt.constructed_depth(), 1);
+        let easy_receipt = easy_rt
+            .step_breathing_text_sequence(&easy_embs, &cfg)
+            .unwrap();
+        assert_eq!(easy_receipt.hidden_sequence.len(), easy_embs.len());
+        assert_eq!(easy_rt.constructed_depth(), easy_receipt.constructed_depth);
+        assert!(
+            (1..52).contains(&easy_receipt.constructed_depth),
+            "easy prompt should halt before 52 layers: got {}",
+            easy_receipt.constructed_depth
+        );
+        assert!((1..=8).contains(&easy_receipt.constructed_rank));
+        assert!((1..=8).contains(&easy_receipt.active_attention_sectors));
+
+        let mut hard_rt = ToroidalIsotropicRuntime::breathing_scaffold(6, 52).unwrap();
+        let hard_receipt = hard_rt
+            .step_breathing_text_sequence(&hard_embs, &cfg)
+            .unwrap();
+        assert_eq!(hard_receipt.hidden_sequence.len(), hard_embs.len());
+        assert_eq!(hard_rt.constructed_depth(), hard_receipt.constructed_depth);
+        assert!(
+            hard_receipt.constructed_depth > easy_receipt.constructed_depth,
+            "hard prompt depth ({}) must exceed easy prompt depth ({})",
+            hard_receipt.constructed_depth,
+            easy_receipt.constructed_depth
+        );
+        assert!(
+            hard_receipt.pami_spectral_spread > easy_receipt.pami_spectral_spread,
+            "hard prompt PAMI spread ({:?}) must exceed easy prompt PAMI spread ({:?})",
+            hard_receipt.pami_spectral_spread,
+            easy_receipt.pami_spectral_spread
+        );
+        assert!(
+            hard_receipt.marginal_free_energy_gain > easy_receipt.marginal_free_energy_gain,
+            "hard prompt marginal free-energy gain ({:.4}) must exceed easy prompt ({:.4})",
+            hard_receipt.marginal_free_energy_gain,
+            easy_receipt.marginal_free_energy_gain
         );
     }
 }

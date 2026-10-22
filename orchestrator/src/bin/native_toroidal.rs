@@ -282,6 +282,8 @@ fn exact_quality(evaluation: &atoma_orchestrator::native_predictor::EvaluationRe
         "held_out_nll_better_than_bigram": evaluation.teacher_forced.learned.mean_nll_nats < evaluation.teacher_forced.bigram.mean_nll_nats,
         "toroidal_feature_nll_gain_nats": evaluation.teacher_forced.without_toroidal_features.mean_nll_nats - evaluation.teacher_forced.learned.mean_nll_nats,
         "ordered_history_nll_gain_nats": evaluation.teacher_forced.without_ordered_history.mean_nll_nats - evaluation.teacher_forced.learned.mean_nll_nats,
+        "held_out_mean_z_surprise": evaluation.teacher_forced.learned.mean_z_surprise,
+        "held_out_max_z_surprise": evaluation.teacher_forced.learned.max_z_surprise,
         "general_language_promotion_evaluated": false,
     })
 }

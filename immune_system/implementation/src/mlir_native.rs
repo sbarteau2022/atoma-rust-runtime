@@ -420,8 +420,18 @@ impl MlirAtomCatalog {
         desc: &MlirOpDescriptor,
     ) -> Q32_31 {
         let cosh_d = OpticalLens::lorentz_inner_product_wide(q_lor, &desc.lorentz_well);
-        let df = (q_phase.theta_f.0 - desc.phase_well.theta_f.0).abs() >> 3;
-        let ds = (q_phase.theta_s.0 - desc.phase_well.theta_s.0).abs() >> 3;
+        let df = q_phase
+            .theta_f
+            .0
+            .saturating_sub(desc.phase_well.theta_f.0)
+            .saturating_abs()
+            >> 3;
+        let ds = q_phase
+            .theta_s
+            .0
+            .saturating_sub(desc.phase_well.theta_s.0)
+            .saturating_abs()
+            >> 3;
         Q32_31(cosh_d.0.saturating_add(df).saturating_add(ds))
     }
 
@@ -855,6 +865,57 @@ impl GeodesicMlirDecoder {
             live_regs.push((dst_reg, chosen_desc.ret_type, q_lor));
         }
 
+        // CS-NATIVE-04 D1: guarantee basic-block termination. The geodesic pick
+        // for the final step is biased toward func.return_q32 but does not
+        // guarantee it; a synthesized block without a terminator is not a valid
+        // executable block (CS-NATIVE-03 return discipline). If the final pick
+        // was not a return, append one over the most recent live register of the
+        // return op's argument type (seeding a constant first if none exists).
+        // Blocks that already terminate are left untouched.
+        let terminated = instructions.last().is_some_and(|inst| {
+            catalog.get_op(inst.op_id).map(|d| d.mnemonic.as_str()) == Some("func.return_q32")
+        });
+        if !terminated {
+            if let Some(ret_desc) = catalog.lookup_by_mnemonic("func.return_q32") {
+                let ret_op = ret_desc.op_id;
+                let want_ty = ret_desc
+                    .arg_types
+                    .first()
+                    .copied()
+                    .unwrap_or(MlirTypeSig::Q32_31);
+                let mut src = live_regs
+                    .iter()
+                    .rev()
+                    .find(|(_, ty, _)| *ty == want_ty)
+                    .map(|(r, _, _)| *r);
+                if src.is_none() {
+                    if let Some(cst_desc) = catalog.lookup_by_mnemonic("arith.constant_q32") {
+                        if cst_desc.ret_type == want_ty {
+                            let dst = instructions.len() as u16;
+                            instructions.push(NativeMlirInstruction {
+                                op_id: cst_desc.op_id,
+                                dst_reg: dst,
+                                src_regs: [0; 4],
+                                arity: 0,
+                                immediate_q32: Q32_31::ZERO,
+                            });
+                            src = Some(dst);
+                        }
+                    }
+                }
+                if let Some(src_reg) = src {
+                    let dst = instructions.len() as u16;
+                    instructions.push(NativeMlirInstruction {
+                        op_id: ret_op,
+                        dst_reg: dst,
+                        src_regs: [src_reg, 0, 0, 0],
+                        arity: 1,
+                        immediate_q32: Q32_31::ZERO,
+                    });
+                }
+            }
+        }
+
         Ok(GeodesicDecodeReceipt {
             block: MlirSsaBlock::new(instructions),
             step_bridge_losses,
@@ -951,6 +1012,18 @@ pub enum MlirSsaError {
         required_role: RoleId,
         actual_sender: RoleId,
     },
+    CatalogIntegrityFailure,
+    MissingReturn,
+    DuplicateReturn {
+        step: usize,
+    },
+    ReturnNotLast {
+        step: usize,
+    },
+    UnimplementedOpcode {
+        step: usize,
+        op_id: MlirOpId,
+    },
 }
 
 impl fmt::Display for MlirSsaError {
@@ -1005,6 +1078,29 @@ impl fmt::Display for MlirSsaError {
                 "Step {} ({}): opcode restricted to {:?}, but sender is {:?}",
                 step, op_id, required_role, actual_sender
             ),
+            Self::CatalogIntegrityFailure => {
+                write!(f, "MLIR atom catalog SHA-256 integrity check failed")
+            }
+            Self::MissingReturn => {
+                write!(f, "MLIR SSA block has no func.return_q32 instruction")
+            }
+            Self::DuplicateReturn { step } => {
+                write!(f, "Step {}: duplicate func.return_q32 instruction", step)
+            }
+            Self::ReturnNotLast { step } => {
+                write!(
+                    f,
+                    "Step {}: func.return_q32 is not the final instruction",
+                    step
+                )
+            }
+            Self::UnimplementedOpcode { step, op_id } => {
+                write!(
+                    f,
+                    "Step {}: opcode {} has no implemented executor semantics",
+                    step, op_id
+                )
+            }
         }
     }
 }
@@ -1078,9 +1174,13 @@ impl MlirSsaBlock {
         if self.instructions.is_empty() {
             return Err(MlirSsaError::EmptyBlock);
         }
+        if !catalog.verify_integrity() {
+            return Err(MlirSsaError::CatalogIntegrityFailure);
+        }
 
         let mut reg_types: BTreeMap<u16, MlirTypeSig> = BTreeMap::new();
         let mut last_type = MlirTypeSig::Void;
+        let mut return_step: Option<usize> = None;
 
         for (step, inst) in self.instructions.iter().enumerate() {
             let desc = catalog
@@ -1089,6 +1189,13 @@ impl MlirSsaBlock {
                     step,
                     op_id: inst.op_id,
                 })?;
+
+            if desc.mnemonic == "func.return_q32" {
+                if return_step.is_some() {
+                    return Err(MlirSsaError::DuplicateReturn { step });
+                }
+                return_step = Some(step);
+            }
 
             if let Some(req_role) = desc.required_role {
                 if sender != RoleId::Coordinator && sender != req_role {
@@ -1139,6 +1246,11 @@ impl MlirSsaBlock {
             last_type = desc.ret_type;
         }
 
+        let return_step = return_step.ok_or(MlirSsaError::MissingReturn)?;
+        if return_step != self.instructions.len() - 1 {
+            return Err(MlirSsaError::ReturnNotLast { step: return_step });
+        }
+
         let wire = self.to_wire_bytes();
         Ok(MlirSsaValidationReceipt {
             instruction_count: self.instructions.len(),
@@ -1149,6 +1261,12 @@ impl MlirSsaBlock {
 
     /// Execute a validated `MlirSsaBlock` deterministically in bit-exact `Q32_31` arithmetic,
     /// returning the final SSA register value.
+    ///
+    /// Arithmetic subset only: any opcode outside {`arith.constant_q32`,
+    /// `arith.add_q32`, `arith.mul_q32`, `func.return_q32`} returns
+    /// [`MlirSsaError::UnimplementedOpcode`]. Manifold and tool semantics live in
+    /// their own engines and are never approximated here (CS-NATIVE-02 found the
+    /// previous catch-all silently executing them as a sum of inputs).
     pub fn execute_deterministic(
         &self,
         catalog: &MlirAtomCatalog,
@@ -1158,7 +1276,7 @@ impl MlirSsaBlock {
         let mut regs_q32: BTreeMap<u16, Q32_31> = BTreeMap::new();
         let mut last_val = Q32_31::ZERO;
 
-        for inst in &self.instructions {
+        for (step, inst) in self.instructions.iter().enumerate() {
             let desc = catalog.get_op(inst.op_id).unwrap();
             let val = match desc.mnemonic.as_str() {
                 "arith.constant_q32" => inst.immediate_q32,
@@ -1189,21 +1307,17 @@ impl MlirSsaBlock {
                     .copied()
                     .unwrap_or(Q32_31::ZERO),
                 _ => {
-                    let mut acc = inst.immediate_q32.0;
-                    for k in 0..(inst.arity as usize) {
-                        acc = acc.saturating_add(
-                            regs_q32
-                                .get(&inst.src_regs[k])
-                                .copied()
-                                .unwrap_or(Q32_31::ZERO)
-                                .0,
-                        );
-                    }
-                    Q32_31(acc)
+                    return Err(MlirSsaError::UnimplementedOpcode {
+                        step,
+                        op_id: inst.op_id,
+                    })
                 }
             };
             regs_q32.insert(inst.dst_reg, val);
             last_val = val;
+            if desc.mnemonic == "func.return_q32" {
+                break;
+            }
         }
         Ok(last_val)
     }
@@ -1270,17 +1384,40 @@ mod tests {
         assert_eq!(decoded_128.block.instructions.len(), 6);
         assert!(decoded_128.masked_illegal_opcodes_count > 0);
 
-        // Must pass Layer 3 SSA & static type verification and execute deterministically with ZERO errors
+        // Must pass Layer 3 SSA & static type verification. Execution contract
+        // (CS-NATIVE-03): the deterministic executor implements the arithmetic
+        // subset only, so a synthesized block containing manifold/tool opcodes
+        // must be REFUSED with UnimplementedOpcode. Before CS-NATIVE-02 the
+        // executor silently computed placeholder sums for those opcodes and
+        // this test asserted the finite placeholder result; that assertion
+        // encoded the bug and is replaced by the contract check below.
         let validation = decoded_128
             .block
             .validate_ssa_and_types(&catalog, RoleId::SensoryPerception)
             .unwrap();
         assert_eq!(validation.instruction_count, 6);
-        let res_q32 = decoded_128
+        let all_implemented = decoded_128.block.instructions.iter().all(|inst| {
+            matches!(
+                catalog.get_op(inst.op_id).map(|d| d.mnemonic.as_str()),
+                Some(
+                    "arith.constant_q32"
+                        | "arith.add_q32"
+                        | "arith.mul_q32"
+                        | "func.return_q32"
+                )
+            )
+        });
+        let exec = decoded_128
             .block
-            .execute_deterministic(&catalog, RoleId::SensoryPerception)
-            .unwrap();
-        assert!(res_q32.to_f64().is_finite());
+            .execute_deterministic(&catalog, RoleId::SensoryPerception);
+        if all_implemented {
+            assert!(exec.unwrap().to_f64().is_finite());
+        } else {
+            assert!(matches!(
+                exec,
+                Err(MlirSsaError::UnimplementedOpcode { .. })
+            ));
+        }
 
         // Same decoder works on 256d hidden states (model-agnostic, zero token_ids)
         let states_256d: Vec<Vec<f32>> = (0..5)

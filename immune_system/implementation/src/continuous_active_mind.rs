@@ -605,6 +605,23 @@ impl GeodesicCursor {
 // 3. Multi-Token `AtomicIrAlphabet` Span Folding on the Active Mind
 // ============================================================================
 
+/// Provenance of one emitted op: the arc whose geodesic walk produced it.
+/// Collected during `decode_span_accelerated_incremental` so the serving
+/// gate can judge a candidate by WHERE it came from, not only how it
+/// forecasts. `on_prompt_chain` is decided against the cursor's expected
+/// chain ids at decode time; `origin_fp` is the fingerprint bytes of the
+/// teacher checkpoint that distilled the arc (the quarantine key).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArcProvenance {
+    pub arc_id: u64,
+    pub chain_id: u64,
+    pub from_role: RoleId,
+    pub to_role: RoleId,
+    pub origin_fp: [u8; 32],
+    pub certainty_q32: i64,
+    pub on_prompt_chain: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpanFoldingReceipt {
     pub candidate_chains_inspected: usize,
@@ -953,6 +970,10 @@ pub struct AgenticTaskCompletionReceipt {
     pub superposition_interventions: usize,
     pub crystallization: Option<CrystallizationReceipt>,
     pub compliance_verified: bool,
+    /// Arc provenance of the served continuation (Tier1 span decode only;
+    /// empty when no trajectory was walked). Feeds the gate's relevance
+    /// verdict in the orchestrator.
+    pub arc_provenance: Vec<ArcProvenance>,
 }
 
 /// Receipt returned when an ephemeral sub-agent executes inside a structurally carved
@@ -976,6 +997,12 @@ pub struct GeodesicActiveTransformer {
     pub holonomy_engine: HyperbolicHolonomyEngine,
     pub wal_path: Option<PathBuf>,
     pub origin_fingerprint: Sha256Digest,
+    /// CRYSTALLIZATION HOLD (2026-10-19, Stewart's order): when true,
+    /// `crystallize_episode` verifies holonomy but stores NOTHING — no
+    /// arcs, no WAL frame. Set by the orchestrator around live turns so
+    /// unreviewed synthesis never enters the vault; held episodes are
+    /// logged by the caller for frontier-model/human approval.
+    pub hold_crystallization: bool,
 }
 
 impl GeodesicActiveTransformer {
@@ -990,6 +1017,7 @@ impl GeodesicActiveTransformer {
             holonomy_engine: HyperbolicHolonomyEngine::default(),
             wal_path,
             origin_fingerprint: Sha256Digest::compute(b"geodesic-active-transformer-v1"),
+            hold_crystallization: false,
         }
     }
 
@@ -1081,9 +1109,10 @@ impl GeodesicActiveTransformer {
         map: &CarvedSwarmMap,
         prefix: &[MlirOpId],
         max_new_tokens: usize,
-    ) -> Result<(Vec<MlirOpId>, Vec<u32>, String), String> {
+    ) -> Result<(Vec<MlirOpId>, Vec<u32>, String, Vec<ArcProvenance>), String> {
         let mut cursor = GeodesicCursor::from_prefix(&self.transducer.catalog, prefix)?;
         let mut emitted_ops = Vec::with_capacity(max_new_tokens);
+        let mut provenance: Vec<ArcProvenance> = Vec::with_capacity(max_new_tokens);
         let mut total_expanded_count = 0usize;
         let slack = Q32_31::from_f64(0.05).0;
         let max_basin = self.active_config.primary_basin_cosh_q32.0;
@@ -1164,6 +1193,16 @@ impl GeodesicActiveTransformer {
                 break;
             }
             emitted_ops.push(next_op);
+            provenance.push(ArcProvenance {
+                arc_id: winner.arc_id,
+                chain_id: winner.chain_id,
+                from_role: winner.from_role,
+                to_role: winner.to_role,
+                origin_fp: winner.origin_model_fingerprint.0,
+                certainty_q32: winner.teacher_certainty_q32.0,
+                on_prompt_chain: winner.chain_id == expected_chain
+                    || winner.chain_id == expected_span_chain,
+            });
             if next_op.0 >= base_vocab {
                 let expanded = self.transducer.atomic_ir.expand(&[next_op.0]);
                 for &tok in &expanded {
@@ -1177,7 +1216,7 @@ impl GeodesicActiveTransformer {
         }
 
         let (expanded_tokens, text) = self.transducer.transduce_egress_ops(&emitted_ops);
-        Ok((emitted_ops, expanded_tokens, text))
+        Ok((emitted_ops, expanded_tokens, text, provenance))
     }
 
     /// Check in `O(1)` (`< 1 µs` via the 27-cell spatial hash) whether `prefix` stands on an
@@ -1785,7 +1824,7 @@ impl GeodesicActiveTransformer {
                 let candidate_str = tmpl.replace("{}", subj);
                 let cand_ops = self.transducer.transduce_ingress_text(&candidate_str, true);
                 if self.has_exact_trajectory_chain(map, &cand_ops) {
-                    if let Ok((ops, _, txt)) =
+                    if let Ok((ops, _, txt, _prov)) =
                         self.decode_span_accelerated_incremental(map, &cand_ops, 16)
                     {
                         if !ops.is_empty()
@@ -2164,7 +2203,7 @@ impl GeodesicActiveTransformer {
                         .transducer
                         .transduce_ingress_text(&probe_prefix_str, true);
                     if self.has_exact_trajectory_chain(map, &probe_ops) {
-                        if let Ok((emitted_ops, _exp, decoded_cont)) =
+                        if let Ok((emitted_ops, _exp, decoded_cont, _prov)) =
                             self.decode_span_accelerated_incremental(map, &probe_ops, 36)
                         {
                             let cont_trimmed = decoded_cont.trim();
@@ -2551,6 +2590,7 @@ impl GeodesicActiveTransformer {
                     superposition_interventions: holds.max(1),
                     crystallization,
                     compliance_verified: comp_report.all_statutes_satisfied,
+                    arc_provenance: Vec::new(),
                 });
             }
         }
@@ -2631,6 +2671,7 @@ impl GeodesicActiveTransformer {
             superposition_interventions: trace.superposition_holds,
             crystallization,
             compliance_verified: comp_report.all_statutes_satisfied,
+                    arc_provenance: Vec::new(),
         })
     }
 
@@ -2826,6 +2867,17 @@ impl GeodesicActiveTransformer {
                 "refusing to crystallize episode: Gauss-Bonnet holonomy rejected as echo chamber"
                     .to_string(),
             );
+        }
+
+        if self.hold_crystallization {
+            return Ok(CrystallizationReceipt {
+                episode_id: trace.episode_id,
+                steps_crystallized: trace.tentative_steps.len(),
+                novel_arcs_minted: 0,
+                holonomy_verified,
+                wal_bytes_appended: 0,
+                mark: EpistemicMark::Theory,
+            });
         }
 
         let mut novel_arcs = 0usize;

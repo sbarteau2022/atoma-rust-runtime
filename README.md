@@ -25,6 +25,8 @@ All components in this repository use standard machine learning and numerical li
 
 ## Status & Proven-vs-Open Ledger
 
+Server ablation scorecards and reproducible full command lines are recorded in [benchmarks/SERVER_SCORECARDS_2026-10-21.md](benchmarks/SERVER_SCORECARDS_2026-10-21.md). The current quality-constrained winner is native Dspark with `max-draft 3`; Rapid-MLX and oMLX both serve the same MoE, while SGLang’s MLX backend currently rejects this Qwen3.5 MoE architecture in language-only mode.
+
 - **Verified (`atoma_immune` — 56 / 56 library tests passing):**
   - `Q32.31` fixed-point arithmetic, CORDIC trigonometry, Lorentz hyperboloid boosts, and Poincaré ball $\leftrightarrow$ hyperboloid isometry (`4.4e-9` agreement across 900 pairs).
   - `Atlas13` 12-cluster topology, $\mathrm{SO}(3)$ Wigner frame parallel transport, and discrete loop consistency verification.

@@ -9,17 +9,52 @@ impl Q32_31 {
     pub const ONE: Self = Self(1i64 << Self::FRACTIONAL_BITS);
     pub const ZERO: Self = Self(0);
     pub const HALF: Self = Self(1i64 << (Self::FRACTIONAL_BITS - 1));
+    pub const MIN: Self = Self(i64::MIN);
+    pub const MAX: Self = Self(i64::MAX);
 
+    #[inline]
     pub fn from_f64(val: f64) -> Self {
-        Self((val * (1i64 << Self::FRACTIONAL_BITS) as f64).round() as i64)
+        if val.is_nan() {
+            return Self::ZERO;
+        }
+        let scaled = (val * (1i64 << Self::FRACTIONAL_BITS) as f64).round();
+        if scaled >= i64::MAX as f64 {
+            Self::MAX
+        } else if scaled <= i64::MIN as f64 {
+            Self::MIN
+        } else {
+            Self(scaled as i64)
+        }
     }
 
+    #[inline]
     pub fn to_f64(self) -> f64 {
         (self.0 as f64) / (1i64 << Self::FRACTIONAL_BITS) as f64
     }
 
+    #[inline]
     pub fn abs(self) -> Self {
-        Self(self.0.abs())
+        Self(self.0.saturating_abs())
+    }
+
+    #[inline]
+    pub const fn saturating_add(self, other: Self) -> Self {
+        Self(self.0.saturating_add(other.0))
+    }
+
+    #[inline]
+    pub const fn saturating_sub(self, other: Self) -> Self {
+        Self(self.0.saturating_sub(other.0))
+    }
+
+    #[inline]
+    pub fn saturating_mul(self, other: Self) -> Self {
+        self.mul(other)
+    }
+
+    #[inline]
+    pub const fn saturating_neg(self) -> Self {
+        Self(self.0.saturating_neg())
     }
 
     pub fn checked_add(self, other: Self) -> Option<Self> {
@@ -30,41 +65,53 @@ impl Q32_31 {
         self.0.checked_sub(other.0).map(Self)
     }
 
+    #[inline]
     pub fn mul(self, other: Self) -> Self {
         let res = (self.0 as i128 * other.0 as i128) >> Self::FRACTIONAL_BITS;
-        Self(res as i64)
+        Self(res.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
     }
 
+    #[inline]
     pub fn div(self, other: Self) -> Self {
         if other.0 == 0 {
-            panic!("Division by zero in Q32_31");
+            return if self.0 == 0 {
+                Self::ZERO
+            } else if self.0 > 0 {
+                Self::MAX
+            } else {
+                Self::MIN
+            };
         }
         let res = ((self.0 as i128) << Self::FRACTIONAL_BITS) / other.0 as i128;
-        Self(res as i64)
+        Self(res.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
     }
 
     pub fn sqrt(self) -> Self {
-        if self.0 < 0 {
-            panic!("Sqrt of negative in Q32_31: {}", self.0);
-        }
-        if self.0 == 0 {
+        if self.0 <= 0 {
             return Self::ZERO;
         }
 
         let mut x = self;
         for _ in 0..10 {
+            if x.0 <= 0 {
+                return Self::ZERO;
+            }
             let s_div_x = self.div(x);
             let sum = (x.0 as i128) + (s_div_x.0 as i128);
-            x = Self((sum >> 1) as i64);
+            x = Self((sum >> 1).clamp(0, i64::MAX as i128) as i64);
         }
         x
     }
 
     pub fn inv_sqrt(self) -> Self {
         if self.0 <= 0 {
-            panic!("InvSqrt of non-positive in Q32_31: {}", self.0);
+            return Self::MAX;
         }
-        Self::ONE.div(self.sqrt())
+        let root = self.sqrt();
+        if root.0 <= 0 {
+            return Self::MAX;
+        }
+        Self::ONE.div(root)
     }
 
     pub fn sin(self) -> Self {
@@ -88,7 +135,7 @@ impl Q32_31 {
         let step = TWO_PI / LUT_SIZE as i64;
 
         let idx = ((theta.0 / step) as usize) % LUT_SIZE;
-        let frac_val = theta.0 - (idx as i64 * step);
+        let frac_val = theta.0.saturating_sub(idx as i64 * step);
         let frac = Self(frac_val);
 
         let val1 = if is_sin { SIN_LUT[idx] } else { COS_LUT[idx] };
@@ -98,7 +145,7 @@ impl Q32_31 {
             COS_LUT[(idx + 1) % LUT_SIZE]
         };
 
-        Self(val1) + frac.mul(Self(val2) - Self(val1))
+        Self(val1).saturating_add(frac.mul(Self(val2).saturating_sub(Self(val1))))
     }
 }
 
@@ -622,22 +669,45 @@ const COS_LUT: [i64; 256] = [
 
 impl std::ops::Add for Q32_31 {
     type Output = Self;
+    #[inline]
     fn add(self, other: Self) -> Self {
-        self.checked_add(other)
-            .expect("Overflow in Q32_31 addition")
+        self.saturating_add(other)
     }
 }
 
 impl std::ops::Sub for Q32_31 {
     type Output = Self;
+    #[inline]
     fn sub(self, other: Self) -> Self {
-        self.checked_sub(other)
-            .expect("Overflow in Q32_31 subtraction")
+        self.saturating_sub(other)
+    }
+}
+
+impl std::ops::Neg for Q32_31 {
+    type Output = Self;
+    #[inline]
+    fn neg(self) -> Self {
+        self.saturating_neg()
+    }
+}
+
+impl std::ops::AddAssign for Q32_31 {
+    #[inline]
+    fn add_assign(&mut self, other: Self) {
+        *self = self.saturating_add(other);
+    }
+}
+
+impl std::ops::SubAssign for Q32_31 {
+    #[inline]
+    fn sub_assign(&mut self, other: Self) {
+        *self = self.saturating_sub(other);
     }
 }
 
 impl std::ops::Mul for Q32_31 {
     type Output = Self;
+    #[inline]
     fn mul(self, other: Self) -> Self {
         self.mul(other)
     }
@@ -645,7 +715,38 @@ impl std::ops::Mul for Q32_31 {
 
 impl std::ops::Div for Q32_31 {
     type Output = Self;
+    #[inline]
     fn div(self, other: Self) -> Self {
         self.div(other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn q32_31_arithmetic_saturates_without_panic() {
+        assert_eq!(Q32_31::MAX + Q32_31::ONE, Q32_31::MAX);
+        assert_eq!(Q32_31::MIN - Q32_31::ONE, Q32_31::MIN);
+        assert_eq!(Q32_31::MIN - Q32_31::MAX, Q32_31::MIN);
+        assert_eq!(Q32_31::MAX - Q32_31::MIN, Q32_31::MAX);
+        assert_eq!(Q32_31::MIN.abs(), Q32_31::MAX);
+        assert_eq!(-Q32_31::MIN, Q32_31::MAX);
+        assert_eq!(Q32_31::MAX * Q32_31::MAX, Q32_31::MAX);
+        assert_eq!(Q32_31::MIN * Q32_31::MAX, Q32_31::MIN);
+        assert_eq!(Q32_31::MAX / Q32_31(1), Q32_31::MAX);
+        assert_eq!(Q32_31::MIN / Q32_31(1), Q32_31::MIN);
+        assert_eq!(Q32_31::ONE / Q32_31::ZERO, Q32_31::MAX);
+        assert_eq!((-Q32_31::ONE) / Q32_31::ZERO, Q32_31::MIN);
+        assert_eq!(Q32_31::ZERO / Q32_31::ZERO, Q32_31::ZERO);
+        assert_eq!(Q32_31::MIN.sqrt(), Q32_31::ZERO);
+        assert_eq!(Q32_31::ZERO.inv_sqrt(), Q32_31::MAX);
+        assert_eq!(Q32_31::MIN.inv_sqrt(), Q32_31::MAX);
+        // Verify trig at extreme bounds never panics
+        let _ = Q32_31::MAX.sin();
+        let _ = Q32_31::MIN.sin();
+        let _ = Q32_31::MAX.cos();
+        let _ = Q32_31::MIN.cos();
     }
 }

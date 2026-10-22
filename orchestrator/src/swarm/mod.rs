@@ -28,7 +28,12 @@ use std::time::{Duration, Instant};
 pub enum RestartStrategy {
     /// Restart only the crashed/timed-out child process (Erlang `one_for_one`).
     OneForOne,
-    /// Restart all 12 specialist processes if any child fails (Erlang `one_for_all`).
+    /// Restart the failed child's whole restart group (Erlang `one_for_all`
+    /// within a group). Groups: Coordination = {Coordinator},
+    /// Specialists = {L1..L12}. The Coordinator is supervised by the Governor's
+    /// root loop independently (CS-NATIVE-04 D2): a Coordinator failure restarts
+    /// only the Coordination group and never triggers a specialist restart, and
+    /// a specialist failure never leaves the Coordinator unrestarded.
     OneForAll,
 }
 
@@ -361,7 +366,10 @@ impl Governor {
             map,
         )?;
 
-        let mut needs_restart = Vec::new();
+        // Failures (Crashed/TimedOut) are strategy-governed; Dissolved is the
+        // normal ephemeral lifecycle and always respawns individually.
+        let mut failed: Vec<RoleId> = Vec::new();
+        let mut dissolved: Vec<RoleId> = Vec::new();
 
         for role in RoleId::ALL_13 {
             if let Some(proc) = self.processes[role.level() as usize].as_mut() {
@@ -371,23 +379,40 @@ impl Governor {
                 {
                     proc.state = ProcessState::TimedOut;
                 }
-                if matches!(
-                    proc.state,
-                    ProcessState::Crashed | ProcessState::TimedOut | ProcessState::Dissolved
-                ) {
-                    needs_restart.push(role);
+                match proc.state {
+                    ProcessState::Crashed | ProcessState::TimedOut => failed.push(role),
+                    ProcessState::Dissolved => dissolved.push(role),
+                    _ => {}
                 }
             }
         }
 
-        if needs_restart.is_empty() {
+        if failed.is_empty() && dissolved.is_empty() {
             return Ok(Vec::new());
         }
 
-        let roles_to_restart = match self.strategy {
-            RestartStrategy::OneForOne => needs_restart,
-            RestartStrategy::OneForAll => RoleId::CARVED_12.to_vec(),
-        };
+        // CS-NATIVE-04 D2 (section-13 fix): explicit restart-group membership.
+        // The previous OneForAll arm restarted CARVED_12 unconditionally, so a
+        // crashed Coordinator was never restarted while 12 healthy specialists
+        // were. Now: OneForAll expands each failure to its whole group; the
+        // Coordination group is {Coordinator} alone, supervised by this root
+        // loop independently of the specialist group.
+        let mut restart_set: Vec<RoleId> = dissolved;
+        match self.strategy {
+            RestartStrategy::OneForOne => restart_set.extend(failed.iter().copied()),
+            RestartStrategy::OneForAll => {
+                for role in &failed {
+                    match role {
+                        RoleId::Coordinator => restart_set.push(RoleId::Coordinator),
+                        _ => restart_set.extend(RoleId::CARVED_12.iter().copied()),
+                    }
+                }
+            }
+        }
+        let roles_to_restart: Vec<RoleId> = RoleId::ALL_13
+            .into_iter()
+            .filter(|r| restart_set.contains(r))
+            .collect();
 
         let mut recovered = Vec::new();
         for role in roles_to_restart {

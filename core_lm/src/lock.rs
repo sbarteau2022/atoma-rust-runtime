@@ -135,7 +135,7 @@ pub fn kuramoto_step_cpu(theta: &mut [i64], omega: &[i64], dt: i64, k_coupling: 
         let interaction = (k_coupling.wrapping_mul(avg)) >> FRAC_BITS;
         let deriv = omega[i].wrapping_add(interaction);
         let delta = (deriv.wrapping_mul(dt)) >> FRAC_BITS;
-        let ad = delta.wrapping_abs();
+        let ad = delta.saturating_abs();
         if ad > max_slip {
             max_slip = ad;
         }

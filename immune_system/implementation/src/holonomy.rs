@@ -40,6 +40,7 @@ use crate::cache::geometric::Phase;
 use crate::geometry::fixed::Q32_31;
 use crate::geometry::lorentz::LorentzVector;
 use crate::lock::{TopologicalInvariant, extract_invariant, inject_surprise, rad_q32_to_pi_unit};
+use crate::refraction::Sha256Digest;
 use crate::silo::CarvedSwarmMap;
 
 /// Verdict emitted by the Layer 3 Holonomy Gate when inspecting a multi-role reasoning loop.
@@ -57,6 +58,28 @@ pub enum HolonomyVerdict {
         enclosed_flux_rad_q32: Q32_31,
         min_required_q32: Q32_31,
     },
+}
+
+/// Computation binding for a [`HolonomyLoopReceipt`] (CS-NATIVE-04, section-13
+/// requirement). The geometric fields of a receipt observe only roles and atlas
+/// geometry — the section-13 probe showed 1,320 receipts byte-identical while
+/// weight values changed 0.1 -> 0.9. The binding ties the receipt to the actual
+/// computation: which weights (claimed fingerprint AND freeze-time content
+/// digest), which carve masks, which model epoch, which input, which outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolonomyBinding {
+    /// Claimed fingerprint of the shared base weights.
+    pub weights_fingerprint: Sha256Digest,
+    /// Freeze-time content hash of the live weight buffer (CS-NATIVE-03 FIX-C).
+    pub weights_content_digest: Sha256Digest,
+    /// Model generation the evaluation ran against.
+    pub model_epoch: u64,
+    /// Per path role: SHA-256 of that role's carve view `active_layers`.
+    pub mask_digests: Vec<(RoleId, Sha256Digest)>,
+    /// SHA-256 of the closed path and initial phase.
+    pub input_digest: Sha256Digest,
+    /// SHA-256 of the measured outcome (flux, Wigner angle, final frame).
+    pub outcome_digest: Sha256Digest,
 }
 
 /// Complete receipt of parallel-transporting a cognitive frame around a multi-role loop on `H³ × T²`.
@@ -80,6 +103,8 @@ pub struct HolonomyLoopReceipt {
     /// Structural verdict (`DialecticalSynthesisVerified` vs `EchoChamberRejected`).
     pub verdict: HolonomyVerdict,
     pub mark: EpistemicMark,
+    /// Computation binding (weights, masks, epoch, input, outcome).
+    pub binding: HolonomyBinding,
 }
 
 /// Engine for computing Levi-Civita hyperbolic parallel transport, Gauss–Bonnet holonomy,
@@ -249,6 +274,50 @@ impl HyperbolicHolonomyEngine {
     /// using the exact Levi-Civita connection `P_{X -> Y}` on `H³`, computes the resulting
     /// `3×3` `SO(3)` holonomy matrix `R_loop`, compares its rotation angle against the
     /// Gauss–Bonnet hyperbolic area `Ω`, and injects the resulting Berry phase into `initial_phase` on `T²`.
+    fn binding_for(
+        &self,
+        map: &CarvedSwarmMap,
+        path: &[RoleId],
+        initial_phase: Phase,
+        flux_q32: Q32_31,
+        angle_q32: Q32_31,
+        frame: &[[Q32_31; 3]; 3],
+    ) -> HolonomyBinding {
+        let mask_digests: Vec<(RoleId, Sha256Digest)> = path
+            .iter()
+            .map(|&role| {
+                let view = map.base_weights.carve_layer_view(role);
+                let mut bytes = Vec::with_capacity(view.active_layers.len() * 8);
+                for &l in &view.active_layers {
+                    bytes.extend_from_slice(&(l as u64).to_le_bytes());
+                }
+                (role, Sha256Digest::compute(&bytes))
+            })
+            .collect();
+        let mut input_bytes = Vec::new();
+        for &role in path {
+            input_bytes.extend_from_slice(&(role.level() as u64).to_le_bytes());
+        }
+        input_bytes.extend_from_slice(&initial_phase.theta_f.0.to_le_bytes());
+        input_bytes.extend_from_slice(&initial_phase.theta_s.0.to_le_bytes());
+        let mut outcome_bytes = Vec::with_capacity(8 * 11);
+        outcome_bytes.extend_from_slice(&flux_q32.0.to_le_bytes());
+        outcome_bytes.extend_from_slice(&angle_q32.0.to_le_bytes());
+        for row in frame.iter() {
+            for v in row.iter() {
+                outcome_bytes.extend_from_slice(&v.0.to_le_bytes());
+            }
+        }
+        HolonomyBinding {
+            weights_fingerprint: map.base_weights.fingerprint,
+            weights_content_digest: map.base_weights.content_digest(),
+            model_epoch: map.model_epoch,
+            mask_digests,
+            input_digest: Sha256Digest::compute(&input_bytes),
+            outcome_digest: Sha256Digest::compute(&outcome_bytes),
+        }
+    }
+
     pub fn evaluate_role_loop(
         &self,
         roles: &[RoleId],
@@ -270,8 +339,17 @@ impl HyperbolicHolonomyEngine {
                 rad_q32_to_pi_unit(initial_phase.theta_f),
                 rad_q32_to_pi_unit(initial_phase.theta_s),
             );
+            let binding = self.binding_for(
+                map,
+                &path,
+                initial_phase,
+                Q32_31::ZERO,
+                Q32_31::ZERO,
+                &id_frame,
+            );
             return HolonomyLoopReceipt {
                 path,
+                binding,
                 enclosed_curvature_flux_q32: Q32_31::ZERO,
                 final_frame_q32: id_frame,
                 wigner_rotation_angle_q32: Q32_31::ZERO,
@@ -382,8 +460,17 @@ impl HyperbolicHolonomyEngine {
             }
         };
 
+        let binding = self.binding_for(
+            map,
+            &path,
+            initial_phase,
+            enclosed_flux_q32,
+            wigner_angle_q32,
+            &final_frame_q32,
+        );
         HolonomyLoopReceipt {
             path,
+            binding,
             enclosed_curvature_flux_q32: enclosed_flux_q32,
             final_frame_q32,
             wigner_rotation_angle_q32: wigner_angle_q32,

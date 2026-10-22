@@ -2029,13 +2029,13 @@ fn main() {
             cfg.gsm8k_path.display()
         );
         println!(
-            "  Compiled to Native MlirSsaBlock:   {}/{} ({:.1}% coverage)",
+            "  Served after validate_and_solve:   {}/{} ({:.1}% coverage)",
             attempted_by_mlir_op,
             problems.len(),
             (attempted_by_mlir_op as f64 / total_p as f64) * 100.0
         );
         println!(
-            "  MlirSsaBlock Verified Precision:   {}/{} ({:.1}%)",
+            "  Exact-match precision of served:  {}/{} ({:.1}%)",
             mlir_op_correct, attempted_by_mlir_op, op_precision
         );
         println!(
@@ -2062,14 +2062,14 @@ fn main() {
         );
         let _ = writeln!(
             md_report,
-            "- **Compiled via `ToroidalWorkingMemory -> MlirSsaBlock`**: `{}/{}` (`{:.1}%` coverage)",
+            "- **Served after `word_problem::validate_and_solve`**: `{}/{}` (`{:.1}%` coverage)",
             attempted_by_mlir_op,
             problems.len(),
             (attempted_by_mlir_op as f64 / total_p as f64) * 100.0
         );
         let _ = writeln!(
             md_report,
-            "- **Verified `MlirSsaBlock` Precision**: `{}/{}` (**`{:.1}%`**)",
+            "- **Exact-match precision of served answers**: `{}/{}` (**`{:.1}%`**)",
             mlir_op_correct, attempted_by_mlir_op, op_precision
         );
         let _ = writeln!(

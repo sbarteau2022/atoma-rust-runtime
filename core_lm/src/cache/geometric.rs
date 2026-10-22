@@ -528,4 +528,31 @@ mod tests {
         assert_eq!(hits.len(), 4);
         assert_eq!(hits[0].payload[0], 5);
     }
+
+    #[test]
+    fn retrieve_5d_and_torus_distance_saturate_on_extreme_phase_and_boost() {
+        let mut map = GeometricMemoryMap::new(16);
+        let extreme_phase_a = Phase {
+            theta_f: Q32_31::MAX,
+            theta_s: Q32_31::MIN,
+        };
+        let extreme_phase_b = Phase {
+            theta_f: Q32_31::MIN,
+            theta_s: Q32_31::MAX,
+        };
+        // Previously panicked with "Overflow in Q32_31 subtraction"
+        let dist = extreme_phase_a.torus_distance_sq(&extreme_phase_b);
+        assert!(dist.0 >= 0);
+
+        let high_boost = LorentzVector::from_f64([100_000.0, 99_999.999_995, 0.0, 0.0]);
+        map.write(high_boost, extreme_phase_a, vec![42]).unwrap();
+        map.write(LorentzVector::origin(), extreme_phase_b, vec![7])
+            .unwrap();
+        map.rebuild();
+
+        let hits = map
+            .retrieve_5d(&high_boost, &extreme_phase_b, 2, false)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+    }
 }

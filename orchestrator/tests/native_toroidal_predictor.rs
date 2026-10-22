@@ -11,13 +11,18 @@ use serde_json::Value;
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_SCRATCH_ID: AtomicU64 = AtomicU64::new(0);
+        let seq = NEXT_SCRATCH_ID.fetch_add(1, Ordering::Relaxed);
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("atoma-native-cli-{}-{stamp}", std::process::id()));
-        fs::create_dir(&path).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "atoma-native-cli-{}-{stamp}-{seq}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
         Self(path)
     }
     fn run(&self, args: &[&str]) -> Output {

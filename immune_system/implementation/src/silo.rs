@@ -23,6 +23,16 @@ use crate::refraction::{OpticalLens, RefractedPoint, Sha256Digest, rad_q32_to_pi
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Which basis a [`FrozenBaseWeights`] fingerprint claim rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightIntegrityBasis {
+    /// The fingerprint is a content hash of the live weight buffer itself.
+    ContentHash,
+    /// The fingerprint is an external checkpoint structural digest. It attests
+    /// provenance of the source checkpoint; it cannot verify live buffer content.
+    ExternalStructuralProvenance,
+}
+
 /// Frozen, shared base model weights (`Qualification #8`: "Specialists are views onto one set
 /// of weights. Nothing is duplicated. The base is never modified.").
 #[derive(Debug)]
@@ -33,6 +43,9 @@ pub struct FrozenBaseWeights {
     weights: Vec<f32>,
     /// Cryptographic SHA-256 fingerprint computed at freeze time.
     pub fingerprint: Sha256Digest,
+    /// Content hash of the weight buffer as passed at freeze time (always
+    /// `hash_f32_slice`, regardless of the fingerprint's basis).
+    content_digest: Sha256Digest,
     /// True when `fingerprint` is an external checkpoint structural digest rather than `hash_f32_slice`.
     external_structural_fingerprint: bool,
 }
@@ -44,11 +57,13 @@ impl FrozenBaseWeights {
         weights: Vec<f32>,
     ) -> Arc<Self> {
         let fingerprint = Self::hash_f32_slice(num_layers, &weights);
+        let content_digest = Self::hash_f32_slice(num_layers, &weights);
         Arc::new(Self {
             model_name: model_name.into(),
             num_layers,
             weights,
             fingerprint,
+            content_digest,
             external_structural_fingerprint: false,
         })
     }
@@ -61,11 +76,13 @@ impl FrozenBaseWeights {
         weights: Vec<f32>,
         fingerprint: Sha256Digest,
     ) -> Arc<Self> {
+        let content_digest = Self::hash_f32_slice(num_layers, &weights);
         Arc::new(Self {
             model_name: model_name.into(),
             num_layers,
             weights,
             fingerprint,
+            content_digest,
             external_structural_fingerprint: true,
         })
     }
@@ -83,9 +100,35 @@ impl FrozenBaseWeights {
     /// Re-verify that the in-memory weights match the original freeze fingerprint (`Qualification #8`).
     pub fn verify_integrity(&self) -> bool {
         if self.external_structural_fingerprint {
-            self.fingerprint.0 != [0u8; 32]
+            Self::hash_f32_slice(self.num_layers, &self.weights) == self.content_digest
         } else {
             Self::hash_f32_slice(self.num_layers, &self.weights) == self.fingerprint
+        }
+    }
+
+    /// Which basis the `fingerprint` claim rests on (see [`WeightIntegrityBasis`]).
+    pub fn integrity_basis(&self) -> WeightIntegrityBasis {
+        if self.external_structural_fingerprint {
+            WeightIntegrityBasis::ExternalStructuralProvenance
+        } else {
+            WeightIntegrityBasis::ContentHash
+        }
+    }
+
+    /// The freeze-time content hash of the buffer as passed to the constructor.
+    pub fn content_digest(&self) -> Sha256Digest {
+        self.content_digest
+    }
+
+    /// Whether the live buffer's content is verified against the fingerprint.
+    /// True only for content-hash stores. An external structural digest attests
+    /// the source checkpoint's provenance and cannot verify live content, so
+    /// this fails closed (false) for externally fingerprinted stores.
+    pub fn verify_live_content(&self) -> bool {
+        if self.external_structural_fingerprint {
+            false
+        } else {
+            self.verify_integrity()
         }
     }
 
@@ -101,8 +144,26 @@ impl FrozenBaseWeights {
             RoleId::Coordinator => (0..total).collect(),
             specialist => {
                 let idx = specialist.carved_index().unwrap_or(0);
+                // CS-NATIVE-03 FIX-D: each specialist skips a distinct pair of
+                // residue classes modulo 8 (the previous (l + idx) % 4 rule made
+                // the mask depend only on idx % 4 — 12 specialists, 4 masks).
+                const SKIP_PAIRS: [(usize, usize); 12] = [
+                    (0, 3),
+                    (1, 4),
+                    (2, 5),
+                    (3, 6),
+                    (4, 7),
+                    (5, 0),
+                    (6, 1),
+                    (7, 2),
+                    (0, 4),
+                    (1, 5),
+                    (2, 6),
+                    (3, 7),
+                ];
+                let (r1, r2) = SKIP_PAIRS[idx % SKIP_PAIRS.len()];
                 (0..total)
-                    .filter(|&l| l < 4 || l + 4 >= total || (l + idx) % 4 != 0)
+                    .filter(|&l| l < 4 || l + 4 >= total || (l % 8 != r1 && l % 8 != r2))
                     .collect()
             }
         };
@@ -126,6 +187,36 @@ impl CarvedWeightView {
     /// Returns true if `other` shares the exact same underlying `FrozenBaseWeights` allocation.
     pub fn shares_allocation_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.base, &other.base)
+    }
+
+    /// Deterministic forward pass over this view's `active_layers` ONLY
+    /// (CS-NATIVE-03 FIX-B: the mask's first numerical consumer). The frozen
+    /// buffer is treated as `num_layers` rows of `weights.len() / num_layers`
+    /// values. State starts as the input cycled to row width; each active layer
+    /// computes a fresh state `y_i = x_i + w[l][i] * x[(i + 1) % width]` in
+    /// Q32_31 arithmetic. Skipped layers are the identity, so two views with
+    /// different masks provably compute different functions of the same buffer.
+    pub fn forward_q32(&self, input: &[Q32_31]) -> Vec<Q32_31> {
+        let weights = self.base.raw_weights();
+        let layers = self.base.num_layers.max(1);
+        let width = weights.len() / layers;
+        if width == 0 || input.is_empty() {
+            return Vec::new();
+        }
+        let mut x: Vec<Q32_31> = (0..width).map(|i| input[i % input.len()]).collect();
+        for &l in &self.active_layers {
+            if l >= layers {
+                continue;
+            }
+            let row = &weights[l * width..(l + 1) * width];
+            let mut y = Vec::with_capacity(width);
+            for i in 0..width {
+                let w = Q32_31::from_f64(row[i] as f64);
+                y.push(x[i] + w * x[(i + 1) % width]);
+            }
+            x = y;
+        }
+        x
     }
 }
 
@@ -879,7 +970,12 @@ impl CarvedSwarmMap {
             }
             for dy in -1..=1 {
                 for dz in -1..=1 {
-                    let key = Self::spatial_bucket_key(q1 + dx, q2 + dy, q3 + dz, sec);
+                    let key = Self::spatial_bucket_key(
+                        q1.saturating_add(dx),
+                        q2.saturating_add(dy),
+                        q3.saturating_add(dz),
+                        sec,
+                    );
                     if let Some(bucket) = self.novelty_buckets.get(&key) {
                         for &cand_id in bucket {
                             if let Some(existing) = self.global_atoms.get(&cand_id.0) {
@@ -970,7 +1066,12 @@ impl CarvedSwarmMap {
             let same_role_circuit = existing.from_role == arc.from_role
                 && existing.to_role == arc.to_role
                 && existing.compiled_mlir_op == arc.compiled_mlir_op
-                && (existing.cosh_action_q32.0 - arc.cosh_action_q32.0).abs() <= cosh_tol;
+                && existing
+                    .cosh_action_q32
+                    .0
+                    .saturating_sub(arc.cosh_action_q32.0)
+                    .saturating_abs()
+                    <= cosh_tol;
             if exact_atoms || same_role_circuit {
                 if arc.teacher_certainty_q32.0 > existing.teacher_certainty_q32.0 {
                     existing.teacher_certainty_q32 = arc.teacher_certainty_q32;
@@ -1039,6 +1140,33 @@ impl CarvedSwarmMap {
             .push(idx);
         self.reasoning_arcs.push(arc);
         (id, true)
+    }
+
+    /// Truncate the tail of `reasoning_arcs` to `keep` entries and rebuild
+    /// the outgoing-arc adjacency index. Returns the number of arcs
+    /// removed. Used to roll back a contaminated crystallization batch
+    /// (2026-10-19: Tier2 confabulation arcs). Never cuts into locked
+    /// arcs; `next_arc_id` is left untouched so new ids stay unique.
+    pub fn truncate_reasoning_arcs(&mut self, keep: usize) -> usize {
+        let len = self.reasoning_arcs.len();
+        if keep >= len {
+            return 0;
+        }
+        assert!(
+            keep >= self.locked_arc_count,
+            "truncate_reasoning_arcs: would cut into locked arcs (keep={}, locked={})",
+            keep,
+            self.locked_arc_count
+        );
+        self.reasoning_arcs.truncate(keep);
+        self.outgoing_arcs_by_atom.clear();
+        for (idx, arc) in self.reasoning_arcs.iter().enumerate() {
+            self.outgoing_arcs_by_atom
+                .entry(arc.from_atom.0)
+                .or_default()
+                .push(idx);
+        }
+        len - keep
     }
 
     /// Write `payload` onto `id` when that atom exists and still carries an empty payload.
@@ -1349,7 +1477,12 @@ impl CarvedSwarmMap {
         for dx in -1..=1 {
             for dy in -1..=1 {
                 for dz in -1..=1 {
-                    let key = Self::spatial_bucket_key(q1 + dx, q2 + dy, q3 + dz, sec);
+                    let key = Self::spatial_bucket_key(
+                        q1.saturating_add(dx),
+                        q2.saturating_add(dy),
+                        q3.saturating_add(dz),
+                        sec,
+                    );
                     if let Some(bucket) = self.novelty_buckets.get(&key) {
                         for &cand_id in bucket {
                             if self.outgoing_arc_indices(cand_id).is_empty() {
@@ -1796,9 +1929,9 @@ impl CarvedSwarmMap {
     fn boost_to_well_frame(&self, role: RoleId, global: &LorentzVector) -> LorentzVector {
         let well = self.atlas.well(role);
         let neg_dir = [
-            Q32_31(-well.unit_dir[0].0),
-            Q32_31(-well.unit_dir[1].0),
-            Q32_31(-well.unit_dir[2].0),
+            Q32_31(well.unit_dir[0].0.saturating_neg()),
+            Q32_31(well.unit_dir[1].0.saturating_neg()),
+            Q32_31(well.unit_dir[2].0.saturating_neg()),
         ];
         let r = R_SPH_Q32.0 as i128;
         let one = 1i128 << Q32_31::FRACTIONAL_BITS;

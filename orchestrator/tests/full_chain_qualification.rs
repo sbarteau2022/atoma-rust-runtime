@@ -832,7 +832,7 @@ fn native_mlir_tokenless_inter_process_ssa_execution_and_binary_catalog_verified
         )
         .unwrap();
     assert_eq!(dispatch.validation.instruction_count, 5);
-    assert!((dispatch.result_q32.to_f64() - 12.5).abs() < 1e-6);
+    assert!((dispatch.result_q32.expect("arithmetic dispatch must execute").to_f64() - 12.5).abs() < 1e-6);
 
     // Verify lossless bijective token_id <-> MlirOpId round-trip on the expanded token stream
     let (re_encoded_ops, loss) = server
@@ -879,7 +879,10 @@ fn native_mlir_tokenless_inter_process_ssa_execution_and_binary_catalog_verified
     assert_eq!(geo_decode.block.instructions.len(), 6);
     assert!(geo_decode.masked_illegal_opcodes_count > 0);
     assert_eq!(geo_dispatch.validation.instruction_count, 6);
-    assert!(geo_dispatch.result_q32.to_f64().is_finite());
+    // CS-NATIVE-04: a geodesic block's semantics are not implemented by the
+    // arithmetic executor, so the dispatch must report None — before the fix it
+    // returned a finite placeholder sum and this assertion certified it.
+    assert_eq!(geo_dispatch.result_q32, None);
 }
 
 #[test]

@@ -401,7 +401,7 @@ impl OpticalLens {
         let s = (v[0].0 as i128 * v[0].0 as i128)
             + (v[1].0 as i128 * v[1].0 as i128)
             + (v[2].0 as i128 * v[2].0 as i128);
-        ((s + (1i128 << (FRAC_BITS - 1))) >> FRAC_BITS) as i64
+        ((s + (1i128 << (FRAC_BITS - 1))) >> FRAC_BITS).clamp(0, i64::MAX as i128) as i64
     }
 
     /// Bit-exact integer square root of a non-negative Q32.31 value `x`:
@@ -416,7 +416,7 @@ impl OpticalLens {
         // Round to nearest integer if remainder exceeds root
         let rem = target - root * root;
         let rounded = if rem > root { root + 1 } else { root };
-        Q32_31(rounded as i64)
+        Q32_31(rounded.min(i64::MAX as u128) as i64)
     }
 
     /// Optical refractive index `n(r) = 2 / (1 - r²)` in Q32.31 (`dhng2.html`).
@@ -429,7 +429,7 @@ impl OpticalLens {
         let denom = ONE_I128 - (r_sq as i128);
         let numer = 2i128 << (2 * FRAC_BITS);
         let n = (numer + (denom >> 1)) / denom;
-        Ok(Q32_31(n as i64))
+        Ok(Q32_31(n.clamp(i64::MIN as i128, i64::MAX as i128) as i64))
     }
 
     /// Isometric stereographic lift from the Poincaré ball `p ∈ B³` to the Lorentz hyperboloid `H³`
@@ -447,13 +447,15 @@ impl OpticalLens {
         }
         let denom = ONE_I128 - (r_sq as i128);
         let num_x0 = (ONE_I128 + (r_sq as i128)) << FRAC_BITS;
-        let x0 = div_round_i128(num_x0, denom) as i64;
+        let x0 = div_round_i128(num_x0, denom).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
 
         let mut x = [Q32_31::ZERO; 4];
         x[0] = Q32_31(x0);
         for i in 0..3 {
             let num_xi = (2i128 * (ball[i].0 as i128)) << FRAC_BITS;
-            x[i + 1] = Q32_31(div_round_i128(num_xi, denom) as i64);
+            x[i + 1] = Q32_31(
+                div_round_i128(num_xi, denom).clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+            );
         }
         Ok(LorentzVector { x })
     }
@@ -469,7 +471,8 @@ impl OpticalLens {
         let mut p = [Q32_31::ZERO; 3];
         for i in 0..3 {
             let num = (v.x[i + 1].0 as i128) << FRAC_BITS;
-            p[i] = Q32_31(div_round_i128(num, denom) as i64);
+            p[i] =
+                Q32_31(div_round_i128(num, denom).clamp(i64::MIN as i128, i64::MAX as i128) as i64);
         }
         p
     }
@@ -489,17 +492,19 @@ impl OpticalLens {
         }
 
         let diff = [
-            Q32_31(p[0].0 - q[0].0),
-            Q32_31(p[1].0 - q[1].0),
-            Q32_31(p[2].0 - q[2].0),
+            Q32_31(p[0].0.saturating_sub(q[0].0)),
+            Q32_31(p[1].0.saturating_sub(q[1].0)),
+            Q32_31(p[2].0.saturating_sub(q[2].0)),
         ];
         let diff_sq = Self::norm_sq_q32(&diff) as i128;
 
         let one_minus_p = ONE_I128 - (rp_sq as i128);
         let one_minus_q = ONE_I128 - (rq_sq as i128);
-        let denom = div_round_i128(one_minus_p * one_minus_q, ONE_I128);
+        let denom = div_round_i128(one_minus_p * one_minus_q, ONE_I128).max(1);
         let delta = div_round_i128((2i128 * diff_sq) << FRAC_BITS, denom);
-        Ok(Q32_31((ONE_I128 + delta) as i64))
+        Ok(Q32_31(
+            (ONE_I128 + delta).clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+        ))
     }
 
     /// Wide-accumulator Lorentz inner product `A0*B0 - A1*B1 - A2*B2 - A3*B3` in Q32.31
@@ -510,7 +515,9 @@ impl OpticalLens {
             - (a.x[1].0 as i128 * b.x[1].0 as i128)
             - (a.x[2].0 as i128 * b.x[2].0 as i128)
             - (a.x[3].0 as i128 * b.x[3].0 as i128);
-        Q32_31(div_round_i128(sum, ONE_I128) as i64)
+        Q32_31(
+            div_round_i128(sum, ONE_I128).clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+        )
     }
 
     /// Bit-exact integer `tanh(t / 2)` for `t >= 0` in Q32.31 (`[verified]`).
@@ -537,7 +544,7 @@ impl OpticalLens {
             tanh_val = div_round_i128((2i128 * tanh_val) << FRAC_BITS, denom);
         }
 
-        Q32_31(tanh_val as i64)
+        Q32_31(tanh_val.clamp(0, ONE_I128) as i64)
     }
 
     /// Bit-exact integer Riemannian exponential map `exp_o : T_o(H³) -> B³ × H³` (`dhng2.html`).
@@ -569,7 +576,7 @@ impl OpticalLens {
             let ball = Self::lorentz_to_ball(&lorentz);
             let n_r = Self::refractive_index_q32(&ball).unwrap_or(Q32_31(2i64 << FRAC_BITS));
             let norm_sq = Self::lorentz_inner_product_wide(&lorentz, &lorentz);
-            let residual = Q32_31((norm_sq.0 - Q32_31::ONE.0).abs());
+            let residual = Q32_31(norm_sq.0.saturating_sub(Q32_31::ONE.0).saturating_abs());
             return Ok((
                 ball,
                 lorentz,
@@ -587,13 +594,15 @@ impl OpticalLens {
         let mut ball = [Q32_31::ZERO; 3];
         for i in 0..3 {
             let num = (tangent[i].0 as i128) * (r.0 as i128);
-            ball[i] = Q32_31(div_round_i128(num, t.0 as i128) as i64);
+            ball[i] = Q32_31(
+                div_round_i128(num, t.0 as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+            );
         }
 
         let n_r = Self::refractive_index_q32(&ball)?;
         let lorentz = Self::ball_to_lorentz(&ball)?;
         let norm_sq = Self::lorentz_inner_product_wide(&lorentz, &lorentz);
-        let residual = Q32_31((norm_sq.0 - Q32_31::ONE.0).abs());
+        let residual = Q32_31(norm_sq.0.saturating_sub(Q32_31::ONE.0).saturating_abs());
 
         Ok((
             ball,

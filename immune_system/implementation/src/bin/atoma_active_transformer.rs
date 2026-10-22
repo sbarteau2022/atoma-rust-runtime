@@ -426,7 +426,7 @@ fn main() -> Result<(), String> {
     let mut total_span_ops = 0usize;
     let mut total_span_tokens = 0usize;
     for _ in 0..iterations {
-        let (ops, exp, _txt) =
+        let (ops, exp, _txt, _prov) =
             transformer.decode_span_accelerated_incremental(&map, &bench_prefix, steps_per_iter)?;
         total_span_ops += ops.len();
         total_span_tokens += exp.len();

@@ -543,9 +543,9 @@ impl CarvedSwarmMap {
             }
 
             // 1. Walk the live 1-cell trajectory chain on the map using the O(1) GeodesicCursor
-            let (emitted_ops, _expanded, decoded_txt) = transformer
+            let (emitted_ops, _expanded, decoded_txt, _prov) = transformer
                 .decode_span_accelerated_incremental(self, &resolved_prefix, 28)
-                .unwrap_or_else(|_| (Vec::new(), Vec::new(), String::new()));
+                .unwrap_or_else(|_| (Vec::new(), Vec::new(), String::new(), Vec::new()));
 
             let is_coherent = crate::continuous_active_mind::BoundaryLexicalTransducer::is_coherent_egress_text(
                 p_text,

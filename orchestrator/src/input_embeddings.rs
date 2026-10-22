@@ -39,6 +39,26 @@ pub fn embed_carrier(
     })
 }
 
+/// Embed text at the MACRO grain: transduce to boundary-lexicon piece ops
+/// WITHOUT expanding them to byte carriers, and take each piece's own atlas
+/// address. The observation stream is the semantic-piece trajectory (the
+/// grain the trajectory-match gate scores), as opposed to `embed_utf8_text`
+/// which expands every macro to its byte carriers.
+pub fn embed_text_macro(
+    transducer: &BoundaryLexicalTransducer,
+    text: &str,
+) -> Result<Vec<NativeMlirEmbedding>, String> {
+    let ops = transducer.transduce_ingress_text(text, false);
+    let mut out = Vec::with_capacity(ops.len());
+    for op in ops {
+        if op == transducer.bos_id || transducer.eos_ids.contains(&op) {
+            continue;
+        }
+        out.push(embed_carrier(&transducer.catalog, op)?);
+    }
+    Ok(out)
+}
+
 /// Convert query text directly to positional native address vectors. Atomic-IR macro IDs
 /// are expanded before embedding so each UTF-8 byte retains its own carrier position.
 pub fn embed_utf8_text(
@@ -83,5 +103,59 @@ mod tests {
                 .iter()
                 .all(|entry| entry.coordinates.iter().all(|value| value.is_finite()))
         );
+    }
+}
+
+/// BACKBONE CLASSIFIER (2026-10-20, Stewart): a lexicon piece belongs
+/// to the relational/numerical backbone of a problem if it is a number
+/// (digits or a number word), an operator word, an implicit-constant
+/// word, or a closed-class relational word. Decorative narrative —
+/// adjectives and atmospheric setup — is NOT backbone. Breathing depth
+/// is decided from the backbone only; the full sequence still
+/// propagates through the constructed depth.
+pub fn is_backbone_piece(text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    if t.is_empty() {
+        return false;
+    }
+    if t.chars().any(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    if crate::math_eval::number_word_value(&t).is_some() {
+        return true;
+    }
+    matches!(
+        t.as_str(),
+        "plus" | "minus" | "times" | "multiply" | "multiplied" | "divided"
+            | "divide" | "over" | "per" | "each" | "every" | "total"
+            | "altogether" | "left" | "remain" | "remains" | "remaining"
+            | "more" | "fewer" | "less" | "than" | "half" | "twice"
+            | "double" | "triple" | "dozen" | "pair" | "weekly" | "equal"
+            | "equals" | "sum" | "difference" | "product" | "quotient"
+            | "cost" | "price" | "earn" | "earns" | "spend" | "spends"
+            | "buy" | "bought" | "sell" | "sold" | "pay" | "paid" | "how"
+            | "many" | "much"
+    )
+}
+
+/// Filter embeddings to the relational/numerical backbone, decoding
+/// each carrier's piece text through the transducer. Falls back to
+/// the full set only when the backbone is degenerate (< 2).
+pub fn backbone_filter(
+    transducer: &atoma_immune::BoundaryLexicalTransducer,
+    embeddings: &[NativeMlirEmbedding],
+) -> Vec<NativeMlirEmbedding> {
+    let kept: Vec<NativeMlirEmbedding> = embeddings
+        .iter()
+        .filter(|e| {
+            let (_, text) = transducer.transduce_egress_ops(&[e.carrier_id]);
+            is_backbone_piece(&text)
+        })
+        .cloned()
+        .collect();
+    if kept.len() >= 2 {
+        kept
+    } else {
+        embeddings.to_vec()
     }
 }

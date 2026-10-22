@@ -37,8 +37,8 @@ impl PicardMapper {
             let mut z_im = current.x[2].div(denom);
             let mut w = Q32_31::ONE.div(denom);
 
-            let gamma_re = Q32_31::from_f64(((z_re.0 + (1 << 30)) >> 31) as f64);
-            let gamma_im = Q32_31::from_f64(((z_im.0 + (1 << 30)) >> 31) as f64);
+            let gamma_re = Q32_31::from_f64((z_re.0.saturating_add(1 << 30) >> 31) as f64);
+            let gamma_im = Q32_31::from_f64((z_im.0.saturating_add(1 << 30) >> 31) as f64);
 
             let mut moved = false;
             if gamma_re != Q32_31::ZERO || gamma_im != Q32_31::ZERO {

@@ -465,9 +465,9 @@ impl SuperpositionHoldingEngine {
         let base_cosh = self.config.primary_basin_cosh_q32.0;
         let max_cosh = self.config.superposition_basin_cosh_q32.0.max(base_cosh);
         let step_cosh = if max_iters > 1 {
-            (max_cosh - base_cosh) / (max_iters as i64 - 1).max(1)
+            max_cosh.saturating_sub(base_cosh) / (max_iters as i64 - 1).max(1)
         } else {
-            max_cosh - base_cosh
+            max_cosh.saturating_sub(base_cosh)
         };
 
         for iter_idx in 0..max_iters {
@@ -477,7 +477,7 @@ impl SuperpositionHoldingEngine {
             } else if iter_idx + 1 == max_iters {
                 max_cosh
             } else {
-                base_cosh.saturating_add(step_cosh * (iter_idx as i64))
+                base_cosh.saturating_add(step_cosh.saturating_mul(iter_idx as i64))
             };
 
             let mut candidates = self.harvest_superposition_branches(
@@ -557,8 +557,11 @@ impl SuperpositionHoldingEngine {
                     });
                 }
                 if let Some(runner_up) = candidates.get(1) {
-                    let gap = runner_up.free_energy.total_free_energy_q32.0
-                        - winner.free_energy.total_free_energy_q32.0;
+                    let gap = runner_up
+                        .free_energy
+                        .total_free_energy_q32
+                        .0
+                        .saturating_sub(winner.free_energy.total_free_energy_q32.0);
                     if gap < self.config.ambiguity_margin_q32.0 {
                         let r_denom =
                             one + (runner_up.free_energy.total_free_energy_q32.0.max(0) as i128);
@@ -828,7 +831,12 @@ impl SuperpositionHoldingEngine {
                 };
                 let q_cosh =
                     OpticalLens::lorentz_inner_product_wide(query_lorentz, &from_atom.lorentz);
-                let phase_diff = (from_atom.phase.theta_f.0 - target_theta.0).unsigned_abs();
+                let phase_diff = from_atom
+                    .phase
+                    .theta_f
+                    .0
+                    .wrapping_sub(target_theta.0)
+                    .unsigned_abs();
                 let _ = phase_diff;
                 let fe = self.score_candidate_arc(
                     map,
@@ -969,7 +977,8 @@ impl SuperpositionHoldingEngine {
             // Each verified lookahead step reduces horizon free energy by 0.25 (preferring branches
             // that re-enter a multi-step verified trajectory highway over dead-end leaf hops)
             let lookahead_bonus = Q32_31::from_f64(0.25 * (lookahead_steps as f64));
-            branch.free_energy.counterfactual_horizon_delta_q32 = Q32_31(-lookahead_bonus.0);
+            branch.free_energy.counterfactual_horizon_delta_q32 =
+                Q32_31(lookahead_bonus.0.saturating_neg());
 
             let adjusted = (branch.free_energy.total_free_energy_q32.0 as i128)
                 - (holonomy_bonus.0 as i128)
@@ -998,7 +1007,12 @@ impl SuperpositionHoldingEngine {
                 raw_weights.push(0i128);
                 continue;
             }
-            let delta = ((b.free_energy.total_free_energy_q32.0 - min_f).max(0)) as i128;
+            let delta = (b
+                .free_energy
+                .total_free_energy_q32
+                .0
+                .saturating_sub(min_f)
+                .max(0)) as i128;
             let denom = one + (delta << 1);
             let w = ((one << 31) / denom).max(1);
             raw_weights.push(w);

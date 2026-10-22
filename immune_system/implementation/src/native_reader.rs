@@ -364,7 +364,11 @@ impl NativeReader {
                 .find(|(arc, _, _, _)| arc.compiled_mlir_op != best_arc.compiled_mlir_op)
             {
                 let gap = Q32_31(
-                    (second_fe.total_free_energy_q32.0 - best_fe.total_free_energy_q32.0).max(0),
+                    second_fe
+                        .total_free_energy_q32
+                        .0
+                        .saturating_sub(best_fe.total_free_energy_q32.0)
+                        .max(0),
                 );
                 if gap.0 < config.ambiguity_margin_q32.0 {
                     let res = engine.hold_and_iterate(
@@ -1480,5 +1484,44 @@ mod tests {
         let read = NativeReader::step(&restored, &catalog2, &[MlirOpId(10), MlirOpId(20)]).unwrap();
         assert_eq!(read.next_id, MlirOpId(30));
         assert_eq!(read.origin_model_fingerprint, origin);
+    }
+
+    #[test]
+    fn query_path_and_active_inference_step_do_not_panic_on_extreme_q32_31() {
+        let (mut map, policy, catalog) = fixture("extreme-q32", 1);
+        let origin = Sha256Digest::compute(b"teacher");
+        NativeReader::record_step(
+            &mut map,
+            &catalog,
+            &policy,
+            &[MlirOpId(10)],
+            MlirOpId(20),
+            &[1e6, -1e6],
+            origin,
+            Q32_31::MAX,
+        )
+        .unwrap();
+
+        if let Some(arc) = map.reasoning_arcs.first_mut() {
+            arc.cosh_action_q32 = Q32_31::MAX;
+        }
+
+        let query_phase = Phase {
+            theta_f: Q32_31::MAX,
+            theta_s: Q32_31::MIN,
+        };
+        let high_lor = LorentzVector::from_f64([50_000.0, 49_999.999_99, 0.0, 0.0]);
+        let near = map.candidate_arc_atoms_near(&high_lor, query_phase, i64::MAX);
+        assert!(near.is_some());
+
+        let config = ActiveInferenceConfig::default();
+        let _ = NativeReader::active_inference_step(
+            &map,
+            &catalog,
+            &policy,
+            &[MlirOpId(10)],
+            &config,
+            0,
+        );
     }
 }
