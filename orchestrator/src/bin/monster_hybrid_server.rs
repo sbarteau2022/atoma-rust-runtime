@@ -341,7 +341,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let out_scale: Vec<f32> = (0..q_rows).map(|r| 0.8 + (r % 7) as f32 * 0.05).collect();
         let x_in: Vec<f32> = (0..q_cols).map(|c| ((c as f32) * 0.013).sin()).collect();
 
-        atoma_immune::metal::reset_kernel_telemetry();
+        // Single-row embedding dequantization runs on every host via the
+        // feature-dispatched `atoma_immune::dequantize_row_zero_copy`
+        // (Metal-tuned path with the `metal` feature, portable otherwise).
+        let t_row_start = std::time::Instant::now();
+        let emb_row = atoma_immune::dequantize_row_zero_copy(
+            &packed_w,
+            "U32",
+            &scales_bf16,
+            "BF16",
+            &biases_bf16,
+            "BF16",
+            out_scale[42],
+            4,
+            group_size,
+            42,
+            q_cols,
+        )?;
+        let row_ns = t_row_start.elapsed().as_nanos();
+
+        // The fused zero-copy GEMV and kernel telemetry live in the
+        // macOS-only Metal backend module.
+        #[cfg(feature = "metal")]
+        {
+            atoma_immune::metal::reset_kernel_telemetry();
         let t_fused_start = std::time::Instant::now();
         let y_fused = atoma_immune::metal::qmatvec_fused_zero_copy(
             &packed_w,
@@ -389,25 +412,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let q6_us = t_q6_start.elapsed().as_micros();
 
-        let t_row_start = std::time::Instant::now();
-        let emb_row = atoma_immune::metal::dequantize_row_zero_copy(
-            &packed_w,
-            "U32",
-            &scales_bf16,
-            "BF16",
-            &biases_bf16,
-            "BF16",
-            out_scale[42],
-            4,
-            group_size,
-            42,
-            q_cols,
-        )?;
-        let row_ns = t_row_start.elapsed().as_nanos();
-        println!(
-            "[verified] Fused 6-Bit Super-Word GEMV ({}x{}, 6-bit/g128): latency={}us y6[0]={:.4} | Single-Row Embed Dequant (1x{}): latency={}ns emb[0]={:.4}",
-            q_rows, q_cols, q6_us, y_q6[0], q_cols, row_ns, emb_row[0]
-        );
+            println!(
+                "[verified] Fused 6-Bit Super-Word GEMV ({}x{}, 6-bit/g128): latency={}us y6[0]={:.4} | Single-Row Embed Dequant (1x{}): latency={}ns emb[0]={:.4}",
+                q_rows, q_cols, q6_us, y_q6[0], q_cols, row_ns, emb_row[0]
+            );
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            println!(
+                "[verified] Single-Row Embed Dequant (1x{}): latency={}ns emb[0]={:.4} (portable path; fused GEMV benchmark requires the `metal` feature)",
+                q_cols, row_ns, emb_row[0]
+            );
+        }
 
         let p_a = [
             Q32_31::from_f64(0.21),
